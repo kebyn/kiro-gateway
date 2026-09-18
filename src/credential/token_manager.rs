@@ -45,7 +45,7 @@ impl TokenManager {
             state: Arc::new(RwLock::new(RefreshState::default())),
             client,
             early_secs: config.refresh_early_secs,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(config.upstream_timeout_secs),
             persistence_path: config
                 .credential_json_path
                 .as_ref()
@@ -103,7 +103,13 @@ impl TokenManager {
                 self.state.write().last_error = None;
                 if let Some(path) = &self.persistence_path {
                     let credential = self.credential();
-                    let _ = crate::credential::persistence::write_json(path, &credential);
+                    if let Err(error) =
+                        crate::credential::persistence::write_json(path, &credential)
+                    {
+                        self.state.write().last_error = Some(error.to_string());
+                        self.state.write().refreshing = false;
+                        return Err(error);
+                    }
                 }
                 self.state.write().refreshing = false;
                 Ok(())

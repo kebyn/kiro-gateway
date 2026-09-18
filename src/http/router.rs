@@ -24,15 +24,18 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             crate::admin::middleware::client_api_key,
         ));
-    let admin_routes = admin::router::router(state.clone());
-    Router::new()
+    let mut router = Router::new()
         .merge(health_route)
         .merge(protected)
-        .route("/admin", get(crate::admin_ui::index))
-        .nest("/admin", admin_routes.clone())
-        .nest("/api/admin", admin_routes)
-        .layer(axum::middleware::from_fn(request_id::request_id))
-        .with_state(state)
+        .layer(axum::middleware::from_fn(request_id::request_id));
+    if state.config.admin.enabled {
+        let admin_routes = admin::router::router(state.clone());
+        router = router
+            .route("/admin", get(crate::admin_ui::index))
+            .nest("/admin", admin_routes.clone())
+            .nest("/api/admin", admin_routes);
+    }
+    router.with_state(state)
 }
 
 pub async fn health(State(_state): State<AppState>) -> impl IntoResponse {
