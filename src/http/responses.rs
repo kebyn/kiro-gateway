@@ -131,10 +131,14 @@ pub async fn create(
 }
 
 fn response_in_progress_payload(id: &str, model: &str) -> Value {
+    response_in_progress_payload_at(id, model, chrono::Utc::now().timestamp())
+}
+
+fn response_in_progress_payload_at(id: &str, model: &str, created_at: i64) -> Value {
     json!({
         "id": id,
         "object": "response",
-        "created_at": chrono::Utc::now().timestamp(),
+        "created_at": created_at,
         "status": "in_progress",
         "error": null,
         "incomplete_details": null,
@@ -292,6 +296,10 @@ fn responses_live_stream(
         messages: stored_messages.clone(),
         tools: stored_tools.clone(),
     });
+    let created_at = record
+        .as_ref()
+        .and_then(|record| record.payload["response"]["created_at"].as_i64())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
     let stream = async_stream::stream! {
         let _disconnect_guard = disconnect_guard;
         let mut sequence = 0_u64;
@@ -299,7 +307,7 @@ fn responses_live_stream(
         let mut accumulator = InternalEventAccumulator::new();
         let mut text_filter = XmlLeakFilter::new();
         let mut failed = false;
-        let initial = response_in_progress_payload(&id, &model);
+        let initial = response_in_progress_payload_at(&id, &model, created_at);
         for (event_type, data) in [
             ("response.created", json!({"response":initial.clone()})),
             ("response.in_progress", json!({"response":initial})),
@@ -456,7 +464,7 @@ fn responses_live_stream(
         }
         if failed { return; }
         let response = accumulator.finish();
-        let payload = responses_payload_with_live_items(&id, &model, &response, &live);
+        let payload = responses_payload_with_live_items(&id, &model, &response, &live, created_at);
         // Close every item in the same arrival order used for output_index.
         if live.item_order.is_empty() {
             if let Some(item) = payload["output"].as_array().and_then(|items| items.first()) {
@@ -530,6 +538,7 @@ fn responses_payload_with_live_items(
     model: &str,
     response: &InternalResponse,
     live: &LiveResponseState,
+    created_at: i64,
 ) -> Value {
     let incomplete_reason = responses_incomplete_reason(response);
     let status = if incomplete_reason.is_some() { "incomplete" } else { "completed" };
@@ -555,7 +564,7 @@ fn responses_payload_with_live_items(
     if output.is_empty() {
         output.push(json!({"type":"message","id":format!("msg_{}", uuid::Uuid::now_v7()),"status":status,"role":"assistant","content":[{"type":"output_text","text":"","annotations":[],"logprobs":[]}]}));
     }
-    json!({"id":id,"object":"response","created_at":chrono::Utc::now().timestamp(),"status":status,"error":null,"incomplete_details":incomplete_reason.map(|reason| json!({"reason":reason})),"model":model,"output":output,"output_text":response.text,"usage":response.usage})
+    json!({"id":id,"object":"response","created_at":created_at,"status":status,"error":null,"incomplete_details":incomplete_reason.map(|reason| json!({"reason":reason})),"model":model,"output":output,"output_text":response.text,"usage":response.usage})
 }
 
 fn responses_payload(id: &str, model: &str, response: &InternalResponse) -> Value {
