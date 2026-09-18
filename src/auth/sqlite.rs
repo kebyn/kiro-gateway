@@ -14,15 +14,7 @@ pub fn load(path: &Path) -> Result<Vec<Credential>, AppError> {
         .map_err(|e| AppError::Credential(format!("{}: {e}", path.display())))?;
     let mut result = Vec::new();
     for key in TOKEN_KEYS {
-        let raw: Option<String> = conn
-            .query_row("SELECT value FROM key_value WHERE key = ?1", [key], |row| row.get(0))
-            .optional()
-            .unwrap_or(None)
-            .or_else(|| {
-                conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0))
-                    .optional()
-                    .unwrap_or(None)
-            });
+        let raw = read_any(&conn, key);
         if let Some(raw) = raw {
             if let Some(mut credential) = parse_token(&raw) {
                 credential.auth_method =
@@ -48,6 +40,15 @@ pub fn load(path: &Path) -> Result<Vec<Credential>, AppError> {
                 first.machine_id = id;
             }
         }
+        if let Ok(profile) = conn.query_row::<String, _, _>(
+            "SELECT value FROM state WHERE key = 'api.codewhisperer.profile'",
+            [],
+            |row| row.get(0),
+        ) {
+            if let Ok(value) = serde_json::from_str::<Value>(&profile) {
+                super::profile_resolver::resolve_profile(&value, first);
+            }
+        }
     }
     if result.is_empty() {
         return Err(AppError::Credential("no supported Kiro token found in SQLite".into()));
@@ -57,6 +58,7 @@ pub fn load(path: &Path) -> Result<Vec<Credential>, AppError> {
 
 fn read_any(conn: &Connection, key: &str) -> Option<String> {
     for sql in [
+        "SELECT value FROM auth_kv WHERE key = ?1",
         "SELECT value FROM key_value WHERE key = ?1",
         "SELECT value FROM settings WHERE key = ?1",
         "SELECT data FROM state WHERE key = ?1",
@@ -104,4 +106,37 @@ fn load_state_tables(conn: &Connection) -> Vec<Credential> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load;
+    use rusqlite::Connection;
+
+    #[test]
+    fn reads_auth_kv_and_profile_state_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE auth_kv(key TEXT PRIMARY KEY, value TEXT); CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT);").unwrap();
+        connection
+            .execute(
+                "INSERT INTO auth_kv(key,value) VALUES('kirocli:odic:token', ?1)",
+                [r#"{"accessToken":"a","refreshToken":"r","region":"us-west-2"}"#],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO state(key,value) VALUES('api.codewhisperer.profile', ?1)",
+                [r#"{"arn":"arn:aws:codewhisperer:eu-west-1:123:profile/x"}"#],
+            )
+            .unwrap();
+        drop(connection);
+        let credentials = load(&path).unwrap();
+        assert_eq!(
+            credentials[0].profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:eu-west-1:123:profile/x")
+        );
+        assert_eq!(credentials[0].api_region, "eu-west-1");
+    }
 }
