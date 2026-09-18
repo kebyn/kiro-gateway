@@ -2,7 +2,7 @@ use crate::{
     error::AppError,
     protocol::internal::{InternalMessage, InternalResponse, InternalTool},
     response_store::{
-        model::{ResponseRecord, ResponseStatus},
+        model::{ResponseEvent, ResponseRecord, ResponseStatus},
         sqlite::SqliteStore,
     },
 };
@@ -71,7 +71,18 @@ impl ResponseStore {
         event_type: &str,
         payload: &Value,
     ) -> Result<(), AppError> {
+        self.inner.add_event(response_id, event_type, payload).map(|_| ())
+    }
+    pub fn append_event(
+        &self,
+        response_id: &str,
+        event_type: &str,
+        payload: &Value,
+    ) -> Result<ResponseEvent, AppError> {
         self.inner.add_event(response_id, event_type, payload)
+    }
+    pub fn events(&self, response_id: &str) -> Result<Vec<ResponseEvent>, AppError> {
+        self.inner.events(response_id)
     }
     pub fn extract_messages(record: &ResponseRecord) -> Vec<InternalMessage> {
         record
@@ -106,5 +117,38 @@ mod tests {
         assert_eq!(store.get(&record.id).unwrap().unwrap().status, ResponseStatus::InProgress);
         assert!(store.delete(&record.id).unwrap());
         assert!(store.get(&record.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn events_are_ordered_and_cascade_on_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResponseStore::open(directory.path().join("responses.sqlite3")).unwrap();
+        let record =
+            store.create("kiro", serde_json::json!({}), ResponseStatus::InProgress).unwrap();
+        let first = store
+            .append_event(&record.id, "response.created", &serde_json::json!({"ok":true}))
+            .unwrap();
+        let second = store
+            .append_event(&record.id, "response.completed", &serde_json::json!({"ok":true}))
+            .unwrap();
+        assert_eq!(first.sequence_number, 0);
+        assert_eq!(second.sequence_number, 1);
+        let events = store.events(&record.id).unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
+            ["response.created", "response.completed"]
+        );
+        assert_eq!(events[1].payload["sequence_number"], 1);
+        let updated = store
+            .update(
+                store.get(&record.id).unwrap().unwrap(),
+                ResponseStatus::Completed,
+                serde_json::json!({"updated":true}),
+            )
+            .unwrap();
+        assert_eq!(updated.status, ResponseStatus::Completed);
+        assert_eq!(store.events(&record.id).unwrap().len(), 2);
+        assert!(store.delete(&record.id).unwrap());
+        assert!(store.events(&record.id).unwrap().is_empty());
     }
 }

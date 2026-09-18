@@ -1,6 +1,6 @@
 use crate::{
     error::AppError,
-    response_store::model::{ResponseRecord, ResponseStatus},
+    response_store::model::{ResponseEvent, ResponseRecord, ResponseStatus},
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -15,11 +15,48 @@ impl SqliteStore {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(include_str!("../../migrations/001_initial.sql"))?;
+        // Databases created by the early 0.1 releases had no per-response
+        // sequence column. Upgrade that table in place so event reads remain
+        // deterministic without reintroducing the unused conversations table.
+        let has_sequence = conn
+            .prepare("PRAGMA table_info(response_events)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|name| name == "sequence_number");
+        if !has_sequence {
+            conn.execute("ALTER TABLE response_events ADD COLUMN sequence_number INTEGER", [])?;
+            let mut rows = conn
+                .prepare("SELECT id, response_id FROM response_events ORDER BY response_id, id")?;
+            let values = rows
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut current = String::new();
+            let mut sequence = 0_i64;
+            for (id, response_id) in values {
+                if response_id != current {
+                    current = response_id.clone();
+                    sequence = 0;
+                }
+                conn.execute(
+                    "UPDATE response_events SET sequence_number = ?1 WHERE id = ?2",
+                    params![sequence, id],
+                )?;
+                sequence += 1;
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_response_events_sequence ON response_events(response_id, sequence_number)",
+                [],
+            )?;
+        }
         Ok(Self { conn: std::sync::Mutex::new(conn) })
     }
     pub fn put(&self, record: &ResponseRecord) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|_| AppError::Storage("store lock poisoned".into()))?;
-        conn.execute("INSERT OR REPLACE INTO responses(id, object, status, model, payload, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![record.id, record.object, serde_json::to_string(&record.status)?, record.model, serde_json::to_string(&record.payload)?, record.created_at.timestamp(), record.updated_at.timestamp()])?;
+        conn.execute(
+            "INSERT INTO responses(id, object, status, model, payload, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET object=excluded.object, status=excluded.status, model=excluded.model, payload=excluded.payload, created_at=excluded.created_at, updated_at=excluded.updated_at",
+            params![record.id, record.object, serde_json::to_string(&record.status)?, record.model, serde_json::to_string(&record.payload)?, record.created_at.timestamp(), record.updated_at.timestamp()],
+        )?;
         Ok(())
     }
     pub fn get(&self, id: &str) -> Result<Option<ResponseRecord>, AppError> {
@@ -37,9 +74,47 @@ impl SqliteStore {
         response_id: &str,
         event_type: &str,
         payload: &Value,
-    ) -> Result<(), AppError> {
+    ) -> Result<ResponseEvent, AppError> {
         let conn = self.conn.lock().map_err(|_| AppError::Storage("store lock poisoned".into()))?;
-        conn.execute("INSERT INTO response_events(response_id, event_type, payload, created_at) VALUES(?1, ?2, ?3, ?4)", params![response_id, event_type, serde_json::to_string(payload)?, Utc::now().timestamp()])?;
-        Ok(())
+        let sequence: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(sequence_number) + 1, 0) FROM response_events WHERE response_id = ?1",
+            [response_id],
+            |row| row.get(0),
+        )?;
+        let created_at = Utc::now();
+        let mut stored_payload = payload.clone();
+        if let Value::Object(object) = &mut stored_payload {
+            object.insert("sequence_number".into(), Value::from(sequence));
+        }
+        conn.execute(
+            "INSERT INTO response_events(response_id, sequence_number, event_type, payload, created_at) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![response_id, sequence, event_type, serde_json::to_string(&stored_payload)?, created_at.timestamp()],
+        )?;
+        Ok(ResponseEvent {
+            response_id: response_id.to_owned(),
+            sequence_number: sequence as u64,
+            event_type: event_type.to_owned(),
+            payload: stored_payload,
+            created_at,
+        })
+    }
+
+    pub fn events(&self, response_id: &str) -> Result<Vec<ResponseEvent>, AppError> {
+        let conn = self.conn.lock().map_err(|_| AppError::Storage("store lock poisoned".into()))?;
+        let mut statement = conn.prepare(
+            "SELECT response_id, sequence_number, event_type, payload, created_at FROM response_events WHERE response_id = ?1 ORDER BY sequence_number ASC",
+        )?;
+        let rows = statement.query_map([response_id], |row| {
+            let payload: String = row.get(3)?;
+            Ok(ResponseEvent {
+                response_id: row.get(0)?,
+                sequence_number: row.get::<_, i64>(1)? as u64,
+                event_type: row.get(2)?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                created_at: DateTime::from_timestamp(row.get::<_, i64>(4)?, 0)
+                    .unwrap_or_else(Utc::now),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
     }
 }

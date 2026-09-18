@@ -8,6 +8,9 @@ use axum::{
 };
 
 pub fn router(state: AppState) -> Router<AppState> {
+    if !state.config.admin.enabled {
+        return Router::new().with_state(state);
+    }
     let protected = Router::new()
         .route("/auth/logout", post(handlers::logout))
         .route("/auth/session", get(handlers::session))
@@ -17,6 +20,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/credential/reload", post(handlers::credential_reload))
         .route("/credential/refresh", post(handlers::credential_refresh))
         .route("/request-logs", get(handlers::request_logs).delete(handlers::clear_request_logs))
+        .route("/responses/{id}/events", get(handlers::response_events))
         .route("/responses/{id}", get(handlers::response).delete(handlers::delete_response))
         .layer(middleware::from_fn_with_state(state.clone(), admin_middleware::admin_session));
     Router::new().route("/auth/login", post(handlers::login)).merge(protected).with_state(state)
