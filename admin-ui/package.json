@@ -1,0 +1,8 @@
+{
+  "name": "kiro-gateway-rs-admin",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {"build": "node src/build.mjs"}
+}
+
