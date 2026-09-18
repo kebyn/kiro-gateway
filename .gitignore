@@ -4,6 +4,4 @@
 *.db
 .env
 .env.*
-admin-ui/dist/
 admin-ui/node_modules/
-

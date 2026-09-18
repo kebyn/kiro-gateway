@@ -3,6 +3,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY src ./src
 COPY migrations ./migrations
+COPY admin-ui/dist ./admin-ui/dist
 RUN SOURCE_DATE_EPOCH=0 cargo build --release --locked
 
 FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867

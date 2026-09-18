@@ -98,7 +98,7 @@ Authorization: Bearer client-key-change-me
 | `port` | `8990` | 监听端口，不能为 `0` |
 | `client_api_key` | 空 | `/v1/*` 客户端密钥，必填 |
 | `admin_api_key` | 空 | Admin 登录密钥；`admin.enabled=true` 时必填 |
-| `admin.enabled` | `true` | 当前用于 Admin 配置校验；当前版本仍会注册 Admin 路由 |
+| `admin.enabled` | `true` | 为 `false` 时不注册 `/admin` 页面及 `/admin/*`、`/api/admin/*` 路由 |
 | `admin.session_ttl_secs` | `28800` | 内存会话有效期，秒 |
 | `admin.cookie_secure` | `true` | 是否为 Admin Cookie 添加 `Secure` |
 | `admin.allowed_origins` | `[]` | 非空时检查带 `Origin` 的 Admin 请求 |
@@ -106,7 +106,7 @@ Authorization: Bearer client-key-change-me
 | `credential_source` | `auto` | `auto`、`env`、`json`、`sqlite`、`api_key` 之一 |
 | `credential_path` | 空 | SQLite 凭据路径；支持 `~/` 展开 |
 | `credential_json_path` | 空 | JSON 凭据路径及刷新后的原子写回路径；支持 `~/` 展开 |
-| `endpoint` | `ide` | 上游格式，`ide` 或 `cli`；其他值按 `ide` 处理 |
+| `endpoint` | `ide` | 上游格式，只能为 `ide` 或 `cli` |
 | `api_region` | `us-east-1` | API Key 来源使用的默认区域 |
 | `upstream_url` | 空 | 覆盖模型生成上游 URL，主要用于受控代理或测试 |
 | `proxy_url` | 空 | Token 刷新 HTTP 客户端的代理 URL |
@@ -135,6 +135,19 @@ Authorization: Bearer client-key-change-me
 | `KIRO_API_REGION` | 覆盖 `api_region`，也用于环境变量凭据 |
 | `KIRO_CREDENTIAL_SOURCE` | 覆盖 `credential_source` |
 | `KIRO_CREDENTIAL_PATH` | 覆盖 SQLite `credential_path` |
+| `KIRO_CREDENTIAL_JSON_PATH` | 覆盖 JSON `credential_json_path` |
+| `KIRO_UPSTREAM_URL` | 覆盖模型上游 URL |
+| `KIRO_PROXY_URL` | 覆盖刷新客户端代理 URL |
+| `KIRO_UPSTREAM_TIMEOUT_SECS` | 覆盖上游请求和刷新超时，必须大于 `0` |
+| `KIRO_REFRESH_EARLY_SECS` | 覆盖提前刷新秒数，不得为负 |
+| `KIRO_REFRESH_INTERVAL_SECS` | 覆盖后台刷新间隔，必须大于 `0` |
+| `KIRO_ADMIN_ENABLED` | 启用或禁用 Admin 页面和 API |
+| `KIRO_ADMIN_SESSION_TTL_SECS` | 覆盖 Admin 会话 TTL，必须大于 `0` |
+| `KIRO_ADMIN_COOKIE_SECURE` | 是否设置 Admin Cookie 的 `Secure` 属性 |
+| `KIRO_ADMIN_LOGIN_RATE_LIMIT_PER_MINUTE` | 覆盖登录限流值，必须大于 `0` |
+| `KIRO_MCP_REGION` | 覆盖保留的 MCP 区域字段 |
+| `KIRO_LOG_JSON` | 覆盖保留的 JSON 日志字段 |
+| `KIRO_TRUST_FORWARDED_HEADERS` | 覆盖转发头信任字段 |
 | `KIRO_RESPONSE_STORE_PATH` | 覆盖 `response_store_path` |
 | `RUST_LOG` | tracing 过滤器，默认 `info` |
 
@@ -331,7 +344,7 @@ Authorization: Bearer client-key-change-me
 }
 ```
 
-`store` 默认为 `true`。存储开启时，工具调用会和消息一起保存，后续 `previous_response_id` 可以恢复调用上下文。`store: false` 不创建本地记录，该 ID 不能用于本地读取或可靠续传。
+`store` 默认为 `true`。存储开启时，工具调用会和消息一起保存，后续 `previous_response_id` 可以恢复调用上下文。`store: false` 不创建 `responses` 或 `response_events` 记录；该响应 ID 不能用于本地读取或可靠续传。带有不存在的 `previous_response_id` 会返回 `404`，不会静默当作空历史。
 
 Responses SSE 生命周期包含 `response.created`、`response.in_progress`，随后为每个调用发送 `response.output_item.added`、`response.function_call_arguments.delta`、`response.function_call_arguments.done`、`response.output_item.done`，最后发送 `response.completed` 或 `response.incomplete`。所有事件包含递增的 `sequence_number`；工具事件包含 `output_index` 和独立的 `item_id`。
 
@@ -381,6 +394,7 @@ Admin 路由：
 | `GET` | `/request-logs` | 当前返回空列表，尚未持久化请求日志 |
 | `DELETE` | `/request-logs` | 当前返回 `204` |
 | `GET` | `/responses/{id}` | 读取完整的本地 Response 记录 |
+| `GET` | `/responses/{id}/events` | 按 `sequence_number` 读取 Response 生命周期事件 |
 | `DELETE` | `/responses/{id}` | 删除本地 Response 记录 |
 
 当 `admin.allowed_origins` 非空时，带 `Origin` 的登录和 Admin 请求必须精确匹配列表中的一个值。登录尝试按 `x-forwarded-for` 值或全局键进行内存限流。
@@ -393,12 +407,16 @@ Admin 路由：
 - SQLite 凭据源只读。只有显式配置的 `credential_json_path` 会在刷新成功后写入完整凭据。
 - `response_store_path` 会以明文保存请求消息、模型输出、工具参数和工具结果。应限制数据库文件权限，并按数据保留要求删除记录。
 - Admin 的 `/responses/{id}` 会返回完整存储内容，只应向受信任管理员开放。
+- 删除 Response 会通过外键级联删除对应的 `response_events`；事件和 Response 内容均以明文保存在本地 SQLite。
 - `upstream_url` 和 `KIRO_TOKEN_ENDPOINT` 会改变凭据或内容发送目标，只能配置为受信任地址。
 - 本服务不提供 TLS、跨进程会话共享或静态凭据加密。
 
 ## 构建与验证
 
 ```sh
+node --check admin-ui/src/build.mjs
+pnpm --dir admin-ui install --frozen-lockfile
+pnpm --dir admin-ui build
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
