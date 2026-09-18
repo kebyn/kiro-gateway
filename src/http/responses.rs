@@ -287,7 +287,9 @@ fn responses_live_stream(
                         if let Some(record) = record.clone() {
                             let _ = state.responses.update(record, ResponseStatus::Failed, json!({"messages":stored_messages,"tools":stored_tools,"response":payload}));
                         }
-                        let _ = state.responses.append_event(&id, "response.failed", &payload);
+                    }
+                    if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.failed", json!({"response":payload,"error":{"code":"upstream_error","message":error.to_string()}})) {
+                        yield Ok(Event::default().event("response.failed").data(data.to_string()));
                     }
                     match attach_sequence(&state, &id, store, &mut sequence, "response.incomplete", json!({"response":payload,"error":{"code":"upstream_error","message":error.to_string()}})) {
                         Ok(data) => yield Ok(Event::default().event("response.incomplete").data(data.to_string())),
@@ -303,7 +305,9 @@ fn responses_live_stream(
                     if let Some(record) = record.clone() {
                         let _ = state.responses.update(record, ResponseStatus::Failed, json!({"messages":stored_messages,"tools":stored_tools,"response":payload}));
                     }
-                    let _ = state.responses.append_event(&id, "response.failed", &payload);
+                }
+                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.failed", json!({"response":payload,"error":{"code":"upstream_error","message":message}})) {
+                    yield Ok(Event::default().event("response.failed").data(data.to_string()));
                 }
                 if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.incomplete", json!({"response":payload,"error":{"code":"upstream_error","message":message}})) {
                     yield Ok(Event::default().event("response.incomplete").data(data.to_string()));
@@ -317,7 +321,9 @@ fn responses_live_stream(
                     if let Some(record) = record.clone() {
                         let _ = state.responses.update(record, ResponseStatus::Failed, json!({"messages":stored_messages,"tools":stored_tools,"response":payload}));
                     }
-                    let _ = state.responses.append_event(&id, "response.failed", &payload);
+                }
+                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.failed", json!({"response":payload,"error":{"code":"upstream_error","message":error.to_string()}})) {
+                    yield Ok(Event::default().event("response.failed").data(data.to_string()));
                 }
                 if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.incomplete", json!({"response":payload,"error":{"code":"upstream_error","message":error.to_string()}})) {
                     yield Ok(Event::default().event("response.incomplete").data(data.to_string()));
