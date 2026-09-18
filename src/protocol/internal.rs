@@ -112,18 +112,11 @@ pub enum InternalEvent {
         id: String,
         name: String,
     },
-    /// Backwards-compatible string form for callers that construct events
-    /// directly.
     ToolCallDelta {
         id: String,
         arguments: String,
         #[serde(default)]
         name: Option<String>,
-    },
-    /// Structured input form used by the wire decoder for object payloads.
-    ToolCallValueDelta {
-        id: String,
-        arguments: Value,
     },
     ToolCallEnd {
         id: String,

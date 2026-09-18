@@ -38,15 +38,16 @@ pub struct ResponsesError {
 impl ResponsesRequest {
     pub fn into_internal(self, previous: Vec<InternalMessage>) -> InternalRequest {
         let mut messages = previous;
+        let previous_len = messages.len();
         match self.input {
             Value::Array(items) => {
                 for item in items {
-                    append_item(&mut messages, &item);
+                    append_item(&mut messages, &item, previous_len);
                 }
             }
             Value::String(text) => messages.push(InternalMessage::new("user", Value::String(text))),
             item @ Value::Object(_) => {
-                if !append_item(&mut messages, &item) {
+                if !append_item(&mut messages, &item, previous_len) {
                     messages.push(InternalMessage::new("user", item));
                 }
             }
@@ -68,13 +69,15 @@ impl ResponsesRequest {
     }
 }
 
-fn append_item(messages: &mut Vec<InternalMessage>, item: &Value) -> bool {
+fn append_item(messages: &mut Vec<InternalMessage>, item: &Value, previous_len: usize) -> bool {
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => {
             let Some(call) = parse_function_call(item) else {
                 return false;
             };
-            if let Some(message) = messages.last_mut().filter(|message| message.role == "assistant")
+            let can_merge = messages.len() > previous_len;
+            if let Some(message) =
+                messages.last_mut().filter(|message| can_merge && message.role == "assistant")
             {
                 message.tool_calls.push(call);
             } else {
@@ -243,5 +246,30 @@ mod tests {
         .unwrap();
         let internal = request.into_internal(Vec::new());
         assert_eq!(internal.messages[0].tool_calls[0].id, "fc_only");
+    }
+
+    #[test]
+    fn does_not_merge_first_new_call_into_previous_response_assistant() {
+        let mut previous = InternalMessage::new("assistant", Value::Null);
+        previous.tool_calls.push(crate::protocol::internal::InternalToolCall {
+            id: "call_previous".into(),
+            name: "old".into(),
+            arguments: json!({}),
+            complete: true,
+        });
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"kiro",
+            "input":[
+                {"type":"function_call","call_id":"call_new_a","name":"alpha","arguments":{}},
+                {"type":"function_call","call_id":"call_new_b","name":"beta","arguments":{}}
+            ]
+        }))
+        .unwrap();
+        let internal = request.into_internal(vec![previous]);
+        assert_eq!(internal.messages.len(), 2);
+        assert_eq!(internal.messages[0].tool_calls[0].id, "call_previous");
+        assert_eq!(internal.messages[1].tool_calls.len(), 2);
+        assert_eq!(internal.messages[1].tool_calls[0].id, "call_new_a");
+        assert_eq!(internal.messages[1].tool_calls[1].id, "call_new_b");
     }
 }

@@ -168,18 +168,11 @@ pub fn decode_internal_events(
                 });
             }
             if let Some(arguments) = value.get("input").or_else(|| value.get("content")) {
-                let event = match arguments {
-                    Value::String(arguments) => InternalEvent::ToolCallDelta {
-                        id: id.clone(),
-                        arguments: arguments.clone(),
-                        name: None,
-                    },
-                    arguments => InternalEvent::ToolCallValueDelta {
-                        id: id.clone(),
-                        arguments: arguments.clone(),
-                    },
-                };
-                events.push(event);
+                events.push(InternalEvent::ToolCallDelta {
+                    id: id.clone(),
+                    arguments: value_to_fragment(arguments),
+                    name: None,
+                });
             }
             if bool_field(&value, &["stop", "isStop", "done"]) {
                 events.push(InternalEvent::ToolCallEnd { id, complete: true });
@@ -247,6 +240,8 @@ pub fn decode_internal_event(message: &EventMessage) -> Result<InternalEvent, Up
 fn value_to_fragment(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
+        Value::Object(object) if object.is_empty() => String::new(),
+        Value::Null => String::new(),
         value => value.to_string(),
     }
 }
