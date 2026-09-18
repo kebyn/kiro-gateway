@@ -91,11 +91,9 @@ fn parse_message(message: ChatMessage) -> InternalMessage {
         .tool_calls
         .into_iter()
         .filter(|call| call.r#type.as_deref().is_none_or(|kind| kind == "function"))
-        .map(|call| InternalToolCall {
-            id: call.id,
-            name: call.function.name,
-            arguments: parse_arguments(call.function.arguments),
-            complete: true,
+        .map(|call| {
+            let (arguments, complete) = parse_arguments(call.function.arguments);
+            InternalToolCall { id: call.id, name: call.function.name, arguments, complete }
         })
         .collect();
     if parsed.role == "tool" {
@@ -107,12 +105,16 @@ fn parse_message(message: ChatMessage) -> InternalMessage {
     parsed
 }
 
-fn parse_arguments(arguments: Value) -> Value {
+fn parse_arguments(arguments: Value) -> (Value, bool) {
     match arguments {
-        Value::String(arguments) => {
-            serde_json::from_str(&arguments).unwrap_or(Value::String(arguments))
-        }
-        arguments => arguments,
+        Value::String(arguments) if arguments.trim().is_empty() => (serde_json::json!({}), true),
+        Value::String(arguments) => match serde_json::from_str::<Value>(&arguments) {
+            Ok(value) if value.is_object() => (value, true),
+            Ok(value) => (value, false),
+            Err(_) => (Value::String(arguments), false),
+        },
+        Value::Object(object) => (Value::Object(object), true),
+        value => (value, false),
     }
 }
 
@@ -141,5 +143,19 @@ mod tests {
         assert_eq!(internal.messages[0].tool_calls[1].arguments["value"], 2);
         assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_a");
         assert_eq!(internal.messages[2].tool_results[0].content[0]["text"], "second");
+    }
+
+    #[test]
+    fn marks_truncated_function_arguments_incomplete() {
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"assistant","tool_calls":[
+                {"id":"call_partial","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}}
+            ]}]
+        }))
+        .unwrap();
+        let internal: InternalRequest = request.into();
+        assert!(!internal.messages[0].tool_calls[0].complete);
+        assert_eq!(internal.messages[0].tool_calls[0].arguments, "{\"q\":");
     }
 }

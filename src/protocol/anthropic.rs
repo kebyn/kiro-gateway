@@ -94,11 +94,12 @@ fn parse_content_block(item: Value, content: &mut Vec<Value>, message: &mut Inte
             if let (Some(id), Some(name)) =
                 (item.get("id").and_then(Value::as_str), item.get("name").and_then(Value::as_str))
             {
+                let input = item.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
                 message.tool_calls.push(InternalToolCall {
                     id: id.to_owned(),
                     name: name.to_owned(),
-                    arguments: item.get("input").cloned().unwrap_or_else(|| serde_json::json!({})),
-                    complete: true,
+                    complete: input.is_object(),
+                    arguments: input,
                 });
             }
         }
@@ -157,5 +158,19 @@ mod tests {
         assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_weather");
         assert!(internal.messages[1].tool_results[1].is_error);
         assert_eq!(crate::protocol::internal::content_text(&internal.messages[0]), "Checking");
+    }
+
+    #[test]
+    fn marks_non_object_tool_input_incomplete() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"assistant","content":[
+                {"type":"tool_use","id":"call_partial","name":"lookup","input":"{\"q\":"}
+            ]}]
+        }))
+        .unwrap();
+        let internal: InternalRequest = request.into();
+        assert!(!internal.messages[0].tool_calls[0].complete);
+        assert_eq!(internal.messages[0].tool_calls[0].arguments, "{\"q\":");
     }
 }
