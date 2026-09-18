@@ -93,6 +93,12 @@ pub async fn messages(
             }
             match event {
                 InternalEvent::TextDelta { text } => {
+                    if let Some(index) = thinking_index {
+                        if closed_blocks.insert(index) {
+                            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+                        }
+                        thinking_index = None;
+                    }
                     let was_none = text_index.is_none();
                     let index = *text_index.get_or_insert_with(|| {
                         let value = next_index;
@@ -109,6 +115,12 @@ pub async fn messages(
                     }
                 }
                 InternalEvent::ThinkingDelta { text } => {
+                    if let Some(index) = text_index {
+                        if closed_blocks.insert(index) {
+                            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+                        }
+                        text_index = None;
+                    }
                     let was_none = thinking_index.is_none();
                     let index = *thinking_index.get_or_insert_with(|| {
                         let value = next_index;
@@ -124,6 +136,13 @@ pub async fn messages(
                     }
                 }
                 InternalEvent::ToolCallStart { id, name } => {
+                    for index in [text_index, thinking_index].into_iter().flatten() {
+                        if closed_blocks.insert(index) {
+                            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+                        }
+                    }
+                    text_index = None;
+                    thinking_index = None;
                     let key = if id.is_empty() {
                         active_tool.clone().unwrap_or_else(|| format!("tool_call_{}", tool_indices.len() + 1))
                     } else { id };
@@ -137,6 +156,13 @@ pub async fn messages(
                     active_tool = Some(key);
                 }
                 InternalEvent::ToolCallDelta { id, arguments, name } => {
+                    for index in [text_index, thinking_index].into_iter().flatten() {
+                        if closed_blocks.insert(index) {
+                            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+                        }
+                    }
+                    text_index = None;
+                    thinking_index = None;
                     let mut key = id;
                     if key.is_empty() {
                         key = active_tool.clone().unwrap_or_else(|| format!("tool_call_{}", tool_indices.len() + 1));
