@@ -2,7 +2,7 @@ use crate::{
     AppState,
     error::AppError,
     protocol::{
-        internal::{InternalEvent, InternalMessage, InternalResponse, InternalToolCall, Usage},
+        internal::{InternalEvent, InternalMessage, InternalResponse, InternalToolCall},
         openai_responses::ResponsesRequest,
     },
     response_store::{ResponseStatus, ResponseStore},

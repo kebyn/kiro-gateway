@@ -452,10 +452,11 @@ fn parse_json_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_internal_event, finish_stream_response, is_empty_stream, parse_json_tool_calls,
+        apply_internal_event, finish_stream_response, is_empty_stream, json_events,
+        parse_json_tool_calls,
     };
     use crate::{
-        protocol::internal::InternalResponse,
+        protocol::internal::{InternalEvent, InternalResponse},
         transform::truncation::XmlLeakFilter,
         upstream::{
             event_stream::{EventStreamDecoder, decode_internal_events},
@@ -534,6 +535,21 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].complete);
         assert_eq!(calls[0].arguments, serde_json::json!("{\"query\":"));
+    }
+
+    #[test]
+    fn adapts_json_response_to_ordered_internal_events() {
+        let events = json_events(
+            br#"{"content":"answer","thinking":"plan","toolUses":[{"toolUseId":"call_1","name":"lookup","input":"{\"id\":1}"}],"usage":{"inputTokens":2,"outputTokens":3},"stopReason":"end_turn"}"#,
+        )
+        .unwrap();
+        assert!(matches!(events[0], InternalEvent::TextDelta { .. }));
+        assert!(matches!(events[1], InternalEvent::ThinkingDelta { .. }));
+        assert!(matches!(events[2], InternalEvent::ToolCallStart { .. }));
+        assert!(matches!(events[3], InternalEvent::ToolCallDelta { .. }));
+        assert!(matches!(events[4], InternalEvent::ToolCallEnd { .. }));
+        assert!(matches!(events[5], InternalEvent::Usage { .. }));
+        assert!(matches!(events[6], InternalEvent::Stop { .. }));
     }
 
     #[test]
