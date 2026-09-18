@@ -143,7 +143,10 @@ pub fn decode_internal_event(message: &EventMessage) -> Result<InternalEvent, Up
             arguments: value
                 .get("input")
                 .or_else(|| value.get("content"))
-                .map(Value::to_string)
+                .map(|arguments| match arguments {
+                    Value::String(arguments) => arguments.clone(),
+                    arguments => arguments.to_string(),
+                })
                 .unwrap_or_default(),
             name: value
                 .get("name")

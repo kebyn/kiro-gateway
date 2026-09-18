@@ -1,4 +1,6 @@
-use crate::protocol::internal::{InternalMessage, InternalRequest, InternalTool};
+use crate::protocol::internal::{
+    InternalMessage, InternalRequest, InternalTool, InternalToolCall, InternalToolResult,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -26,7 +28,19 @@ pub struct ChatMessage {
     #[serde(default)]
     pub tool_call_id: Option<String>,
     #[serde(default)]
-    pub tool_calls: Vec<Value>,
+    pub tool_calls: Vec<ChatToolCall>,
+}
+#[derive(Debug, Deserialize)]
+pub struct ChatToolCall {
+    pub id: String,
+    #[serde(default)]
+    pub r#type: Option<String>,
+    pub function: ChatFunctionCall,
+}
+#[derive(Debug, Deserialize)]
+pub struct ChatFunctionCall {
+    pub name: String,
+    pub arguments: Value,
 }
 #[derive(Debug, Deserialize)]
 pub struct ChatTool {
@@ -46,16 +60,7 @@ impl From<ChatRequest> for InternalRequest {
     fn from(value: ChatRequest) -> Self {
         Self {
             model: value.model,
-            messages: value
-                .messages
-                .into_iter()
-                .map(|m| InternalMessage {
-                    role: m.role,
-                    content: m.content.unwrap_or(Value::Null),
-                    name: m.name,
-                    tool_call_id: m.tool_call_id,
-                })
-                .collect(),
+            messages: value.messages.into_iter().map(parse_message).collect(),
             system: None,
             tools: value
                 .tools
@@ -74,5 +79,67 @@ impl From<ChatRequest> for InternalRequest {
             conversation_id: None,
             instructions: None,
         }
+    }
+}
+
+fn parse_message(message: ChatMessage) -> InternalMessage {
+    let content = message.content.unwrap_or(Value::Null);
+    let mut parsed = InternalMessage::new(message.role, content.clone());
+    parsed.name = message.name;
+    parsed.tool_call_id = message.tool_call_id.clone();
+    parsed.tool_calls = message
+        .tool_calls
+        .into_iter()
+        .filter(|call| call.r#type.as_deref().is_none_or(|kind| kind == "function"))
+        .map(|call| InternalToolCall {
+            id: call.id,
+            name: call.function.name,
+            arguments: parse_arguments(call.function.arguments),
+            complete: true,
+        })
+        .collect();
+    if parsed.role == "tool" {
+        if let Some(tool_call_id) = message.tool_call_id {
+            parsed.tool_results.push(InternalToolResult { tool_call_id, content, is_error: false });
+            parsed.content = Value::Null;
+        }
+    }
+    parsed
+}
+
+fn parse_arguments(arguments: Value) -> Value {
+    match arguments {
+        Value::String(arguments) => {
+            serde_json::from_str(&arguments).unwrap_or(Value::String(arguments))
+        }
+        arguments => arguments,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatRequest;
+    use crate::protocol::internal::InternalRequest;
+
+    #[test]
+    fn preserves_parallel_calls_and_tool_messages() {
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[
+                {"role":"assistant","content":"Working","tool_calls":[
+                    {"id":"call_a","type":"function","function":{"name":"alpha","arguments":"{\"value\":1}"}},
+                    {"id":"call_b","type":"function","function":{"name":"beta","arguments":"{\"value\":2}"}}
+                ]},
+                {"role":"tool","tool_call_id":"call_a","content":"first"},
+                {"role":"tool","tool_call_id":"call_b","content":[{"type":"text","text":"second"}]}
+            ]
+        }))
+        .unwrap();
+
+        let internal: InternalRequest = request.into();
+        assert_eq!(internal.messages[0].tool_calls.len(), 2);
+        assert_eq!(internal.messages[0].tool_calls[1].arguments["value"], 2);
+        assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_a");
+        assert_eq!(internal.messages[2].tool_results[0].content[0]["text"], "second");
     }
 }

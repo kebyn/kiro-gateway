@@ -106,8 +106,10 @@ impl UpstreamClient {
                         .unwrap_or_default(),
                 )
             });
+            let tool_calls = parse_json_tool_calls(&body);
             return Ok(crate::protocol::internal::InternalResponse {
                 text,
+                tool_calls,
                 usage,
                 stop_reason: body
                     .get("stopReason")
@@ -144,10 +146,7 @@ impl UpstreamClient {
                         tools.append(Some(&id), &arguments);
                     }
                     InternalEvent::ToolCallEnd { id, complete } => {
-                        if let Some(mut call) = tools.finish(Some(&id)) {
-                            call.complete = complete;
-                            output.tool_calls.push(call);
-                        }
+                        tools.finish_with_state(Some(&id), complete);
                     }
                     InternalEvent::Usage { usage } => output.usage = Some(usage),
                     InternalEvent::Stop { reason } => output.stop_reason = Some(reason),
@@ -156,12 +155,74 @@ impl UpstreamClient {
             }
         }
         decoder.finish().map_err(|e| AppError::Integrity(e.to_string()))?;
-        if tools.incomplete() {
+        output.tool_calls = tools.finish_all();
+        if output.tool_calls.iter().any(|call| !call.complete) {
             output.incomplete = true;
-            if output.tool_calls.is_empty() {
-                output.tool_calls = tools.calls();
-            }
         }
         Ok(output)
+    }
+}
+
+fn parse_json_tool_calls(
+    body: &serde_json::Value,
+) -> Vec<crate::protocol::internal::InternalToolCall> {
+    let items = body
+        .get("toolUses")
+        .or_else(|| body.get("tool_uses"))
+        .or_else(|| body.get("toolCalls"))
+        .or_else(|| body.get("tool_calls"))
+        .and_then(serde_json::Value::as_array);
+    let Some(items) = items else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = item
+                .get("toolUseId")
+                .or_else(|| item.get("tool_use_id"))
+                .or_else(|| item.get("id"))
+                .and_then(serde_json::Value::as_str)?
+                .to_owned();
+            let name = item
+                .get("name")
+                .or_else(|| item.get("toolName"))
+                .and_then(serde_json::Value::as_str)?
+                .to_owned();
+            let arguments = item
+                .get("input")
+                .or_else(|| item.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let arguments = match arguments {
+                serde_json::Value::String(raw) => {
+                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw))
+                }
+                value => value,
+            };
+            let complete =
+                item.get("complete").and_then(serde_json::Value::as_bool).unwrap_or(true);
+            Some(crate::protocol::internal::InternalToolCall { id, name, arguments, complete })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_json_tool_calls;
+
+    #[test]
+    fn parses_parallel_json_tool_uses() {
+        let calls = parse_json_tool_calls(&serde_json::json!({
+            "toolUses": [
+                {"toolUseId":"call_a","name":"alpha","input":r#"{"a":1}"#},
+                {"toolUseId":"call_b","name":"beta","input":{"b":2},"complete":false}
+            ]
+        }));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].arguments["a"], 1);
+        assert_eq!(calls[1].arguments["b"], 2);
+        assert!(!calls[1].complete);
     }
 }

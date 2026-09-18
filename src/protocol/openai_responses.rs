@@ -1,4 +1,6 @@
-use crate::protocol::internal::{InternalMessage, InternalRequest, InternalTool};
+use crate::protocol::internal::{
+    InternalMessage, InternalRequest, InternalTool, InternalToolCall, InternalToolResult,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -36,19 +38,19 @@ pub struct ResponsesError {
 impl ResponsesRequest {
     pub fn into_internal(self, previous: Vec<InternalMessage>) -> InternalRequest {
         let mut messages = previous;
-        if let Some(items) = self.input.as_array() {
-            for item in items {
-                if let Some(message) = parse_item(item) {
-                    messages.push(message);
+        match self.input {
+            Value::Array(items) => {
+                for item in items {
+                    append_item(&mut messages, &item);
                 }
             }
-        } else {
-            messages.push(InternalMessage {
-                role: "user".into(),
-                content: self.input,
-                name: None,
-                tool_call_id: None,
-            });
+            Value::String(text) => messages.push(InternalMessage::new("user", Value::String(text))),
+            item @ Value::Object(_) => {
+                if !append_item(&mut messages, &item) {
+                    messages.push(InternalMessage::new("user", item));
+                }
+            }
+            value => messages.push(InternalMessage::new("user", value)),
         }
         let tools = self.tools.into_iter().filter_map(parse_tool).collect();
         InternalRequest {
@@ -66,24 +68,70 @@ impl ResponsesRequest {
     }
 }
 
-fn parse_item(item: &Value) -> Option<InternalMessage> {
-    let raw_role = item
-        .get("role")
-        .and_then(Value::as_str)
-        .or_else(|| item.get("type").and_then(Value::as_str))?;
-    let role = if raw_role == "function_call_output" { "tool" } else { raw_role }.to_owned();
-    let content =
-        item.get("content").cloned().or_else(|| item.get("text").cloned()).unwrap_or(Value::Null);
-    Some(InternalMessage {
-        role,
-        content,
-        name: item.get("name").and_then(Value::as_str).map(ToOwned::to_owned),
-        tool_call_id: item
-            .get("call_id")
-            .or_else(|| item.get("tool_call_id"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-    })
+fn append_item(messages: &mut Vec<InternalMessage>, item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            let Some(call) = parse_function_call(item) else {
+                return false;
+            };
+            if let Some(message) = messages.last_mut().filter(|message| message.role == "assistant")
+            {
+                message.tool_calls.push(call);
+            } else {
+                let mut message = InternalMessage::new("assistant", Value::Null);
+                message.tool_calls.push(call);
+                messages.push(message);
+            }
+            true
+        }
+        Some("function_call_output") => {
+            let Some(tool_call_id) =
+                item.get("call_id").or_else(|| item.get("tool_call_id")).and_then(Value::as_str)
+            else {
+                return false;
+            };
+            let mut message = InternalMessage::new("tool", Value::Null);
+            message.tool_call_id = Some(tool_call_id.to_owned());
+            message.tool_results.push(InternalToolResult {
+                tool_call_id: tool_call_id.to_owned(),
+                content: item.get("output").cloned().unwrap_or(Value::Null),
+                is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false)
+                    || item.get("status").and_then(Value::as_str) == Some("failed"),
+            });
+            messages.push(message);
+            true
+        }
+        Some("message") | None if item.get("role").and_then(Value::as_str).is_some() => {
+            let role = item.get("role").and_then(Value::as_str).unwrap();
+            let content = item
+                .get("content")
+                .cloned()
+                .or_else(|| item.get("text").cloned())
+                .unwrap_or(Value::Null);
+            let mut message = InternalMessage::new(role, content);
+            message.name = item.get("name").and_then(Value::as_str).map(ToOwned::to_owned);
+            messages.push(message);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn parse_function_call(item: &Value) -> Option<InternalToolCall> {
+    let id = item
+        .get("call_id")
+        .or_else(|| item.get("tool_call_id"))
+        .or_else(|| item.get("id"))?
+        .as_str()?
+        .to_owned();
+    let name = item.get("name")?.as_str()?.to_owned();
+    let arguments = match item.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({})) {
+        Value::String(arguments) => {
+            serde_json::from_str(&arguments).unwrap_or(Value::String(arguments))
+        }
+        arguments => arguments,
+    };
+    Some(InternalToolCall { id, name, arguments, complete: true })
 }
 fn parse_tool(tool: Value) -> Option<InternalTool> {
     let function = tool.get("function").unwrap_or(&tool);
@@ -96,4 +144,54 @@ fn parse_tool(tool: Value) -> Option<InternalTool> {
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"type":"object"})),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResponsesRequest;
+    use crate::protocol::internal::InternalMessage;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn parses_parallel_calls_and_function_outputs() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"kiro",
+            "input":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking"}]},
+                {"type":"function_call","id":"fc_item_a","call_id":"call_a","name":"alpha","arguments":"{\"value\":1}"},
+                {"type":"function_call","id":"fc_item_b","call_id":"call_b","name":"beta","arguments":"{\"value\":2}"},
+                {"type":"function_call_output","call_id":"call_a","output":"first"},
+                {"type":"function_call_output","call_id":"call_b","output":{"answer":2},"status":"failed"}
+            ]
+        }))
+        .unwrap();
+
+        let internal = request.into_internal(Vec::new());
+        assert_eq!(internal.messages.len(), 3);
+        assert_eq!(internal.messages[0].tool_calls.len(), 2);
+        assert_eq!(internal.messages[0].tool_calls[0].id, "call_a");
+        assert_eq!(internal.messages[0].tool_calls[1].arguments["value"], 2);
+        assert_eq!(internal.messages[1].tool_results[0].content, Value::String("first".into()));
+        assert!(internal.messages[2].tool_results[0].is_error);
+    }
+
+    #[test]
+    fn appends_function_output_to_stored_tool_call_history() {
+        let mut assistant = InternalMessage::new("assistant", Value::Null);
+        assistant.tool_calls.push(crate::protocol::internal::InternalToolCall {
+            id: "call_saved".into(),
+            name: "lookup".into(),
+            arguments: json!({"id":7}),
+            complete: true,
+        });
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"kiro",
+            "input":[{"type":"function_call_output","call_id":"call_saved","output":"done"}]
+        }))
+        .unwrap();
+
+        let internal = request.into_internal(vec![assistant]);
+        assert_eq!(internal.messages[0].tool_calls[0].id, "call_saved");
+        assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_saved");
+    }
 }
