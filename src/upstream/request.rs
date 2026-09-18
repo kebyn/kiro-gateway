@@ -195,7 +195,8 @@ async fn send_once(
             credential.access_token.as_ref().map(|v| v.expose_secret()).unwrap_or_default(),
         )
         .json(&body)
-        .header("x-amzn-codewhisperer-optout", "true");
+        .header("x-amzn-codewhisperer-optout", "true")
+        .header("accept", "application/vnd.amazon.eventstream, application/json");
     if matches!(credential.auth_method, AuthMethod::ApiKey) {
         builder = builder.header("tokentype", "API_KEY");
     } else if matches!(credential.auth_method, AuthMethod::Social) {
