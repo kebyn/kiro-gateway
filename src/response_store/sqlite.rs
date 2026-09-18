@@ -84,6 +84,7 @@ impl SqliteStore {
         let created_at = Utc::now();
         let mut stored_payload = payload.clone();
         if let Value::Object(object) = &mut stored_payload {
+            object.insert("type".into(), Value::String(event_type.to_owned()));
             object.insert("sequence_number".into(), Value::from(sequence));
         }
         conn.execute(
