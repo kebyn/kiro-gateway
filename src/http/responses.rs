@@ -168,6 +168,7 @@ struct LiveTool {
     arguments: String,
     output_index: usize,
     ended: bool,
+    done_emitted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +218,7 @@ impl LiveResponseState {
             arguments: String::new(),
             output_index,
             ended: false,
+            done_emitted: false,
         });
         self.tool_indices.insert(call_id.to_owned(), index);
         self.item_order.push(LiveItem::Tool(index));
@@ -378,15 +380,30 @@ fn responses_live_stream(
                     if let Some(key) = key {
                         if let Some(tool_index) = live.tool_indices.get(&key).copied() {
                             let tool = &mut live.tools[tool_index];
+                            if tool.done_emitted {
+                                continue;
+                            }
                             tool.ended = true;
                             let item_id = tool.item_id.clone();
                             let call_id = tool.call_id.clone();
                             let output_index = tool.output_index;
                             let arguments = tool.arguments.clone();
-                            let _ = complete;
+                            let arguments_complete = tool.arguments.trim().is_empty()
+                                || serde_json::from_str::<Value>(&tool.arguments)
+                                    .is_ok_and(|value| value.is_object());
+                            let status = if complete && arguments_complete {
+                                "completed"
+                            } else {
+                                "incomplete"
+                            };
                             if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.function_call_arguments.done", json!({"item_id":item_id,"call_id":call_id,"output_index":output_index,"arguments":arguments})) {
                                 yield Ok(Event::default().event("response.function_call_arguments.done").data(data.to_string()));
                             }
+                            let item = json!({"type":"function_call","id":item_id,"call_id":call_id,"name":tool.name,"arguments":tool.arguments,"status":status});
+                            if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.done", json!({"output_index":output_index,"item":item})) {
+                                yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
+                            }
+                            tool.done_emitted = true;
                         }
                     }
                 }
@@ -442,9 +459,11 @@ fn responses_live_stream(
                             yield Ok(Event::default().event("response.function_call_arguments.done").data(data.to_string()));
                         }
                     }
-                    if let Some(item) = payload["output"].as_array().and_then(|items| items.iter().find(|item| item["id"] == tool.item_id)) {
+                    if !tool.done_emitted {
+                        if let Some(item) = payload["output"].as_array().and_then(|items| items.iter().find(|item| item["id"] == tool.item_id)) {
                         if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.done", json!({"output_index":tool.output_index,"item":item})) {
                             yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
+                        }
                         }
                     }
                 }
@@ -710,7 +729,10 @@ pub async fn delete(
 
 #[cfg(test)]
 mod tests {
-    use super::{create, response_messages, responses_payload, responses_stream_events};
+    use super::{
+        create, response_messages, responses_live_stream, responses_payload,
+        responses_stream_events,
+    };
     use crate::{
         AppState,
         app_state::build_upstream,
@@ -721,7 +743,9 @@ mod tests {
         protocol::openai_responses::ResponsesRequest,
         response_store::{ResponseStatus, ResponseStore},
     };
+    use axum::response::IntoResponse;
     use axum::{Json, extract::State};
+    use futures_util::stream;
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use std::{path::Path, sync::Arc};
@@ -814,6 +838,64 @@ mod tests {
         assert_eq!(stored.status, ResponseStatus::Completed);
         assert!(state.responses.delete(&id).unwrap());
         assert!(state.responses.events(&id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_tool_arguments_and_item_completion_keep_arrival_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory.path().join("responses.sqlite3"));
+        let internal = crate::protocol::internal::InternalRequest {
+            model: "kiro".into(),
+            messages: vec![InternalMessage::new("user", Value::String("lookup".into()))],
+            system: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            conversation_id: None,
+            instructions: None,
+        };
+        let upstream: crate::upstream::request::InternalEventStream = Box::pin(stream::iter(vec![
+            Ok(crate::protocol::internal::InternalEvent::ToolCallStart {
+                id: "call_1".into(),
+                name: "lookup".into(),
+            }),
+            Ok(crate::protocol::internal::InternalEvent::ToolCallDelta {
+                id: "call_1".into(),
+                arguments: "{\"x\":".into(),
+                name: None,
+            }),
+            Ok(crate::protocol::internal::InternalEvent::ToolCallDelta {
+                id: "call_1".into(),
+                arguments: "1}".into(),
+                name: None,
+            }),
+            Ok(crate::protocol::internal::InternalEvent::ToolCallEnd {
+                id: "call_1".into(),
+                complete: true,
+            }),
+            Ok(crate::protocol::internal::InternalEvent::Stop { reason: "end_turn".into() }),
+        ]));
+        let response = responses_live_stream(
+            state,
+            upstream,
+            "resp_test".into(),
+            "kiro".into(),
+            internal,
+            false,
+            None,
+        )
+        .into_response();
+        let body =
+            String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec())
+                .unwrap();
+        let delta = body.find("response.function_call_arguments.delta").unwrap();
+        let done = body.find("response.function_call_arguments.done").unwrap();
+        let item_done = body.find("response.output_item.done").unwrap();
+        assert!(delta < done && done < item_done);
+        assert!(body.contains("\\\"x\\\":1}"));
+        assert!(body.contains("response.completed"));
     }
 
     #[tokio::test]
