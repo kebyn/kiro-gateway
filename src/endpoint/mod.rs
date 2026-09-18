@@ -168,11 +168,13 @@ fn active_tool_round(
             .filter(|call| call.complete && declared_tools.contains(call.name.as_str()))
             .map(|call| call.id.clone())
             .collect();
-        let has_matching_result = following
+        let result_ids: HashSet<&str> = following
             .iter()
             .flat_map(|candidate| &candidate.tool_results)
-            .any(|result| call_ids.contains(result.tool_call_id.as_str()));
-        has_matching_result.then_some(ActiveToolRound { index, call_ids })
+            .map(|result| result.tool_call_id.as_str())
+            .collect();
+        (!call_ids.is_empty() && call_ids.iter().all(|id| result_ids.contains(id.as_str())))
+            .then_some(ActiveToolRound { index, call_ids })
     })
 }
 
@@ -513,5 +515,35 @@ mod tests {
         assert!(current_text.contains("call_hidden"));
         assert!(current_text.contains("call_incomplete"));
         assert!(!current_text.contains("duplicate"));
+    }
+
+    #[test]
+    fn does_not_keep_a_partial_tool_round_structured() {
+        let mut assistant = InternalMessage::new("assistant", Value::Null);
+        assistant.tool_calls.push(call("call_a", "alpha"));
+        assistant.tool_calls.push(call("call_b", "beta"));
+        let body = conversation_body(
+            &request(vec![
+                InternalMessage::new("user", Value::String("question".into())),
+                assistant,
+                result("call_a", Value::String("only one result".into()), false),
+            ]),
+            &Credential::default(),
+            "AI_EDITOR",
+            "kiro",
+        );
+        let state = &body["conversationState"];
+        assert!(state["history"][1]["assistantResponseMessage"]["toolUses"].is_null());
+        assert!(
+            state["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+                .get("toolResults")
+                .is_none()
+        );
+        assert!(
+            state["history"][1]["assistantResponseMessage"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("call_a")
+        );
     }
 }
