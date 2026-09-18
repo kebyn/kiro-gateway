@@ -106,6 +106,7 @@ impl ResponseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::OptionalExtension;
 
     #[test]
     fn response_round_trips_and_deletes() {
@@ -150,5 +151,28 @@ mod tests {
         assert_eq!(store.events(&record.id).unwrap().len(), 2);
         assert!(store.delete(&record.id).unwrap());
         assert!(store.events(&record.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn schema_does_not_keep_unused_conversations_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("responses.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute("CREATE TABLE conversations (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)", [])
+                .unwrap();
+        }
+        let _store = ResponseStore::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let table: Option<String> = connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(table.is_none());
     }
 }
