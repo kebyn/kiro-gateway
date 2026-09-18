@@ -187,6 +187,35 @@ struct LiveResponseState {
     next_output_index: usize,
 }
 
+struct IncompleteRecordGuard {
+    store: Option<ResponseStore>,
+    record_id: String,
+    model: String,
+    messages: Vec<InternalMessage>,
+    tools: Vec<crate::protocol::internal::InternalTool>,
+}
+
+impl Drop for IncompleteRecordGuard {
+    fn drop(&mut self) {
+        let Some(store) = self.store.as_ref() else { return };
+        let Ok(Some(record)) = store.get(&self.record_id) else { return };
+        if record.status != ResponseStatus::InProgress {
+            return;
+        }
+        let payload = response_error_payload(
+            &self.record_id,
+            &self.model,
+            "client disconnected before response completion",
+        );
+        let _ = store.update(
+            record,
+            ResponseStatus::Incomplete,
+            json!({"messages":self.messages,"tools":self.tools,"response":payload}),
+        );
+        let _ = store.append_event(&self.record_id, "response.incomplete", &payload);
+    }
+}
+
 impl LiveResponseState {
     fn ensure_text(&mut self) -> (String, usize, bool) {
         if let (Some(id), Some(index)) = (&self.text_item_id, self.text_output_index) {
@@ -256,7 +285,15 @@ fn responses_live_stream(
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let stored_messages = response_messages(&internal.messages, &InternalResponse::default());
     let stored_tools = internal.tools.clone();
+    let disconnect_guard = record.as_ref().map(|_| IncompleteRecordGuard {
+        store: store.then_some(state.responses.clone()),
+        record_id: id.clone(),
+        model: model.clone(),
+        messages: stored_messages.clone(),
+        tools: stored_tools.clone(),
+    });
     let stream = async_stream::stream! {
+        let _disconnect_guard = disconnect_guard;
         let mut sequence = 0_u64;
         let mut live = LiveResponseState::default();
         let mut accumulator = InternalEventAccumulator::new();
@@ -902,6 +939,57 @@ mod tests {
         assert!(delta < done && done < item_done);
         assert!(body.contains("\\\"x\\\":1}"));
         assert!(body.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_live_stream_marks_an_in_progress_record_incomplete() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory.path().join("responses.sqlite3"));
+        let record = state
+            .responses
+            .create_with_id(
+                "resp_disconnect".into(),
+                "kiro",
+                json!({"messages":[],"tools":[],"response":{}}),
+                ResponseStatus::InProgress,
+            )
+            .unwrap();
+        let internal = crate::protocol::internal::InternalRequest {
+            model: "kiro".into(),
+            messages: Vec::new(),
+            system: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            conversation_id: None,
+            instructions: None,
+        };
+        let upstream: crate::upstream::request::InternalEventStream = Box::pin(stream::pending());
+        let response = responses_live_stream(
+            state.clone(),
+            upstream,
+            record.id.clone(),
+            "kiro".into(),
+            internal,
+            true,
+            Some(record),
+        )
+        .into_response();
+        drop(response);
+        assert_eq!(
+            state.responses.get("resp_disconnect").unwrap().unwrap().status,
+            ResponseStatus::Incomplete
+        );
+        assert!(
+            state
+                .responses
+                .events("resp_disconnect")
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == "response.incomplete")
+        );
     }
 
     #[tokio::test]
