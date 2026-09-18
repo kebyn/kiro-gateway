@@ -5,7 +5,6 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 description = "A single-tenant Kiro gateway with Anthropic, OpenAI Chat and Responses APIs"
-repository = "https://example.invalid/kiro-gateway-rs"
 build = "build.rs"
 
 [features]
