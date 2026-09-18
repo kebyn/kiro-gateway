@@ -27,7 +27,7 @@ impl AppState {
     ) -> Result<InternalEventStream, AppError> {
         self.token_manager.ensure_fresh().await?;
         let credential = self.token_manager.credential();
-        if credential.access_token.is_none() {
+        if credential.access_token.as_ref().is_none_or(|token| token.is_empty()) {
             let text = format!(
                 "Kiro gateway is configured; upstream is not available for model {}. Request received: {}",
                 request.model,
