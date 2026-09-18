@@ -6,6 +6,7 @@ use crate::{
         openai_responses::ResponsesRequest,
     },
     response_store::{ResponseStatus, ResponseStore},
+    transform::converter::responses_incomplete_reason,
 };
 use axum::{
     Json,
@@ -67,7 +68,8 @@ pub async fn create(
 }
 
 fn responses_payload(id: &str, model: &str, response: &InternalResponse) -> Value {
-    let status = if response.incomplete { "incomplete" } else { "completed" };
+    let incomplete_reason = responses_incomplete_reason(response);
+    let status = if incomplete_reason.is_some() { "incomplete" } else { "completed" };
     let mut output = Vec::new();
     if !response.text.is_empty() {
         output.push(json!({
@@ -93,13 +95,22 @@ fn responses_payload(id: &str, model: &str, response: &InternalResponse) -> Valu
             "status":if call.complete { "completed" } else { "incomplete" }
         }));
     }
+    if output.is_empty() {
+        output.push(json!({
+            "type":"message",
+            "id":format!("msg_{}", uuid::Uuid::now_v7()),
+            "status":status,
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"","annotations":[],"logprobs":[]}]
+        }));
+    }
     json!({
         "id":id,
         "object":"response",
         "created_at":chrono::Utc::now().timestamp(),
         "status":status,
         "error":null,
-        "incomplete_details":null,
+        "incomplete_details":incomplete_reason.map(|reason| json!({"reason":reason})),
         "model":model,
         "output":output,
         "output_text":response.text,
@@ -211,14 +222,14 @@ fn responses_stream_events(payload: &Value) -> Vec<(&'static str, Value)> {
                         &mut events,
                         &mut sequence_number,
                         "response.function_call_arguments.delta",
-                        json!({"item_id":item["id"],"output_index":output_index,"delta":arguments}),
+                        json!({"item_id":item["id"],"call_id":item["call_id"],"output_index":output_index,"delta":arguments}),
                     );
                 }
                 push_event(
                     &mut events,
                     &mut sequence_number,
                     "response.function_call_arguments.done",
-                    json!({"item_id":item["id"],"output_index":output_index,"arguments":arguments}),
+                    json!({"item_id":item["id"],"call_id":item["call_id"],"output_index":output_index,"arguments":arguments}),
                 );
                 push_event(
                     &mut events,
@@ -339,6 +350,32 @@ mod tests {
         assert_eq!(events[2].1["output_index"], 0);
         assert_eq!(events.last().unwrap().0, "response.incomplete");
         assert_eq!(events.last().unwrap().1["response"]["status"], "incomplete");
+    }
+
+    #[test]
+    fn incomplete_payload_exposes_reason_and_stream_call_identity() {
+        let mut response = response("");
+        response.stop_reason = Some("MAX_TOKENS".into());
+        response.incomplete = true;
+        let payload = responses_payload("resp_test", "kiro", &response);
+        assert_eq!(payload["status"], "incomplete");
+        assert_eq!(payload["incomplete_details"]["reason"], "max_output_tokens");
+        let events = responses_stream_events(&payload);
+        let delta = events
+            .iter()
+            .find(|(kind, _)| *kind == "response.function_call_arguments.delta")
+            .unwrap();
+        assert_eq!(delta.1["call_id"], "call_upstream");
+        assert_eq!(delta.1["item_id"], payload["output"][0]["id"]);
+        assert_eq!(delta.1["output_index"], 0);
+    }
+
+    #[test]
+    fn empty_response_has_a_message_output_item() {
+        let payload = responses_payload("resp_test", "kiro", &InternalResponse::default());
+        assert_eq!(payload["output"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["output"][0]["type"], "message");
+        assert_eq!(payload["output"][0]["content"][0]["text"], "");
     }
 
     #[test]
