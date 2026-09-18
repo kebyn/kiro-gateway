@@ -182,9 +182,6 @@ fn apply_internal_event(
             }
             tools.append(Some(&id), &arguments);
         }
-        InternalEvent::ToolCallValueDelta { id, arguments } => {
-            tools.append_value(Some(&id), &arguments);
-        }
         InternalEvent::ToolCallEnd { id, complete } => {
             if tools.finish_with_state(Some(&id), complete).is_some_and(|call| call.complete) {
                 integrity.completed = true;
