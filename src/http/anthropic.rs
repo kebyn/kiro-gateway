@@ -1,11 +1,13 @@
+use crate::transform::truncation::XmlLeakFilter;
 use crate::{
     AppState,
     error::AppError,
     protocol::{
         anthropic::{CountTokensRequest, MessagesRequest},
-        internal::{InternalRequest, InternalResponse},
+        internal::{InternalEvent, InternalRequest, InternalResponse},
     },
     transform::converter::{anthropic_response, anthropic_stop_reason},
+    upstream::request::InternalEventAccumulator,
 };
 use axum::{
     Json,
@@ -15,8 +17,9 @@ use axum::{
         sse::{Event, Sse},
     },
 };
-use futures_util::stream;
+use futures_util::StreamExt;
 use serde_json::json;
+use std::{collections::HashMap, convert::Infallible};
 
 pub async fn messages(
     State(state): State<AppState>,
@@ -25,17 +28,150 @@ pub async fn messages(
     let request: InternalRequest = body.into();
     let stream_response = request.stream;
     let model = request.model.clone();
-    let response = state.complete(&request).await?;
-    let payload = anthropic_response(&model, &response);
-    if stream_response {
-        let events = anthropic_stream_events(&payload, &response)
-            .into_iter()
-            .map(|(event, data)| Event::default().event(event).data(data.to_string()));
-        Ok(Sse::new(stream::iter(events.into_iter().map(Ok::<Event, std::convert::Infallible>)))
-            .into_response())
-    } else {
-        Ok(Json(payload).into_response())
+    if !stream_response {
+        let response = state.complete(&request).await?;
+        return Ok(Json(anthropic_response(&model, &response)).into_response());
     }
+    let upstream = state.event_stream(&request).await?;
+    let message_id = format!("msg_{}", uuid::Uuid::now_v7());
+    let input_tokens = request.input_text().chars().count() as u64 / 4;
+    let stream = async_stream::stream! {
+        let start = json!({
+            "type":"message_start",
+            "message": {
+                "id":message_id,
+                "type":"message",
+                "role":"assistant",
+                "model":model,
+                "content":[],
+                "stop_reason":null,
+                "stop_sequence":null,
+                "usage":{"input_tokens":input_tokens,"output_tokens":0}
+            }
+        });
+        yield Ok::<Event, Infallible>(Event::default().event("message_start").data(start.to_string()));
+
+        let mut upstream = upstream;
+        let mut accumulator = InternalEventAccumulator::new();
+        let mut text_index = None;
+        let mut thinking_index = None;
+        let mut tool_indices = HashMap::<String, usize>::new();
+        let mut active_tool = None::<String>;
+        let mut next_index = 0_usize;
+        let mut text_filter = XmlLeakFilter::new();
+        let mut failed = false;
+
+        while let Some(item) = upstream.next().await {
+            let event = match item {
+                Ok(event) => event,
+                Err(error) => {
+                    yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":error.to_string()}}).to_string()));
+                    yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
+                    failed = true;
+                    break;
+                }
+            };
+            if let InternalEvent::Error { message } = &event {
+                yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":message}}).to_string()));
+                yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
+                failed = true;
+                break;
+            }
+            if let Err(error) = accumulator.push(event.clone()) {
+                yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":error.to_string()}}).to_string()));
+                yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
+                failed = true;
+                break;
+            }
+            match event {
+                InternalEvent::TextDelta { text } => {
+                    let was_none = text_index.is_none();
+                    let index = *text_index.get_or_insert_with(|| {
+                        let value = next_index;
+                        next_index += 1;
+                        value
+                    });
+                    if was_none {
+                        yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}).to_string()));
+                    }
+                    let text = text_filter.push(&text);
+                    if !text.is_empty() {
+                        yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}).to_string()));
+                    }
+                }
+                InternalEvent::ThinkingDelta { text } => {
+                    let was_none = thinking_index.is_none();
+                    let index = *thinking_index.get_or_insert_with(|| {
+                        let value = next_index;
+                        next_index += 1;
+                        value
+                    });
+                    if was_none {
+                        yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":index,"content_block":{"type":"thinking","thinking":""}}).to_string()));
+                    }
+                    if !text.is_empty() {
+                        yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}}).to_string()));
+                    }
+                }
+                InternalEvent::ToolCallStart { id, name } => {
+                    let key = if id.is_empty() {
+                        active_tool.clone().unwrap_or_else(|| format!("tool_call_{}", tool_indices.len() + 1))
+                    } else { id };
+                    if !tool_indices.contains_key(&key) {
+                        let index = next_index;
+                        next_index += 1;
+                        tool_indices.insert(key.clone(), index);
+                        yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":key,"name":name,"input":{}}}).to_string()));
+                    }
+                    active_tool = Some(key);
+                }
+                InternalEvent::ToolCallDelta { id, arguments, name } => {
+                    let mut key = id;
+                    if key.is_empty() {
+                        key = active_tool.clone().unwrap_or_else(|| format!("tool_call_{}", tool_indices.len() + 1));
+                    }
+                    if !tool_indices.contains_key(&key) {
+                        let index = next_index;
+                        next_index += 1;
+                        tool_indices.insert(key.clone(), index);
+                        yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":key,"name":name.unwrap_or_default(),"input":{}}}).to_string()));
+                    }
+                    active_tool = Some(key.clone());
+                    if !arguments.is_empty() {
+                        yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":tool_indices[&key],"delta":{"type":"input_json_delta","partial_json":arguments}}).to_string()));
+                    }
+                }
+                InternalEvent::ToolCallEnd { id, .. } => {
+                    let key = if id.is_empty() { active_tool.clone() } else { Some(id) };
+                    if let Some(key) = key {
+                        if let Some(index) = tool_indices.get(&key).copied() {
+                            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+                        }
+                        if active_tool.as_deref() == Some(key.as_str()) { active_tool = None; }
+                    }
+                }
+                InternalEvent::Usage { .. } | InternalEvent::Stop { .. } => {}
+                InternalEvent::Error { .. } => unreachable!(),
+            }
+        }
+        if failed { return; }
+        let response = accumulator.finish();
+        if let Some(index) = thinking_index {
+            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+        }
+        if let Some(index) = text_index {
+            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+        }
+        if let Some(key) = active_tool.take() {
+            if let Some(index) = tool_indices.get(&key).copied() {
+                yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+            }
+        }
+        let output_tokens = response.usage.as_ref().map_or(0, |usage| usage.output_tokens);
+        yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":anthropic_stop_reason(&response),"stop_sequence":null},"usage":{"output_tokens":output_tokens}}).to_string()));
+        yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
+    };
+    Ok(Sse::new(stream).into_response())
 }
 
 fn anthropic_stream_events(
