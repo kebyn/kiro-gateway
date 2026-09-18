@@ -15,6 +15,11 @@ impl SqliteStore {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(include_str!("../../migrations/001_initial.sql"))?;
+        // The initial scaffold created a conversations table that was never
+        // read or written. Remove it during upgrade so the schema reflects the
+        // response_id-based continuation model instead of advertising a
+        // second, unused conversation lifecycle.
+        conn.execute("DROP TABLE IF EXISTS conversations", [])?;
         // Databases created by the early 0.1 releases had no per-response
         // sequence column. Upgrade that table in place so event reads remain
         // deterministic without reintroducing the unused conversations table.
