@@ -30,7 +30,26 @@ pub fn load(path: &Path) -> Result<Vec<Credential>, AppError> {
     }
     if let Some(first) = result.first_mut() {
         if let Some(device) = DEVICE_KEYS.iter().find_map(|key| read_any(&conn, key)) {
-            let machine_id = serde_json::from_str::<Value>(&device).ok().and_then(|v| {
+            let registration = serde_json::from_str::<Value>(&device).ok();
+            if let Some(value) = registration.as_ref() {
+                if let Some(client_id) =
+                    value.get("clientId").or_else(|| value.get("client_id")).and_then(Value::as_str)
+                {
+                    first.client_id = Some(SecretString::new(client_id));
+                }
+                if let Some(client_secret) = value
+                    .get("clientSecret")
+                    .or_else(|| value.get("client_secret"))
+                    .and_then(Value::as_str)
+                {
+                    first.client_secret = Some(SecretString::new(client_secret));
+                }
+                if first.sso_region.is_none() {
+                    first.sso_region =
+                        value.get("region").and_then(Value::as_str).map(ToOwned::to_owned);
+                }
+            }
+            let machine_id = registration.and_then(|v| {
                 v.get("machineId")
                     .or_else(|| v.get("deviceId"))
                     .and_then(Value::as_str)
