@@ -1,6 +1,6 @@
 use crate::{
     auth::Credential,
-    endpoint::{EndpointKind, KiroEndpoint},
+    endpoint::{EndpointKind, KiroEndpoint, conversation_body},
     error::AppError,
     protocol::internal::InternalRequest,
 };
@@ -37,7 +37,10 @@ impl KiroEndpoint for CliEndpoint {
         request: &InternalRequest,
         credential: &Credential,
     ) -> serde_json::Value {
-        serde_json::json!({"conversationState": {"history": request.messages, "currentMessage": request.last_user_text()}, "profileArn": credential.profile_arn, "clientName": "kiro-cli", "machineId": credential.machine_id, "conversationId": request.conversation_id})
+        let mut body = conversation_body(request, credential, "KIRO_CLI", "auto");
+        body["clientName"] = serde_json::Value::String("kiro-cli".into());
+        body["machineId"] = serde_json::Value::String(credential.machine_id.clone());
+        body
     }
     fn decorate_api(
         &self,
@@ -45,6 +48,8 @@ impl KiroEndpoint for CliEndpoint {
         credential: &Credential,
     ) -> reqwest::RequestBuilder {
         builder
+            .header("x-amz-target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
+            .header("content-type", "application/x-amz-json-1.0")
             .header("x-amz-user-agent", "kiro-cli/1.0 kiro-gateway-rs/0.1")
             .header("x-kiro-machine-id", &credential.machine_id)
             .header("origin", "https://app.kiro.dev")

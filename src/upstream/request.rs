@@ -31,6 +31,9 @@ impl UpstreamClient {
             match self.complete_once(request, credential, &mut integrity).await {
                 Ok(response) => return Ok(response),
                 Err(error) => {
+                    if matches!(error, AppError::Integrity(_)) {
+                        integrity.incomplete = true;
+                    }
                     if integrity.should_retry() == RetryDecision::Retry {
                         continue;
                     } else {
@@ -72,6 +75,47 @@ impl UpstreamClient {
             let body = response.text().await.unwrap_or_default();
             return Err(self.endpoint.classify_error(status, &body));
         }
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("json"))
+        {
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| AppError::Upstream(format!("invalid JSON upstream response: {e}")))?;
+            let text = body
+                .get("content")
+                .or_else(|| body.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let usage = body.get("usage").map(|value| {
+                crate::protocol::internal::Usage::new(
+                    value
+                        .get("inputTokens")
+                        .or_else(|| value.get("input_tokens"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default(),
+                    value
+                        .get("outputTokens")
+                        .or_else(|| value.get("output_tokens"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default(),
+                )
+            });
+            return Ok(crate::protocol::internal::InternalResponse {
+                text,
+                usage,
+                stop_reason: body
+                    .get("stopReason")
+                    .or_else(|| body.get("stop_reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                ..Default::default()
+            });
+        }
         let mut stream = response.bytes_stream();
         let mut decoder = EventStreamDecoder::new();
         let mut tools = ToolCallAccumulator::new();
@@ -91,7 +135,10 @@ impl UpstreamClient {
                     InternalEvent::ToolCallStart { id, name } => {
                         tools.start(Some(&id), &name);
                     }
-                    InternalEvent::ToolCallDelta { id, arguments } => {
+                    InternalEvent::ToolCallDelta { id, arguments, name } => {
+                        if let Some(name) = name {
+                            tools.start(Some(&id), &name);
+                        }
                         tools.append(Some(&id), &arguments);
                     }
                     InternalEvent::ToolCallEnd { id, complete } => {

@@ -1,6 +1,6 @@
 use crate::{
     auth::Credential,
-    endpoint::{EndpointKind, KiroEndpoint},
+    endpoint::{EndpointKind, KiroEndpoint, conversation_body},
     error::AppError,
     protocol::internal::InternalRequest,
 };
@@ -34,7 +34,7 @@ impl KiroEndpoint for IdeEndpoint {
         request: &InternalRequest,
         credential: &Credential,
     ) -> serde_json::Value {
-        serde_json::json!({"conversationState": {"history": request.messages, "currentMessage": request.last_user_text()}, "profileArn": credential.profile_arn, "conversationId": request.conversation_id, "mode": "agent"})
+        conversation_body(request, credential, "AI_EDITOR", &request.model)
     }
     fn decorate_api(
         &self,
@@ -42,8 +42,11 @@ impl KiroEndpoint for IdeEndpoint {
         credential: &Credential,
     ) -> reqwest::RequestBuilder {
         builder
+            .header("x-amz-target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
+            .header("content-type", "application/x-amz-json-1.0")
             .header("x-amz-user-agent", "kiro-gateway-rs/0.1")
             .header("x-kiro-machine-id", &credential.machine_id)
+            .header("x-amzn-kiro-agent-mode", "agent")
             .header("origin", "https://app.kiro.dev")
     }
     fn decorate_mcp(
