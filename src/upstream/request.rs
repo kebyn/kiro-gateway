@@ -3,6 +3,7 @@ use crate::{
     endpoint::KiroEndpoint,
     error::AppError,
     protocol::internal::{InternalEvent, InternalRequest},
+    transform::converter::normalized_stop_reason,
     transform::truncation::XmlLeakFilter,
     upstream::{
         error::UpstreamStreamError,
@@ -107,16 +108,19 @@ impl UpstreamClient {
                         .unwrap_or_default(),
                 )
             });
-            let tool_calls = parse_json_tool_calls(&body);
+            let stop_reason = body
+                .get("stopReason")
+                .or_else(|| body.get("stop_reason"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
             return Ok(crate::protocol::internal::InternalResponse {
                 text,
-                tool_calls,
+                tool_calls: parse_json_tool_calls(&body),
                 usage,
-                stop_reason: body
-                    .get("stopReason")
-                    .or_else(|| body.get("stop_reason"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned),
+                incomplete: normalized_stop_reason(stop_reason.as_deref()).is_some_and(|reason| {
+                    matches!(reason, "max_tokens" | "context_window_exceeded" | "refusal")
+                }),
+                stop_reason,
                 ..Default::default()
             });
         }
@@ -245,14 +249,27 @@ fn parse_json_tool_calls(
                 .or_else(|| item.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
-            let arguments = match arguments {
-                serde_json::Value::String(raw) => {
-                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw))
+            let (arguments, arguments_complete) = match arguments {
+                serde_json::Value::String(raw) if raw.trim().is_empty() => {
+                    (serde_json::json!({}), true)
                 }
-                value => value,
+                serde_json::Value::String(raw) => {
+                    match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(value) if value.is_object() => (value, true),
+                        Ok(value) => (value, false),
+                        Err(_) => (serde_json::Value::String(raw), false),
+                    }
+                }
+                serde_json::Value::Object(object) => (serde_json::Value::Object(object), true),
+                value => (value, false),
             };
             let complete =
-                item.get("complete").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                item.get("complete").and_then(serde_json::Value::as_bool).unwrap_or(true)
+                    && arguments_complete
+                    && !matches!(
+                        item.get("status").and_then(serde_json::Value::as_str),
+                        Some("incomplete" | "failed" | "cancelled")
+                    );
             Some(crate::protocol::internal::InternalToolCall { id, name, arguments, complete })
         })
         .collect()
@@ -327,6 +344,20 @@ mod tests {
         assert_eq!(calls[0].arguments["a"], 1);
         assert_eq!(calls[1].arguments["b"], 2);
         assert!(!calls[1].complete);
+    }
+
+    #[test]
+    fn marks_invalid_json_tool_arguments_incomplete() {
+        let calls = parse_json_tool_calls(&serde_json::json!({
+            "toolUses": [{
+                "toolUseId":"call_partial",
+                "name":"lookup",
+                "input":"{\"query\":"
+            }]
+        }));
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].complete);
+        assert_eq!(calls[0].arguments, serde_json::json!("{\"query\":"));
     }
 
     #[test]

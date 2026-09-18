@@ -29,20 +29,58 @@ pub fn openai_usage(usage: Usage) -> Value {
 }
 
 pub fn anthropic_stop_reason(response: &InternalResponse) -> String {
-    if response.tool_calls.is_empty() {
-        response.stop_reason.clone().unwrap_or_else(|| "end_turn".into())
-    } else {
-        "tool_use".into()
+    if !response.tool_calls.is_empty() {
+        return "tool_use".into();
+    }
+    match normalized_stop_reason(response.stop_reason.as_deref()) {
+        Some("max_tokens") => "max_tokens".into(),
+        Some("context_window_exceeded") => "model_context_window_exceeded".into(),
+        Some("refusal") => "refusal".into(),
+        Some("stop_sequence") => "stop_sequence".into(),
+        Some("pause_turn") => "pause_turn".into(),
+        _ => "end_turn".into(),
     }
 }
 
 pub fn chat_finish_reason(response: &InternalResponse) -> &'static str {
-    if response.tool_calls.is_empty() { "stop" } else { "tool_calls" }
+    if !response.tool_calls.is_empty() {
+        return "tool_calls";
+    }
+    match normalized_stop_reason(response.stop_reason.as_deref()) {
+        Some("max_tokens") | Some("context_window_exceeded") => "length",
+        Some("refusal") => "content_filter",
+        _ => "stop",
+    }
+}
+
+pub fn normalized_stop_reason(reason: Option<&str>) -> Option<&'static str> {
+    match reason?.trim().to_ascii_lowercase().as_str() {
+        "max_tokens" | "max_output_tokens" | "length" => Some("max_tokens"),
+        "model_context_window_exceeded" | "context_window_exceeded" | "context_limit" => {
+            Some("context_window_exceeded")
+        }
+        "refusal" | "content_filter" | "content_filtered" | "guardrail_intervened" => {
+            Some("refusal")
+        }
+        "stop_sequence" => Some("stop_sequence"),
+        "pause_turn" => Some("pause_turn"),
+        "end_turn" | "complete" | "completed" | "stop" => Some("end_turn"),
+        _ => None,
+    }
+}
+
+pub fn responses_incomplete_reason(response: &InternalResponse) -> Option<&'static str> {
+    match normalized_stop_reason(response.stop_reason.as_deref()) {
+        Some("max_tokens") | Some("context_window_exceeded") => Some("max_output_tokens"),
+        Some("refusal") => Some("content_filter"),
+        _ if response.incomplete => Some("max_output_tokens"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{anthropic_response, openai_chat_response};
+    use super::{anthropic_response, anthropic_stop_reason, openai_chat_response};
     use crate::protocol::internal::{InternalResponse, InternalToolCall};
     use serde_json::json;
 
@@ -77,5 +115,22 @@ mod tests {
         assert_eq!(call["function"]["arguments"], r#"{"city":"Paris"}"#);
         assert!(call.get("index").is_none());
         assert_eq!(payload["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn maps_upstream_stop_reasons_to_protocol_values() {
+        let mut response =
+            InternalResponse { stop_reason: Some("MAX_TOKENS".into()), ..Default::default() };
+        assert_eq!(anthropic_stop_reason(&response), "max_tokens");
+        assert_eq!(
+            openai_chat_response("kiro", &response)["choices"][0]["finish_reason"],
+            "length"
+        );
+        response.stop_reason = Some("CONTENT_FILTERED".into());
+        assert_eq!(anthropic_stop_reason(&response), "refusal");
+        assert_eq!(
+            openai_chat_response("kiro", &response)["choices"][0]["finish_reason"],
+            "content_filter"
+        );
     }
 }

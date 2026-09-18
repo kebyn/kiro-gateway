@@ -11,6 +11,11 @@ use crate::{
 };
 use std::collections::HashSet;
 
+struct ActiveToolRound {
+    index: usize,
+    call_ids: HashSet<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointKind {
     Ide,
@@ -60,17 +65,21 @@ pub fn conversation_body(
 ) -> serde_json::Value {
     // Kiro rejects native tool result structures when no tool definitions are
     // present. In that case all tool history is intentionally rendered as text.
-    let active_tool_round =
-        (!request.tools.is_empty()).then(|| active_tool_round(&request.messages)).flatten();
+    let declared_tools: HashSet<&str> =
+        request.tools.iter().map(|tool| tool.name.as_str()).collect();
+    let active_tool_round = (!declared_tools.is_empty())
+        .then(|| active_tool_round(&request.messages, &declared_tools))
+        .flatten();
     let current_start = active_tool_round
-        .map(|index| index + 1)
+        .as_ref()
+        .map(|round| round.index + 1)
         .unwrap_or_else(|| request.messages.len().saturating_sub(1));
     let mut history: Vec<serde_json::Value> = request.messages[..current_start]
         .iter()
         .enumerate()
         .map(|(index, message)| {
-            if active_tool_round == Some(index) {
-                assistant_tool_message(message)
+            if active_tool_round.as_ref().is_some_and(|round| round.index == index) {
+                assistant_tool_message(message, &active_tool_round.as_ref().unwrap().call_ids)
             } else {
                 message_to_history(message, origin, model_id)
             }
@@ -84,23 +93,25 @@ pub fn conversation_body(
     let current_content = current_messages
         .iter()
         .map(|message| {
-            if active_tool_round.is_some() { content_text(message) } else { history_text(message) }
+            active_tool_round.as_ref().map_or_else(
+                || history_text(message),
+                |round| active_round_text(message, &round.call_ids),
+            )
         })
         .filter(|content| !content.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
     let current_content =
         if current_content.is_empty() { "(empty placeholder)".to_owned() } else { current_content };
-    let active_ids: HashSet<&str> = active_tool_round
-        .and_then(|index| request.messages.get(index))
-        .into_iter()
-        .flat_map(|message| message.tool_calls.iter().map(|call| call.id.as_str()))
-        .collect();
     let mut seen_results = HashSet::new();
     let tool_results: Vec<serde_json::Value> = current_messages
         .iter()
         .flat_map(|message| &message.tool_results)
-        .filter(|result| active_ids.contains(result.tool_call_id.as_str()))
+        .filter(|result| {
+            active_tool_round
+                .as_ref()
+                .is_some_and(|round| round.call_ids.contains(result.tool_call_id.as_str()))
+        })
         .filter(|result| seen_results.insert(result.tool_call_id.clone()))
         .map(tool_result)
         .collect();
@@ -132,7 +143,10 @@ pub fn conversation_body(
     body
 }
 
-fn active_tool_round(messages: &[InternalMessage]) -> Option<usize> {
+fn active_tool_round(
+    messages: &[InternalMessage],
+    declared_tools: &HashSet<&str>,
+) -> Option<ActiveToolRound> {
     if messages.last().is_none_or(|message| message.tool_results.is_empty()) {
         return None;
     }
@@ -140,32 +154,50 @@ fn active_tool_round(messages: &[InternalMessage]) -> Option<usize> {
         if message.role != "assistant" || message.tool_calls.is_empty() {
             return None;
         }
-        let call_ids: HashSet<&str> =
-            message.tool_calls.iter().map(|call| call.id.as_str()).collect();
         let following = &messages[index + 1..];
-        let mut result_ids = HashSet::new();
-        let valid = !following.is_empty()
-            && following.iter().all(|candidate| {
-                !candidate.tool_results.is_empty()
-                    && candidate.tool_results.iter().all(|result| {
-                        let known = call_ids.contains(result.tool_call_id.as_str());
-                        if known {
-                            result_ids.insert(result.tool_call_id.as_str());
-                        }
-                        known
-                    })
+        if following.is_empty()
+            || !following.iter().all(|candidate| {
+                candidate.tool_calls.is_empty() && !candidate.tool_results.is_empty()
             })
-            && result_ids.len() == call_ids.len();
-        valid.then_some(index)
+        {
+            return None;
+        }
+        let call_ids: HashSet<String> = message
+            .tool_calls
+            .iter()
+            .filter(|call| call.complete && declared_tools.contains(call.name.as_str()))
+            .map(|call| call.id.clone())
+            .collect();
+        let has_matching_result = following
+            .iter()
+            .flat_map(|candidate| &candidate.tool_results)
+            .any(|result| call_ids.contains(result.tool_call_id.as_str()));
+        has_matching_result.then_some(ActiveToolRound { index, call_ids })
     })
 }
 
-fn assistant_tool_message(message: &InternalMessage) -> serde_json::Value {
-    let content = content_text(message);
-    let content = if content.is_empty() { "(empty placeholder)".to_owned() } else { content };
+fn assistant_tool_message(
+    message: &InternalMessage,
+    structured_ids: &HashSet<String>,
+) -> serde_json::Value {
+    let mut content = Vec::new();
+    let message_content = content_text(message);
+    if !message_content.is_empty() {
+        content.push(message_content);
+    }
+    content.extend(
+        message
+            .tool_calls
+            .iter()
+            .filter(|call| !structured_ids.contains(call.id.as_str()))
+            .map(tool_call_text),
+    );
+    let content =
+        if content.is_empty() { "(empty placeholder)".to_owned() } else { content.join("\n") };
     let tool_uses: Vec<serde_json::Value> = message
         .tool_calls
         .iter()
+        .filter(|call| structured_ids.contains(call.id.as_str()))
         .map(|call| {
             serde_json::json!({
                 "toolUseId": call.id,
@@ -180,6 +212,22 @@ fn assistant_tool_message(message: &InternalMessage) -> serde_json::Value {
             "toolUses": tool_uses,
         }
     })
+}
+
+fn active_round_text(message: &InternalMessage, structured_ids: &HashSet<String>) -> String {
+    let mut parts = Vec::new();
+    let content = content_text(message);
+    if !content.is_empty() {
+        parts.push(content);
+    }
+    parts.extend(
+        message
+            .tool_results
+            .iter()
+            .filter(|result| !structured_ids.contains(result.tool_call_id.as_str()))
+            .map(tool_result_text),
+    );
+    parts.join("\n")
 }
 
 fn tool_result(result: &InternalToolResult) -> serde_json::Value {
@@ -234,18 +282,20 @@ fn history_text(message: &InternalMessage) -> String {
     if !content.is_empty() {
         parts.push(content);
     }
-    parts.extend(
-        message.tool_calls.iter().map(|call| {
-            format!("[Tool call {} ({})]\n{}", call.name, call.id, call.arguments_json())
-        }),
-    );
-    parts.extend(message.tool_results.iter().map(|result| {
-        let status = if result.is_error { " error" } else { "" };
-        let content = value_text(&result.content);
-        let content = if content.is_empty() { result.content.to_string() } else { content };
-        format!("[Tool result {}{}]\n{}", result.tool_call_id, status, content)
-    }));
+    parts.extend(message.tool_calls.iter().map(tool_call_text));
+    parts.extend(message.tool_results.iter().map(tool_result_text));
     parts.join("\n")
+}
+
+fn tool_call_text(call: &crate::protocol::internal::InternalToolCall) -> String {
+    format!("[Tool call {} ({})]\n{}", call.name, call.id, call.arguments_json())
+}
+
+fn tool_result_text(result: &InternalToolResult) -> String {
+    let status = if result.is_error { " error" } else { "" };
+    let content = value_text(&result.content);
+    let content = if content.is_empty() { result.content.to_string() } else { content };
+    format!("[Tool result {}{}]\n{}", result.tool_call_id, status, content)
 }
 
 #[cfg(test)]
@@ -384,5 +434,84 @@ mod tests {
             state["currentMessage"]["userInputMessage"]["content"],
             "[Tool result call_a]\ndone"
         );
+    }
+
+    #[test]
+    fn filters_unknown_duplicate_and_undeclared_tool_results() {
+        let mut assistant = InternalMessage::new("assistant", Value::Null);
+        assistant.tool_calls.push(call("call_a", "alpha"));
+        assistant.tool_calls.push(call("call_b", "beta"));
+        assistant.tool_calls.push(call("call_hidden", "undeclared"));
+        let mut incomplete = call("call_incomplete", "alpha");
+        incomplete.complete = false;
+        assistant.tool_calls.push(incomplete);
+
+        let mut results = InternalMessage::new("tool", Value::Null);
+        results.tool_results = vec![
+            InternalToolResult {
+                tool_call_id: "call_b".into(),
+                content: Value::String(String::new()),
+                is_error: false,
+            },
+            InternalToolResult {
+                tool_call_id: "unknown".into(),
+                content: Value::String("orphan".into()),
+                is_error: false,
+            },
+            InternalToolResult {
+                tool_call_id: "call_a".into(),
+                content: Value::Null,
+                is_error: true,
+            },
+            InternalToolResult {
+                tool_call_id: "call_b".into(),
+                content: Value::String("duplicate".into()),
+                is_error: false,
+            },
+            InternalToolResult {
+                tool_call_id: "call_hidden".into(),
+                content: Value::String("hidden result".into()),
+                is_error: false,
+            },
+            InternalToolResult {
+                tool_call_id: "call_incomplete".into(),
+                content: Value::String("partial result".into()),
+                is_error: false,
+            },
+        ];
+        let body = conversation_body(
+            &request(vec![
+                InternalMessage::new("user", Value::String("question".into())),
+                assistant,
+                results,
+            ]),
+            &Credential::default(),
+            "AI_EDITOR",
+            "kiro",
+        );
+
+        let state = &body["conversationState"];
+        let active =
+            state["history"][1]["assistantResponseMessage"]["toolUses"].as_array().unwrap();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0]["toolUseId"], "call_a");
+        assert_eq!(active[1]["toolUseId"], "call_b");
+        let assistant_text =
+            state["history"][1]["assistantResponseMessage"]["content"].as_str().unwrap();
+        assert!(assistant_text.contains("call_hidden"));
+        assert!(assistant_text.contains("call_incomplete"));
+
+        let current = &state["currentMessage"]["userInputMessage"];
+        let native_results = current["userInputMessageContext"]["toolResults"].as_array().unwrap();
+        assert_eq!(native_results.len(), 2);
+        assert_eq!(native_results[0]["toolUseId"], "call_b");
+        assert_eq!(native_results[0]["content"][0]["text"], "(empty result)");
+        assert_eq!(native_results[1]["toolUseId"], "call_a");
+        assert_eq!(native_results[1]["status"], "error");
+        let current_text = current["content"].as_str().unwrap();
+        assert!(current_text.contains("unknown"));
+        assert!(current_text.contains("call_hidden"));
+        assert!(current_text.contains("call_incomplete"));
+        assert!(!current_text.contains("duplicate"));
     }
 }

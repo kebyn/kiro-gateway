@@ -125,13 +125,28 @@ fn parse_function_call(item: &Value) -> Option<InternalToolCall> {
         .as_str()?
         .to_owned();
     let name = item.get("name")?.as_str()?.to_owned();
-    let arguments = match item.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({})) {
-        Value::String(arguments) => {
-            serde_json::from_str(&arguments).unwrap_or(Value::String(arguments))
+    let (arguments, arguments_complete) =
+        parse_arguments(item.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({})));
+    let status_complete = !matches!(
+        item.get("status").and_then(Value::as_str),
+        Some("incomplete" | "failed" | "cancelled")
+    );
+    Some(InternalToolCall { id, name, arguments, complete: arguments_complete && status_complete })
+}
+
+fn parse_arguments(arguments: Value) -> (Value, bool) {
+    match arguments {
+        Value::String(arguments) if arguments.trim().is_empty() => {
+            (Value::Object(Default::default()), true)
         }
-        arguments => arguments,
-    };
-    Some(InternalToolCall { id, name, arguments, complete: true })
+        Value::String(arguments) => match serde_json::from_str::<Value>(&arguments) {
+            Ok(value) if value.is_object() => (value, true),
+            Ok(value) => (value, false),
+            Err(_) => (Value::String(arguments), false),
+        },
+        Value::Object(object) => (Value::Object(object), true),
+        value => (value, false),
+    }
 }
 fn parse_tool(tool: Value) -> Option<InternalTool> {
     let function = tool.get("function").unwrap_or(&tool);
@@ -193,5 +208,40 @@ mod tests {
         let internal = request.into_internal(vec![assistant]);
         assert_eq!(internal.messages[0].tool_calls[0].id, "call_saved");
         assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_saved");
+    }
+
+    #[test]
+    fn merges_consecutive_function_calls_and_marks_invalid_arguments_incomplete() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"kiro",
+            "input":[
+                {"type":"function_call","id":"fc_a","call_id":"call_a","name":"alpha","arguments":"{\"a\":1}"},
+                {"type":"function_call","id":"fc_b","call_id":"call_b","name":"beta","arguments":"{\"b\":"},
+                {"type":"message","role":"user","content":"after calls"},
+                {"type":"function_call","id":"fc_c","call_id":"call_c","name":"gamma","arguments":{},"status":"incomplete"}
+            ]
+        }))
+        .unwrap();
+        let internal = request.into_internal(Vec::new());
+        assert_eq!(internal.messages.len(), 3);
+        assert_eq!(internal.messages[0].tool_calls.len(), 2);
+        assert_eq!(internal.messages[0].tool_calls[0].id, "call_a");
+        assert_eq!(internal.messages[0].tool_calls[1].id, "call_b");
+        assert!(!internal.messages[0].tool_calls[1].complete);
+        assert_eq!(internal.messages[1].role, "user");
+        assert_eq!(internal.messages[1].content, "after calls");
+        assert_eq!(internal.messages[2].tool_calls[0].id, "call_c");
+        assert!(!internal.messages[2].tool_calls[0].complete);
+    }
+
+    #[test]
+    fn accepts_item_id_as_call_id_when_call_id_is_absent() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"kiro",
+            "input":[{"type":"function_call","id":"fc_only","name":"lookup","arguments":{}}]
+        }))
+        .unwrap();
+        let internal = request.into_internal(Vec::new());
+        assert_eq!(internal.messages[0].tool_calls[0].id, "fc_only");
     }
 }
