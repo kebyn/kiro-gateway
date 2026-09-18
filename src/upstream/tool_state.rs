@@ -24,7 +24,11 @@ impl ToolCallAccumulator {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn start(&mut self, id: Option<&str>, name: &str) -> Option<String> {
+    pub fn start(&mut self, id: Option<&str>, name: &str) -> String {
+        self.start_key(id, name).unwrap_or_default()
+    }
+
+    fn start_key(&mut self, id: Option<&str>, name: &str) -> Option<String> {
         let id = id.filter(|value| !value.is_empty());
         let name = (!name.is_empty()).then_some(name);
         let key = if let Some(real_id) = id {
@@ -106,7 +110,11 @@ impl ToolCallAccumulator {
         Some(real_id.to_owned())
     }
 
-    pub fn append(&mut self, id: Option<&str>, fragment: &Value) -> Option<String> {
+    pub fn append(&mut self, id: Option<&str>, fragment: &str) -> String {
+        self.append_value(id, &Value::String(fragment.to_owned())).unwrap_or_default()
+    }
+
+    pub fn append_value(&mut self, id: Option<&str>, fragment: &Value) -> Option<String> {
         let key = if let Some(id) = id.filter(|value| !value.is_empty()) {
             self.buffers.get(id).filter(|buffer| !buffer.ended).map(|_| id.to_owned())?
         } else {
@@ -194,9 +202,9 @@ mod tests {
     fn rebinds_idless_tool_to_real_id() {
         let mut state = ToolCallAccumulator::new();
         state.start(None, "search");
-        state.append(None, &serde_json::json!("{\"query\":"));
+        state.append(None, "{\"query\":");
         state.start(Some("call_real"), "search");
-        state.append(Some("call_real"), &serde_json::json!("\"rust\"}"));
+        state.append(Some("call_real"), "\"rust\"}");
         let calls = state.finish_all();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_real");
@@ -208,8 +216,8 @@ mod tests {
         let mut state = ToolCallAccumulator::new();
         state.start(Some("a"), "one");
         state.start(Some("b"), "two");
-        state.append(Some("b"), &serde_json::json!("{}"));
-        state.append(Some("a"), &serde_json::json!("{}"));
+        state.append(Some("b"), "{}");
+        state.append(Some("a"), "{}");
         let calls = state.finish_all();
         assert_eq!(calls.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     }
@@ -218,11 +226,11 @@ mod tests {
     fn rebind_does_not_consume_the_next_parallel_tool() {
         let mut state = ToolCallAccumulator::new();
         state.start(None, "one");
-        state.append(None, &serde_json::json!(r#"{"a":"#));
+        state.append(None, r#"{"a":"#);
         state.start(Some("call_a"), "one");
-        state.append(Some("call_a"), &serde_json::json!("1}"));
+        state.append(Some("call_a"), "1}");
         state.start(Some("call_b"), "two");
-        state.append(Some("call_b"), &serde_json::json!(r#"{"b":2}"#));
+        state.append(Some("call_b"), r#"{"b":2}"#);
         let calls = state.finish_all();
         assert_eq!(
             calls.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
@@ -245,7 +253,7 @@ mod tests {
     fn marks_unfinished_arguments_incomplete() {
         let mut state = ToolCallAccumulator::new();
         state.start(Some("call"), "tool");
-        state.append(Some("call"), &serde_json::json!("{\"a\":"));
+        state.append(Some("call"), "{\"a\":");
         assert!(state.incomplete());
         assert!(!state.calls()[0].complete);
     }
@@ -253,9 +261,9 @@ mod tests {
     #[test]
     fn completes_valid_json_and_fills_late_name() {
         let mut state = ToolCallAccumulator::new();
-        assert!(state.append(Some("call"), &serde_json::json!("{\"a\":")).is_none());
+        assert!(state.append(Some("call"), "{\"a\":").is_empty());
         state.start(Some("call"), "lookup");
-        state.append(Some("call"), &serde_json::json!("{\"a\":1}"));
+        state.append(Some("call"), "{\"a\":1}");
         let calls = state.finish_all();
         assert_eq!(calls[0].name, "lookup");
         assert!(calls[0].complete);
@@ -265,8 +273,8 @@ mod tests {
     #[test]
     fn ignores_orphan_fragments_without_creating_unknown_tools() {
         let mut state = ToolCallAccumulator::new();
-        assert!(state.append(Some("missing"), &serde_json::json!("{}")).is_none());
-        assert!(state.append(None, &serde_json::json!("{}")).is_none());
+        assert!(state.append(Some("missing"), "{}").is_empty());
+        assert!(state.append(None, "{}").is_empty());
         assert!(state.finish_all().is_empty());
     }
 
@@ -274,9 +282,9 @@ mod tests {
     fn idless_name_change_closes_old_tool_and_opens_new_one() {
         let mut state = ToolCallAccumulator::new();
         state.start(Some("first"), "alpha");
-        state.append(Some("first"), &serde_json::json!(r#"{"a":1}"#));
+        state.append(Some("first"), r#"{"a":1}"#);
         state.start(None, "beta");
-        state.append(None, &serde_json::json!(r#"{"b":2}"#));
+        state.append(None, r#"{"b":2}"#);
         let calls = state.finish_all();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "alpha");
@@ -289,7 +297,7 @@ mod tests {
     fn stop_does_not_make_invalid_json_complete() {
         let mut state = ToolCallAccumulator::new();
         state.start(Some("call"), "lookup");
-        state.append(Some("call"), &serde_json::json!("{\"query\":"));
+        state.append(Some("call"), "{\"query\":");
         let call = state.finish(Some("call")).unwrap();
         assert!(!call.complete);
         assert_eq!(call.arguments, serde_json::json!("{\"query\":"));
@@ -299,9 +307,9 @@ mod tests {
     fn object_input_replaces_fragments_and_empty_object_is_valid() {
         let mut state = ToolCallAccumulator::new();
         state.start(Some("object"), "lookup");
-        state.append(Some("object"), &serde_json::json!({"query":"rust"}));
+        state.append_value(Some("object"), &serde_json::json!({"query":"rust"}));
         state.start(Some("empty"), "noop");
-        state.append(Some("empty"), &serde_json::json!({}));
+        state.append_value(Some("empty"), &serde_json::json!({}));
         let calls = state.finish_all();
         assert_eq!(calls[0].arguments["query"], "rust");
         assert_eq!(calls[1].arguments, serde_json::json!({}));

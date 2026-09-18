@@ -149,7 +149,11 @@ impl UpstreamClient {
             }
         }
         decoder.finish().map_err(|e| AppError::Integrity(e.to_string()))?;
-        Ok(finish_stream_response(output, &mut tools))
+        let output = finish_stream_response(output, &mut tools);
+        if is_empty_stream(&output) {
+            return Err(AppError::Integrity("upstream stream was empty".into()));
+        }
+        Ok(output)
     }
 }
 
@@ -172,8 +176,14 @@ fn apply_internal_event(
         InternalEvent::ToolCallStart { id, name } => {
             tools.start(Some(&id), &name);
         }
-        InternalEvent::ToolCallDelta { id, arguments } => {
+        InternalEvent::ToolCallDelta { id, arguments, name } => {
+            if let Some(name) = name {
+                tools.start(Some(&id), &name);
+            }
             tools.append(Some(&id), &arguments);
+        }
+        InternalEvent::ToolCallValueDelta { id, arguments } => {
+            tools.append_value(Some(&id), &arguments);
         }
         InternalEvent::ToolCallEnd { id, complete } => {
             if tools.finish_with_state(Some(&id), complete).is_some_and(|call| call.complete) {
@@ -216,6 +226,13 @@ fn finish_stream_response(
         || truncated_without_terminal
         || stopped_incomplete;
     output
+}
+
+fn is_empty_stream(response: &crate::protocol::internal::InternalResponse) -> bool {
+    response.text.is_empty()
+        && response.thinking.is_empty()
+        && response.tool_calls.is_empty()
+        && response.stop_reason.is_none()
 }
 
 fn parse_json_tool_calls(
@@ -277,7 +294,9 @@ fn parse_json_tool_calls(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_internal_event, finish_stream_response, parse_json_tool_calls};
+    use super::{
+        apply_internal_event, finish_stream_response, is_empty_stream, parse_json_tool_calls,
+    };
     use crate::{
         protocol::internal::InternalResponse,
         transform::truncation::XmlLeakFilter,
@@ -467,5 +486,14 @@ mod tests {
             assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
             assert!(!response.incomplete);
         }
+    }
+
+    #[test]
+    fn rejects_a_clean_but_empty_stream_without_terminal_signal() {
+        assert!(is_empty_stream(&InternalResponse::default()));
+        assert!(!is_empty_stream(&InternalResponse {
+            stop_reason: Some("end_turn".into()),
+            ..Default::default()
+        }));
     }
 }

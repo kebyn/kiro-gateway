@@ -164,10 +164,18 @@ pub fn decode_internal_events(
                 });
             }
             if let Some(arguments) = value.get("input").or_else(|| value.get("content")) {
-                events.push(InternalEvent::ToolCallDelta {
-                    id: id.clone(),
-                    arguments: arguments.clone(),
-                });
+                let event = match arguments {
+                    Value::String(arguments) => InternalEvent::ToolCallDelta {
+                        id: id.clone(),
+                        arguments: arguments.clone(),
+                        name: None,
+                    },
+                    arguments => InternalEvent::ToolCallValueDelta {
+                        id: id.clone(),
+                        arguments: arguments.clone(),
+                    },
+                };
+                events.push(event);
             }
             if bool_field(&value, &["stop", "isStop", "done"]) {
                 events.push(InternalEvent::ToolCallEnd { id, complete: true });
@@ -205,6 +213,40 @@ pub fn decode_internal_events(
     }
 }
 
+/// Compatibility entry point for consumers that decode one logical event at a
+/// time. New code should use `decode_internal_events`, because one tool frame
+/// can carry a name, input, and stop marker simultaneously.
+pub fn decode_internal_event(message: &EventMessage) -> Result<InternalEvent, UpstreamStreamError> {
+    let header_kind = header(message, ":event-type");
+    if matches!(header_kind, Some("toolUseEvent" | "tool_use")) {
+        let value: Value = serde_json::from_slice(&message.payload)
+            .map_err(|error| UpstreamStreamError::Event(error.to_string()))?;
+        let id = string_field(&value, &["toolUseId", "toolUseID", "tool_use_id", "id"])
+            .unwrap_or_default()
+            .to_owned();
+        let arguments = value
+            .get("input")
+            .or_else(|| value.get("content"))
+            .map(value_to_fragment)
+            .unwrap_or_default();
+        return Ok(InternalEvent::ToolCallDelta {
+            id,
+            arguments,
+            name: string_field(&value, &["name", "toolName", "tool_name"]).map(ToOwned::to_owned),
+        });
+    }
+    decode_internal_events(message)?.into_iter().next().ok_or_else(|| {
+        UpstreamStreamError::Event("event did not contain a decodable internal value".into())
+    })
+}
+
+fn value_to_fragment(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        value => value.to_string(),
+    }
+}
+
 fn header<'a>(message: &'a EventMessage, name: &str) -> Option<&'a str> {
     message.headers.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
 }
@@ -231,7 +273,7 @@ fn number_field(value: &Value, names: &[&str]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CRC32, EventStreamDecoder, decode_internal_events};
+    use super::{CRC32, EventStreamDecoder, decode_internal_event, decode_internal_events};
     use crate::protocol::internal::InternalEvent;
 
     fn frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
@@ -312,5 +354,21 @@ mod tests {
         let message = decoder.push(&input).unwrap().pop().unwrap();
         let error = decode_internal_events(&message).unwrap_err();
         assert_eq!(error.to_string(), "upstream exception: upstream denied request");
+    }
+
+    #[test]
+    fn compatibility_decoder_keeps_string_tool_delta_shape() {
+        let input =
+            frame("toolUseEvent", br#"{"toolUseId":"call","name":"lookup","input":"{\"q\":"}"#);
+        let mut decoder = EventStreamDecoder::new();
+        let message = decoder.push(&input).unwrap().pop().unwrap();
+        assert_eq!(
+            decode_internal_event(&message).unwrap(),
+            InternalEvent::ToolCallDelta {
+                id: "call".into(),
+                arguments: "{\"q\":".into(),
+                name: Some("lookup".into()),
+            }
+        );
     }
 }
