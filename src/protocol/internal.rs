@@ -102,35 +102,14 @@ pub fn value_text(value: &Value) -> String {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InternalEvent {
-    TextDelta {
-        text: String,
-    },
-    ThinkingDelta {
-        text: String,
-    },
-    ToolCallStart {
-        id: String,
-        name: String,
-    },
-    ToolCallDelta {
-        id: String,
-        arguments: String,
-        #[serde(default)]
-        name: Option<String>,
-    },
-    ToolCallEnd {
-        id: String,
-        complete: bool,
-    },
-    Usage {
-        usage: super::internal::Usage,
-    },
-    Stop {
-        reason: String,
-    },
-    Error {
-        message: String,
-    },
+    TextDelta { text: String },
+    ThinkingDelta { text: String },
+    ToolCallStart { id: String, name: String },
+    ToolCallDelta { id: String, arguments: Value },
+    ToolCallEnd { id: String, complete: bool },
+    Usage { usage: super::internal::Usage },
+    Stop { reason: String },
+    Error { message: String },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
