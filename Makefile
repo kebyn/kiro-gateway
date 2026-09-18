@@ -7,8 +7,8 @@ fmt:
 
 frontend:
 	node --check admin-ui/src/build.mjs
-	corepack pnpm --dir admin-ui install --frozen-lockfile
-	corepack pnpm --dir admin-ui build
+	corepack pnpm@9.15.4 --dir admin-ui install --frozen-lockfile
+	corepack pnpm@9.15.4 --dir admin-ui build
 
 check:
 	$(MAKE) frontend

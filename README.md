@@ -415,8 +415,8 @@ Admin 路由：
 
 ```sh
 node --check admin-ui/src/build.mjs
-pnpm --dir admin-ui install --frozen-lockfile
-pnpm --dir admin-ui build
+corepack pnpm@9.15.4 --dir admin-ui install --frozen-lockfile
+corepack pnpm@9.15.4 --dir admin-ui build
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
