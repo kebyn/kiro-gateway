@@ -2,9 +2,10 @@ pub mod cli;
 pub mod ide;
 
 use crate::{
-    auth::Credential,
+    auth::{AuthMethod, Credential},
     error::AppError,
     protocol::internal::{InternalMessage, InternalRequest, content_text},
+    transform::tool_compression::compress_schema,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,13 +60,16 @@ pub fn conversation_body(
         .iter()
         .map(|message| message_to_history(message, origin, model_id))
         .collect();
-    let current = serde_json::json!({"userInputMessage":{"content":request.last_user_text(),"modelId":model_id,"origin":origin,"userInputMessageContext":{"tools":request.tools}}});
+    let tools: Vec<serde_json::Value> = request.tools.iter().map(|tool| serde_json::json!({"toolSpecification":{"inputSchema":{"json":compress_schema(&tool.input_schema, 32 * 1024)},"name":tool.name,"description":tool.description.clone().unwrap_or_default()}})).collect();
+    let current = serde_json::json!({"userInputMessage":{"content":request.last_user_text(),"modelId":model_id,"origin":origin,"userInputMessageContext":{"tools":tools}}});
     let conversation_id =
         request.conversation_id.clone().unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
     let state = serde_json::json!({"conversationId":conversation_id,"history":history,"currentMessage":current,"chatTriggerType":"MANUAL","agentTaskType":"vibe"});
     let mut body = serde_json::json!({"conversationState":state});
-    if let Some(profile_arn) = &credential.profile_arn {
-        body["profileArn"] = serde_json::Value::String(profile_arn.clone());
+    if !matches!(credential.auth_method, AuthMethod::Sso) {
+        if let Some(profile_arn) = &credential.profile_arn {
+            body["profileArn"] = serde_json::Value::String(profile_arn.clone());
+        }
     }
     body
 }
