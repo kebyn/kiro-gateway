@@ -1,0 +1,56 @@
+use parking_lot::RwLock;
+use rand::{Rng, distr::Alphanumeric};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub token: String,
+    pub csrf_token: String,
+    pub expires_at: Instant,
+}
+
+#[derive(Clone, Default)]
+pub struct SessionStore {
+    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    attempts: Arc<RwLock<HashMap<String, (Instant, u32)>>>,
+}
+impl SessionStore {
+    pub fn create(&self, ttl: Duration) -> Session {
+        let mut rng = rand::rng();
+        let token: String =
+            (&mut rng).sample_iter(&Alphanumeric).take(48).map(char::from).collect();
+        let csrf_token: String =
+            (&mut rng).sample_iter(&Alphanumeric).take(32).map(char::from).collect();
+        let session =
+            Session { token: token.clone(), csrf_token, expires_at: Instant::now() + ttl };
+        self.sessions.write().insert(token, session.clone());
+        session
+    }
+    pub fn get(&self, token: &str) -> Option<Session> {
+        let session = self.sessions.read().get(token).cloned();
+        session.filter(|v| v.expires_at > Instant::now())
+    }
+    pub fn remove(&self, token: &str) {
+        self.sessions.write().remove(token);
+    }
+    pub fn clear(&self) {
+        self.sessions.write().clear();
+    }
+    pub fn allow_login(&self, key: &str, limit: u32) -> bool {
+        let now = Instant::now();
+        let mut attempts = self.attempts.write();
+        let entry = attempts.entry(key.to_owned()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= Duration::from_secs(60) {
+            *entry = (now, 0);
+        }
+        if entry.1 >= limit {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+}
