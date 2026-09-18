@@ -220,20 +220,20 @@ async fn send_once(
 fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
     let body: Value = serde_json::from_slice(body)
         .map_err(|error| AppError::Upstream(format!("invalid JSON upstream response: {error}")))?;
+    if let Some(error) = body.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| error.as_str())
+            .unwrap_or("upstream error")
+            .to_owned();
+        return Ok(vec![InternalEvent::Error { message }]);
+    }
     let mut events = Vec::new();
-    if let Some(text) = body
-        .get("content")
-        .or_else(|| body.get("text"))
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-    {
+    if let Some(text) = json_text(&body, &["content", "text"]).filter(|text| !text.is_empty()) {
         events.push(InternalEvent::TextDelta { text: text.to_owned() });
     }
-    if let Some(text) = body
-        .get("thinking")
-        .or_else(|| body.get("reasoning"))
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
+    if let Some(text) = json_text(&body, &["thinking", "reasoning"]).filter(|text| !text.is_empty())
     {
         events.push(InternalEvent::ThinkingDelta { text: text.to_owned() });
     }
@@ -275,6 +275,33 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
     // response when the upstream explicitly returned an object.
     events.push(InternalEvent::Stop { reason });
     Ok(events)
+}
+
+fn json_text(value: &Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        let value = value.get(*name)?;
+        match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Object(object) => object
+                .get("text")
+                .or_else(|| object.get("content"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            Value::Array(items) => {
+                let text = items
+                    .iter()
+                    .filter_map(|item| {
+                        item.as_str()
+                            .or_else(|| item.get("text").and_then(Value::as_str))
+                            .or_else(|| item.get("content").and_then(Value::as_str))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        }
+    })
 }
 
 /// Shared state machine used by complete responses and by all streaming HTTP
@@ -400,6 +427,7 @@ fn parse_json_tool_calls(
         .or_else(|| body.get("tool_uses"))
         .or_else(|| body.get("toolCalls"))
         .or_else(|| body.get("tool_calls"))
+        .or_else(|| body.get("output"))
         .and_then(serde_json::Value::as_array);
     let Some(items) = items else {
         return Vec::new();
@@ -407,20 +435,30 @@ fn parse_json_tool_calls(
     items
         .iter()
         .filter_map(|item| {
+            if item
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind != "function_call" && kind != "tool_use")
+            {
+                return None;
+            }
             let id = item
                 .get("toolUseId")
                 .or_else(|| item.get("tool_use_id"))
+                .or_else(|| item.get("call_id"))
                 .or_else(|| item.get("id"))
                 .and_then(serde_json::Value::as_str)?
                 .to_owned();
             let name = item
                 .get("name")
                 .or_else(|| item.get("toolName"))
+                .or_else(|| item.get("function").and_then(|function| function.get("name")))
                 .and_then(serde_json::Value::as_str)?
                 .to_owned();
             let arguments = item
                 .get("input")
                 .or_else(|| item.get("arguments"))
+                .or_else(|| item.get("function").and_then(|function| function.get("arguments")))
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
             let (arguments, arguments_complete) = match arguments {
@@ -550,6 +588,14 @@ mod tests {
         assert!(matches!(events[4], InternalEvent::ToolCallEnd { .. }));
         assert!(matches!(events[5], InternalEvent::Usage { .. }));
         assert!(matches!(events[6], InternalEvent::Stop { .. }));
+    }
+
+    #[test]
+    fn adapts_json_upstream_error_to_error_event() {
+        let events = json_events(br#"{"error":{"message":"overloaded"}}"#).unwrap();
+        assert!(
+            matches!(&events[..], [InternalEvent::Error { message }] if message == "overloaded")
+        );
     }
 
     #[test]
