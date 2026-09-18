@@ -51,7 +51,15 @@ impl AppState {
         while let Some(event) = futures_util::StreamExt::next(&mut events).await {
             accumulator.push(event?)?;
         }
-        Ok(accumulator.finish())
+        let response = accumulator.finish();
+        if response.text.is_empty()
+            && response.thinking.is_empty()
+            && response.tool_calls.is_empty()
+            && response.stop_reason.is_none()
+        {
+            return Err(AppError::Integrity("upstream stream was empty".into()));
+        }
+        Ok(response)
     }
 
     pub async fn reload_credential(&self) -> Result<(), AppError> {
