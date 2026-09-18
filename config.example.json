@@ -1,0 +1,22 @@
+{
+  "host": "127.0.0.1",
+  "port": 8990,
+  "client_api_key": "sk-client-change-me",
+  "admin_api_key": "sk-admin-change-me",
+  "admin": {
+    "enabled": true,
+    "session_ttl_secs": 28800,
+    "cookie_secure": false,
+    "allowed_origins": []
+  },
+  "credential_source": "auto",
+  "credential_path": "~/.local/share/kiro-cli/data.sqlite3",
+  "credential_json_path": "~/.aws/sso/cache/kiro.json",
+  "endpoint": "ide",
+  "api_region": "us-east-1",
+  "upstream_timeout_secs": 60,
+  "refresh_early_secs": 120,
+  "response_store_path": "kiro-gateway.sqlite3",
+  "proxy_url": null
+}
+
