@@ -23,15 +23,18 @@ pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<ResponsesRequest>,
 ) -> Result<Response, AppError> {
-    let previous = body
-        .previous_response_id
-        .as_deref()
-        .and_then(|id| state.responses.get(id).ok().flatten())
-        .map(|record| ResponseStore::extract_messages(&record))
-        .unwrap_or_default();
+    let previous_record =
+        body.previous_response_id.as_deref().and_then(|id| state.responses.get(id).ok().flatten());
+    let previous =
+        previous_record.as_ref().map(ResponseStore::extract_messages).unwrap_or_default();
+    let previous_tools =
+        previous_record.as_ref().map(ResponseStore::extract_tools).unwrap_or_default();
     let store = body.store;
     let stream_response = body.stream;
-    let internal = body.into_internal(previous);
+    let mut internal = body.into_internal(previous);
+    if internal.tools.is_empty() {
+        internal.tools = previous_tools;
+    }
     let model = internal.model.clone();
     let response = state.complete(&internal).await?;
     let id = format!("resp_{}", uuid::Uuid::now_v7());
@@ -41,7 +44,7 @@ pub async fn create(
         let mut record = state.responses.create_with_id(
             id.clone(),
             &model,
-            json!({"messages":stored_messages,"response":payload}),
+            json!({"messages":stored_messages,"tools":internal.tools,"response":payload}),
             ResponseStatus::InProgress,
         )?;
         let status = if response.incomplete {
@@ -52,7 +55,7 @@ pub async fn create(
         record = state.responses.update(
             record,
             status,
-            json!({"messages":stored_messages,"response":payload}),
+            json!({"messages":stored_messages,"tools":internal.tools,"response":payload}),
         )?;
         let _ = record;
     }
@@ -403,5 +406,27 @@ mod tests {
         assert_eq!(internal.messages[1].tool_calls[0].arguments["id"], 42);
         assert_eq!(internal.messages[2].tool_results[0].tool_call_id, "call_upstream");
         assert_eq!(internal.messages[2].tool_results[0].content, "found");
+    }
+
+    #[test]
+    fn stored_response_replays_tool_definitions_for_continuation() {
+        use crate::protocol::internal::InternalTool;
+        let input = vec![InternalMessage::new("user", Value::String("question".into()))];
+        let messages = response_messages(&input, &response(""));
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResponseStore::open(directory.path().join("responses.sqlite3")).unwrap();
+        let record = store
+            .create(
+                "kiro",
+                json!({
+                    "messages":messages,
+                    "tools":[InternalTool { name:"lookup".into(), description:None, input_schema:json!({"type":"object"}) }]
+                }),
+                ResponseStatus::Completed,
+            )
+            .unwrap();
+        let recovered = ResponseStore::extract_tools(&store.get(&record.id).unwrap().unwrap());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].name, "lookup");
     }
 }
