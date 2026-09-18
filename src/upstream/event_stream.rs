@@ -115,7 +115,11 @@ fn parse_headers(mut bytes: &[u8]) -> Result<Vec<(String, String)>, UpstreamStre
 pub fn decode_internal_events(
     message: &EventMessage,
 ) -> Result<Vec<InternalEvent>, UpstreamStreamError> {
-    let parsed = serde_json::from_slice::<Value>(&message.payload);
+    let parsed = if message.payload.is_empty() {
+        Ok(Value::Object(serde_json::Map::new()))
+    } else {
+        serde_json::from_slice::<Value>(&message.payload)
+    };
     let message_type = header(message, ":message-type").unwrap_or("event");
     if matches!(message_type, "error" | "exception") {
         let detail = parsed
@@ -370,5 +374,13 @@ mod tests {
                 name: Some("lookup".into()),
             }
         );
+    }
+
+    #[test]
+    fn accepts_empty_metadata_payload() {
+        let input = frame("metadataEvent", b"");
+        let mut decoder = EventStreamDecoder::new();
+        let message = decoder.push(&input).unwrap().pop().unwrap();
+        assert!(decode_internal_events(&message).unwrap().is_empty());
     }
 }
