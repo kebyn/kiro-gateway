@@ -504,7 +504,9 @@ mod tests {
         parse_json_tool_calls,
     };
     use crate::{
-        protocol::internal::{InternalEvent, InternalResponse},
+        auth::{AuthMethod, Credential, SecretString},
+        endpoint::{EndpointKind, endpoint_for},
+        protocol::internal::{InternalEvent, InternalRequest, InternalResponse},
         transform::truncation::XmlLeakFilter,
         upstream::{
             event_stream::{EventStreamDecoder, decode_internal_events},
@@ -513,7 +515,16 @@ mod tests {
         },
     };
     use crc::{CRC_32_ISO_HDLC, Crc};
+    use futures_util::StreamExt;
     use serde_json::{Value, json};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
@@ -534,6 +545,70 @@ mod tests {
         frame.extend_from_slice(&payload);
         frame.extend_from_slice(&CRC32.checksum(&frame).to_be_bytes());
         frame
+    }
+
+    #[tokio::test]
+    async fn retries_truncated_attempt_before_emitting_any_event() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                server_attempts.fetch_add(1, Ordering::SeqCst);
+                let body = if attempt == 0 {
+                    b"bad".to_vec()
+                } else {
+                    let mut body = event_frame("assistantResponseEvent", json!({"content":"ok"}));
+                    body.extend(event_frame("metadataEvent", json!({"stopReason":"end_turn"})));
+                    body
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+        let upstream_url = format!("http://{address}");
+        let client = super::UpstreamClient::new(
+            reqwest::Client::new(),
+            endpoint_for(EndpointKind::Ide, Some(upstream_url.as_str())),
+        );
+        let credential = Credential {
+            auth_method: AuthMethod::ApiKey,
+            access_token: Some(SecretString::new("token")),
+            ..Default::default()
+        };
+        let request = InternalRequest {
+            model: "kiro".into(),
+            messages: vec![crate::protocol::internal::InternalMessage::new(
+                "user",
+                Value::String("hello".into()),
+            )],
+            system: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            conversation_id: None,
+            instructions: None,
+        };
+        let mut events = client.event_stream(&request, &credential).await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(event) = events.next().await {
+            collected.push(event.unwrap());
+        }
+        server.await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            matches!(&collected[..], [InternalEvent::TextDelta { text }, InternalEvent::Stop { reason }] if text == "ok" && reason == "end_turn")
+        );
     }
 
     fn response_from_events(events: Vec<(&str, Value)>) -> InternalResponse {
