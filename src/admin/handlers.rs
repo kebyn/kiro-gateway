@@ -117,3 +117,13 @@ pub async fn delete_response(
 ) -> Result<impl IntoResponse, AppError> {
     if state.responses.delete(&id)? { Ok(StatusCode::NO_CONTENT) } else { Err(AppError::NotFound) }
 }
+
+pub async fn response_events(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    if state.responses.get(&id)?.is_none() {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(state.responses.events(&id)?))
+}

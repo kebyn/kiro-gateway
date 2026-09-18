@@ -21,3 +21,12 @@ pub struct ResponseRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResponseEvent {
+    pub response_id: String,
+    pub sequence_number: u64,
+    pub event_type: String,
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
+}
