@@ -34,10 +34,19 @@ pub async fn create(
     let id = format!("resp_{}", uuid::Uuid::now_v7());
     let payload = json!({"id":id,"object":"response","status":if response.incomplete {"incomplete"} else {"completed"},"model":model,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"output_text":response.text,"usage":response.usage,"tool_calls":response.tool_calls});
     if store {
+        let mut stored_messages = internal.messages.clone();
+        if !response.text.is_empty() {
+            stored_messages.push(crate::protocol::internal::InternalMessage {
+                role: "assistant".into(),
+                content: Value::String(response.text.clone()),
+                name: None,
+                tool_call_id: None,
+            });
+        }
         let mut record = state.responses.create_with_id(
             id.clone(),
             &model,
-            json!({"messages":internal.messages,"response":payload}),
+            json!({"messages":stored_messages,"response":payload}),
             ResponseStatus::InProgress,
         )?;
         let status = if response.incomplete {
@@ -48,7 +57,7 @@ pub async fn create(
         record = state.responses.update(
             record,
             status,
-            json!({"messages":internal.messages,"response":payload}),
+            json!({"messages":stored_messages,"response":payload}),
         )?;
         let _ = record;
     }
