@@ -22,6 +22,23 @@ pub struct InternalMessage {
     pub name: Option<String>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<InternalToolCall>,
+    #[serde(default)]
+    pub tool_results: Vec<InternalToolResult>,
+}
+
+impl InternalMessage {
+    pub fn new(role: impl Into<String>, content: Value) -> Self {
+        Self {
+            role: role.into(),
+            content,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -64,13 +81,20 @@ impl InternalRequest {
 }
 
 pub fn content_text(message: &InternalMessage) -> String {
-    match &message.content {
+    value_text(&message.content)
+}
+
+pub fn value_text(value: &Value) -> String {
+    match value {
         Value::String(value) => value.clone(),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
+        Value::Array(items) => items.iter().map(value_text).collect::<Vec<_>>().join(""),
+        Value::Object(object) => object
+            .get("text")
+            .or_else(|| object.get("output_text"))
+            .or_else(|| object.get("input_text"))
+            .map(value_text)
+            .unwrap_or_default(),
+        Value::Null => String::new(),
         value => value.to_string(),
     }
 }
@@ -124,11 +148,28 @@ pub struct InternalResponse {
     pub incomplete: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct InternalToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
     #[serde(default)]
     pub complete: bool,
+}
+
+impl InternalToolCall {
+    pub fn arguments_json(&self) -> String {
+        match &self.arguments {
+            Value::String(arguments) => arguments.clone(),
+            arguments => arguments.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InternalToolResult {
+    pub tool_call_id: String,
+    pub content: Value,
+    #[serde(default)]
+    pub is_error: bool,
 }
