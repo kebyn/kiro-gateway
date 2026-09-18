@@ -271,12 +271,59 @@ pub async fn count_tokens(
 
 #[cfg(test)]
 mod tests {
-    use super::anthropic_stream_events;
+    use super::{anthropic_stream_events, messages};
     use crate::{
+        AppState,
+        app_state::build_upstream,
+        auth::{AuthMethod, Credential},
+        config::AppConfig,
+        credential::TokenManager,
         protocol::internal::{InternalResponse, InternalToolCall},
+        response_store::ResponseStore,
         transform::converter::anthropic_response,
     };
+    use axum::{Json, extract::State};
+    use http_body_util::BodyExt;
     use serde_json::json;
+    use std::{path::Path, sync::Arc};
+
+    fn state(path: &Path) -> AppState {
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            ..Default::default()
+        };
+        let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        AppState {
+            config: Arc::new(config.clone()),
+            token_manager: Arc::new(TokenManager::new(&config, credential).unwrap()),
+            responses: ResponseStore::open(path).unwrap(),
+            upstream: build_upstream(&config, reqwest::Client::new()),
+            sessions: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_stream_starts_before_fallback_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":true
+        }))
+        .unwrap();
+        let response =
+            messages(State(state(&directory.path().join("responses.sqlite3"))), Json(request))
+                .await
+                .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let event_names: Vec<_> =
+            body.lines().filter_map(|line| line.strip_prefix("event: ")).collect();
+        assert_eq!(event_names.first().copied(), Some("message_start"));
+        assert!(event_names.contains(&"content_block_start"));
+        assert_eq!(event_names.last().copied(), Some("message_stop"));
+    }
 
     #[test]
     fn streams_tool_use_blocks_with_protocol_indices() {

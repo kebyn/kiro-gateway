@@ -149,12 +149,60 @@ fn chat_stream_data(payload: &serde_json::Value, response: &InternalResponse) ->
 
 #[cfg(test)]
 mod tests {
-    use super::chat_stream_data;
+    use super::{chat_completions, chat_stream_data};
     use crate::{
+        AppState,
+        app_state::build_upstream,
+        auth::{AuthMethod, Credential},
+        config::AppConfig,
+        credential::TokenManager,
         protocol::internal::{InternalResponse, InternalToolCall},
+        response_store::ResponseStore,
         transform::converter::openai_chat_response,
     };
+    use axum::{Json, extract::State};
+    use http_body_util::BodyExt;
     use serde_json::{Value, json};
+    use std::{path::Path, sync::Arc};
+
+    fn state(path: &Path) -> AppState {
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            ..Default::default()
+        };
+        let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        AppState {
+            config: Arc::new(config.clone()),
+            token_manager: Arc::new(TokenManager::new(&config, credential).unwrap()),
+            responses: ResponseStore::open(path).unwrap(),
+            upstream: build_upstream(&config, reqwest::Client::new()),
+            sessions: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_stream_emits_role_then_incremental_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":true
+        }))
+        .unwrap();
+        let response = chat_completions(
+            State(state(&directory.path().join("responses.sqlite3"))),
+            Json(request),
+        )
+        .await
+        .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.starts_with("data: {"));
+        assert!(body.contains("\"role\":\"assistant\""));
+        assert!(body.contains("\"content\":\"Kiro gateway"));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
 
     #[test]
     fn streams_parallel_tool_calls_before_done() {
