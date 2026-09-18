@@ -32,7 +32,14 @@ pub async fn create(
     let model = internal.model.clone();
     let response = state.complete(&internal).await?;
     let id = format!("resp_{}", uuid::Uuid::now_v7());
-    let payload = json!({"id":id,"object":"response","status":if response.incomplete {"incomplete"} else {"completed"},"model":model,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"output_text":response.text,"usage":response.usage,"tool_calls":response.tool_calls});
+    let mut output = Vec::new();
+    if !response.text.is_empty() {
+        output.push(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}));
+    }
+    for call in &response.tool_calls {
+        output.push(json!({"type":"function_call","id":call.id,"call_id":call.id,"name":call.name,"arguments":call.arguments.to_string()}));
+    }
+    let payload = json!({"id":id,"object":"response","status":if response.incomplete {"incomplete"} else {"completed"},"model":model,"output":output,"output_text":response.text,"usage":response.usage,"tool_calls":response.tool_calls});
     if store {
         let mut stored_messages = internal.messages.clone();
         if !response.text.is_empty() {
@@ -62,7 +69,7 @@ pub async fn create(
         let _ = record;
     }
     if stream_response {
-        let events = vec![
+        let mut events = vec![
             Event::default().event("response.created").data(
                 serde_json::to_string(&json!({"type":"response.created","response":payload}))
                     .map_err(|e| AppError::Internal(e.to_string()))?,
@@ -84,6 +91,13 @@ pub async fn create(
                         .map_err(|e| AppError::Internal(e.to_string()))?,
                 ),
         ];
+        for call in &response.tool_calls {
+            events.push(Event::default().event("response.output_item.added").data(serde_json::to_string(&json!({"type":"response.output_item.added","item":{"type":"function_call","id":call.id,"call_id":call.id,"name":call.name,"arguments":""}})).map_err(|e| AppError::Internal(e.to_string()))?));
+            let arguments = call.arguments.to_string();
+            events.push(Event::default().event("response.function_call_arguments.delta").data(serde_json::to_string(&json!({"type":"response.function_call_arguments.delta","item_id":call.id,"delta":arguments})).map_err(|e| AppError::Internal(e.to_string()))?));
+            events.push(Event::default().event("response.function_call_arguments.done").data(serde_json::to_string(&json!({"type":"response.function_call_arguments.done","item_id":call.id,"arguments":arguments})).map_err(|e| AppError::Internal(e.to_string()))?));
+            events.push(Event::default().event("response.output_item.done").data(serde_json::to_string(&json!({"type":"response.output_item.done","item":{"type":"function_call","id":call.id,"call_id":call.id,"name":call.name,"arguments":arguments}})).map_err(|e| AppError::Internal(e.to_string()))?));
+        }
         Ok(Sse::new(stream::iter(events.into_iter().map(Ok::<Event, std::convert::Infallible>)))
             .into_response())
     } else {
