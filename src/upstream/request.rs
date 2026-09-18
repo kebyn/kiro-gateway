@@ -88,10 +88,6 @@ impl UpstreamClient {
                     let chunk = match chunk {
                         Ok(chunk) => chunk,
                         Err(error) => {
-                            if !emitted && attempt == 0 {
-                                retry = true;
-                                break;
-                            }
                             yield Err(AppError::Upstream(error.to_string()));
                             return;
                         }
@@ -111,10 +107,6 @@ impl UpstreamClient {
                         let events = match decode_internal_events(&message) {
                             Ok(events) => events,
                             Err(UpstreamStreamError::Upstream(message)) => {
-                                if !emitted && attempt == 0 {
-                                    retry = true;
-                                    break;
-                                }
                                 yield Err(AppError::Upstream(message));
                                 return;
                             }
