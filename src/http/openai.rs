@@ -6,6 +6,7 @@ use crate::{
         openai_chat::ChatRequest,
     },
     transform::converter::{chat_finish_reason, openai_chat_response},
+    transform::truncation::XmlLeakFilter,
     upstream::request::InternalEventAccumulator,
 };
 use axum::{
@@ -41,12 +42,14 @@ pub async fn chat_completions(
         let mut accumulator = InternalEventAccumulator::new();
         let mut tool_indices = HashMap::<String, usize>::new();
         let mut next_tool_index = 0_usize;
+        let mut text_filter = XmlLeakFilter::new();
         let mut failed = false;
         while let Some(item) = upstream.next().await {
             let event = match item {
                 Ok(event) => event,
                 Err(error) => {
                     yield Ok(Event::default().event("error").data(json!({"error":{"message":error.to_string(),"type":"upstream_error"}}).to_string()));
+                    yield Ok(Event::default().data(json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}).to_string()));
                     yield Ok(Event::default().data("[DONE]"));
                     failed = true;
                     break;
@@ -54,12 +57,14 @@ pub async fn chat_completions(
             };
             if let InternalEvent::Error { message } = &event {
                 yield Ok(Event::default().event("error").data(json!({"error":{"message":message,"type":"upstream_error"}}).to_string()));
+                yield Ok(Event::default().data(json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}).to_string()));
                 yield Ok(Event::default().data("[DONE]"));
                 failed = true;
                 break;
             }
             if let Err(error) = accumulator.push(event.clone()) {
                 yield Ok(Event::default().event("error").data(json!({"error":{"message":error.to_string(),"type":"upstream_error"}}).to_string()));
+                yield Ok(Event::default().data(json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}).to_string()));
                 yield Ok(Event::default().data("[DONE]"));
                 failed = true;
                 break;
@@ -69,7 +74,10 @@ pub async fn chat_completions(
             };
             match event {
                 InternalEvent::TextDelta { text } if !text.is_empty() => {
-                    yield Ok(Event::default().data(chunk(json!({"content":text})).to_string()));
+                    let text = text_filter.push(&text);
+                    if !text.is_empty() {
+                        yield Ok(Event::default().data(chunk(json!({"content":text})).to_string()));
+                    }
                 }
                 InternalEvent::ThinkingDelta { text } if !text.is_empty() => {
                     yield Ok(Event::default().data(chunk(json!({"reasoning_content":text})).to_string()));

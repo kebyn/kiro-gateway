@@ -19,7 +19,10 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::json;
-use std::{collections::HashMap, convert::Infallible};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+};
 
 pub async fn messages(
     State(state): State<AppState>,
@@ -57,6 +60,8 @@ pub async fn messages(
         let mut thinking_index = None;
         let mut tool_indices = HashMap::<String, usize>::new();
         let mut active_tool = None::<String>;
+        let mut block_order = Vec::<usize>::new();
+        let mut closed_blocks = HashSet::<usize>::new();
         let mut next_index = 0_usize;
         let mut text_filter = XmlLeakFilter::new();
         let mut failed = false;
@@ -66,6 +71,7 @@ pub async fn messages(
                 Ok(event) => event,
                 Err(error) => {
                     yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":error.to_string()}}).to_string()));
+                    yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":0}}).to_string()));
                     yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
                     failed = true;
                     break;
@@ -73,12 +79,14 @@ pub async fn messages(
             };
             if let InternalEvent::Error { message } = &event {
                 yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":message}}).to_string()));
+                yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":0}}).to_string()));
                 yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
                 failed = true;
                 break;
             }
             if let Err(error) = accumulator.push(event.clone()) {
                 yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":error.to_string()}}).to_string()));
+                yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":0}}).to_string()));
                 yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
                 failed = true;
                 break;
@@ -92,6 +100,7 @@ pub async fn messages(
                         value
                     });
                     if was_none {
+                        block_order.push(index);
                         yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}).to_string()));
                     }
                     let text = text_filter.push(&text);
@@ -107,6 +116,7 @@ pub async fn messages(
                         value
                     });
                     if was_none {
+                        block_order.push(index);
                         yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":index,"content_block":{"type":"thinking","thinking":""}}).to_string()));
                     }
                     if !text.is_empty() {
@@ -121,6 +131,7 @@ pub async fn messages(
                         let index = next_index;
                         next_index += 1;
                         tool_indices.insert(key.clone(), index);
+                        block_order.push(index);
                         yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":key,"name":name,"input":{}}}).to_string()));
                     }
                     active_tool = Some(key);
@@ -134,6 +145,7 @@ pub async fn messages(
                         let index = next_index;
                         next_index += 1;
                         tool_indices.insert(key.clone(), index);
+                        block_order.push(index);
                         yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":key,"name":name.unwrap_or_default(),"input":{}}}).to_string()));
                     }
                     active_tool = Some(key.clone());
@@ -145,7 +157,9 @@ pub async fn messages(
                     let key = if id.is_empty() { active_tool.clone() } else { Some(id) };
                     if let Some(key) = key {
                         if let Some(index) = tool_indices.get(&key).copied() {
-                            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+                            if closed_blocks.insert(index) {
+                                yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+                            }
                         }
                         if active_tool.as_deref() == Some(key.as_str()) { active_tool = None; }
                     }
@@ -156,14 +170,8 @@ pub async fn messages(
         }
         if failed { return; }
         let response = accumulator.finish();
-        if let Some(index) = thinking_index {
-            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
-        }
-        if let Some(index) = text_index {
-            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
-        }
-        if let Some(key) = active_tool.take() {
-            if let Some(index) = tool_indices.get(&key).copied() {
+        for index in block_order {
+            if !closed_blocks.contains(&index) {
                 yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
             }
         }
