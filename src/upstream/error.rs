@@ -12,4 +12,6 @@ pub enum UpstreamStreamError {
     MalformedHeader,
     #[error("upstream event error: {0}")]
     Event(String),
+    #[error("upstream exception: {0}")]
+    Upstream(String),
 }
