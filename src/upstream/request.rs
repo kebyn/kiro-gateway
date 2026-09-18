@@ -5,7 +5,6 @@ use crate::{
     protocol::internal::{
         InternalEvent, InternalRequest, InternalResponse, InternalToolCall, Usage,
     },
-    transform::converter::normalized_stop_reason,
     transform::truncation::XmlLeakFilter,
     upstream::{
         error::UpstreamStreamError,
