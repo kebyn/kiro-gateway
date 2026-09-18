@@ -145,6 +145,11 @@ pub fn decode_internal_event(message: &EventMessage) -> Result<InternalEvent, Up
                 .or_else(|| value.get("content"))
                 .map(Value::to_string)
                 .unwrap_or_default(),
+            name: value
+                .get("name")
+                .or_else(|| value.get("toolName"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
         }),
         "metadataEvent" | "metadata" => Ok(InternalEvent::Usage {
             usage: crate::protocol::internal::Usage::new(
