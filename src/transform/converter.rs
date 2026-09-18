@@ -32,6 +32,9 @@ pub fn anthropic_stop_reason(response: &InternalResponse) -> String {
     if !response.tool_calls.is_empty() {
         return "tool_use".into();
     }
+    if response.incomplete {
+        return "max_tokens".into();
+    }
     match normalized_stop_reason(response.stop_reason.as_deref()) {
         Some("max_tokens") => "max_tokens".into(),
         Some("context_window_exceeded") => "model_context_window_exceeded".into(),
@@ -45,6 +48,9 @@ pub fn anthropic_stop_reason(response: &InternalResponse) -> String {
 pub fn chat_finish_reason(response: &InternalResponse) -> &'static str {
     if !response.tool_calls.is_empty() {
         return "tool_calls";
+    }
+    if response.incomplete {
+        return "length";
     }
     match normalized_stop_reason(response.stop_reason.as_deref()) {
         Some("max_tokens") | Some("context_window_exceeded") => "length",
@@ -131,6 +137,13 @@ mod tests {
         assert_eq!(
             openai_chat_response("kiro", &response)["choices"][0]["finish_reason"],
             "content_filter"
+        );
+        response.stop_reason = None;
+        response.incomplete = true;
+        assert_eq!(anthropic_stop_reason(&response), "max_tokens");
+        assert_eq!(
+            openai_chat_response("kiro", &response)["choices"][0]["finish_reason"],
+            "length"
         );
     }
 }
