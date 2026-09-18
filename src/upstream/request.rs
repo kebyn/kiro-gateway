@@ -1,5 +1,5 @@
 use crate::{
-    auth::Credential,
+    auth::{AuthMethod, Credential},
     endpoint::KiroEndpoint,
     error::AppError,
     protocol::internal::{InternalEvent, InternalRequest},
@@ -48,13 +48,19 @@ impl UpstreamClient {
         integrity: &mut StreamIntegrity,
     ) -> Result<crate::protocol::internal::InternalResponse, AppError> {
         let body = self.endpoint.transform_api_body(request, credential);
-        let builder = self
+        let mut builder = self
             .client
             .post(self.endpoint.api_url(credential))
             .bearer_auth(
                 credential.access_token.as_ref().map(|v| v.expose_secret()).unwrap_or_default(),
             )
             .json(&body);
+        builder = builder.header("x-amzn-codewhisperer-optout", "true");
+        if matches!(credential.auth_method, AuthMethod::ApiKey) {
+            builder = builder.header("tokentype", "API_KEY");
+        } else if matches!(credential.auth_method, AuthMethod::Social) {
+            builder = builder.header("TokenType", "EXTERNAL_IDP");
+        }
         let response = self
             .endpoint
             .decorate_api(builder, credential)

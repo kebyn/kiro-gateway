@@ -88,8 +88,13 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
                     candidates.extend(load_json(&path)?);
                 }
             }
-            if let Some(path) = config.credential_path.as_deref() {
-                let path = AppConfig::expanded_path(path);
+            let sqlite_path =
+                config.credential_path.as_deref().map(AppConfig::expanded_path).or_else(|| {
+                    std::env::var("HOME").ok().map(|home| {
+                        std::path::PathBuf::from(home).join(".local/share/kiro-cli/data.sqlite3")
+                    })
+                });
+            if let Some(path) = sqlite_path {
                 if path.exists() {
                     candidates.extend(sqlite::load(&path)?.into_iter().map(|mut c| {
                         c.source = Some(path.display().to_string());
