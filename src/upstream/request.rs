@@ -3,6 +3,7 @@ use crate::{
     endpoint::KiroEndpoint,
     error::AppError,
     protocol::internal::{InternalEvent, InternalRequest},
+    transform::truncation::XmlLeakFilter,
     upstream::{
         event_stream::{EventStreamDecoder, decode_internal_event},
         integrity::{RetryDecision, StreamIntegrity},
@@ -119,6 +120,7 @@ impl UpstreamClient {
         let mut stream = response.bytes_stream();
         let mut decoder = EventStreamDecoder::new();
         let mut tools = ToolCallAccumulator::new();
+        let mut xml_filter = XmlLeakFilter::new();
         let mut output = crate::protocol::internal::InternalResponse::default();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| AppError::Upstream(e.to_string()))?;
@@ -129,7 +131,7 @@ impl UpstreamClient {
                 {
                     InternalEvent::TextDelta { text } => {
                         integrity.record_emission();
-                        output.text.push_str(&text);
+                        output.text.push_str(&xml_filter.push(&text));
                     }
                     InternalEvent::ThinkingDelta { text } => output.thinking.push_str(&text),
                     InternalEvent::ToolCallStart { id, name } => {
