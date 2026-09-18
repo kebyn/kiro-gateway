@@ -111,10 +111,10 @@ impl Credential {
         if matches!(self.auth_method, AuthMethod::ApiKey) {
             return false;
         }
+        let refresh_at =
+            now.checked_add_signed(chrono::Duration::seconds(early_secs)).unwrap_or(now);
         self.access_token.as_ref().is_none_or(|v| v.is_empty())
-            || self
-                .expires_at
-                .is_some_and(|when| when <= now + chrono::Duration::seconds(early_secs))
+            || self.expires_at.is_some_and(|when| when <= refresh_at)
     }
     pub fn status(&self, now: DateTime<Utc>, early_secs: i64) -> CredentialStatus {
         CredentialStatus {
