@@ -20,7 +20,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/responses", post(responses::create))
         .route("/v1/responses/{id}", get(responses::get).delete(responses::delete))
-        .layer(axum::middleware::from_fn_with_state(
+        .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::admin::middleware::client_api_key,
         ));
@@ -50,4 +50,82 @@ async fn models() -> impl IntoResponse {
     axum::Json(
         serde_json::json!({"object":"list","data":[{"id":"kiro","object":"model","owned_by":"kiro"}]}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::router;
+    use crate::{
+        AppState,
+        app_state::build_upstream,
+        auth::{AuthMethod, Credential},
+        config::{AdminConfig, AppConfig},
+        credential::TokenManager,
+        response_store::ResponseStore,
+    };
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn disabled_admin_has_no_page_or_api_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin: AdminConfig { enabled: false, ..Default::default() },
+            response_store_path: directory.path().join("responses.sqlite3").display().to_string(),
+            ..Default::default()
+        };
+        let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        let state = AppState {
+            config: Arc::new(config.clone()),
+            token_manager: Arc::new(TokenManager::new(&config, credential).unwrap()),
+            responses: ResponseStore::open(&config.response_store_path).unwrap(),
+            upstream: build_upstream(&config, reqwest::Client::new()),
+            sessions: Default::default(),
+        };
+        let app = router(state);
+        let page = app
+            .clone()
+            .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::NOT_FOUND);
+        let api = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/admin/credential").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::NOT_FOUND);
+        let health = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn enabled_admin_page_is_public_before_login() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            response_store_path: directory.path().join("responses.sqlite3").display().to_string(),
+            ..Default::default()
+        };
+        let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        let state = AppState {
+            config: Arc::new(config.clone()),
+            token_manager: Arc::new(TokenManager::new(&config, credential).unwrap()),
+            responses: ResponseStore::open(&config.response_store_path).unwrap(),
+            upstream: build_upstream(&config, reqwest::Client::new()),
+            sessions: Default::default(),
+        };
+        let response = router(state)
+            .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
