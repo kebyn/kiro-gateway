@@ -232,7 +232,21 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
         return Ok(vec![InternalEvent::Error { message }]);
     }
     let mut events = Vec::new();
-    if let Some(text) = json_text(&body, &["content", "text"]).filter(|text| !text.is_empty()) {
+    if let Some(text) = json_text(&body, &["content", "text", "output_text"])
+        .or_else(|| {
+            body.get("output").and_then(|output| {
+                output.as_array().and_then(|items| {
+                    let text = items
+                        .iter()
+                        .filter_map(|item| json_text(item, &["content", "text", "output_text"]))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    (!text.is_empty()).then_some(text)
+                })
+            })
+        })
+        .filter(|text| !text.is_empty())
+    {
         events.push(InternalEvent::TextDelta { text: text.to_owned() });
     }
     if let Some(text) = json_text(&body, &["thinking", "reasoning"]).filter(|text| !text.is_empty())
@@ -440,7 +454,7 @@ fn parse_json_tool_calls(
             if item
                 .get("type")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|kind| kind != "function_call" && kind != "tool_use")
+                .is_some_and(|kind| !matches!(kind, "function_call" | "tool_use" | "function"))
             {
                 return None;
             }
@@ -672,6 +686,18 @@ mod tests {
         let events = json_events(br#"{"error":{"message":"overloaded"}}"#).unwrap();
         assert!(
             matches!(&events[..], [InternalEvent::Error { message }] if message == "overloaded")
+        );
+    }
+
+    #[test]
+    fn adapts_nested_output_text_and_openai_function_calls() {
+        let events = json_events(
+            br#"{"output":[{"type":"message","content":[{"type":"output_text","text":"nested"}]},{"type":"function","id":"call_1","function":{"name":"lookup","arguments":"{\"x\":1}"}}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(&events[0], InternalEvent::TextDelta { text } if text == "nested"));
+        assert!(
+            matches!(&events[1], InternalEvent::ToolCallStart { id, name } if id == "call_1" && name == "lookup")
         );
     }
 
