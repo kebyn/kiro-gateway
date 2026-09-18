@@ -163,6 +163,16 @@ impl UpstreamClient {
         }))
     }
 
+    /// Short compatibility alias for callers that refer to the upstream
+    /// interface simply as a stream.
+    pub async fn stream(
+        &self,
+        request: &InternalRequest,
+        credential: &Credential,
+    ) -> Result<InternalEventStream, AppError> {
+        self.event_stream(request, credential).await
+    }
+
     pub async fn complete(
         &self,
         request: &InternalRequest,

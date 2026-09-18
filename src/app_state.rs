@@ -45,6 +45,10 @@ impl AppState {
         self.upstream.event_stream(request, &credential).await
     }
 
+    pub async fn stream(&self, request: &InternalRequest) -> Result<InternalEventStream, AppError> {
+        self.event_stream(request).await
+    }
+
     pub async fn complete(&self, request: &InternalRequest) -> Result<InternalResponse, AppError> {
         let mut events = self.event_stream(request).await?;
         let mut accumulator = crate::upstream::request::InternalEventAccumulator::new();
