@@ -67,7 +67,11 @@ impl ResponsesRequest {
 }
 
 fn parse_item(item: &Value) -> Option<InternalMessage> {
-    let role = item.get("role").and_then(Value::as_str)?.to_owned();
+    let raw_role = item
+        .get("role")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("type").and_then(Value::as_str))?;
+    let role = if raw_role == "function_call_output" { "tool" } else { raw_role }.to_owned();
     let content =
         item.get("content").cloned().or_else(|| item.get("text").cloned()).unwrap_or(Value::Null);
     Some(InternalMessage {
