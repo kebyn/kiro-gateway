@@ -1,6 +1,6 @@
 use crate::{
     error::AppError,
-    protocol::internal::{InternalMessage, InternalResponse},
+    protocol::internal::{InternalMessage, InternalResponse, InternalTool},
     response_store::{
         model::{ResponseRecord, ResponseStatus},
         sqlite::SqliteStore,
@@ -78,6 +78,13 @@ impl ResponseStore {
             .payload
             .get("messages")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+    pub fn extract_tools(record: &ResponseRecord) -> Vec<InternalTool> {
+        record
+            .payload
+            .get("tools")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
             .unwrap_or_default()
     }
     pub fn response_payload(response: &InternalResponse) -> Value {
