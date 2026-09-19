@@ -13,11 +13,12 @@
   "credential_source": "auto",
   "credential_path": "~/.local/share/kiro-cli/data.sqlite3",
   "credential_json_path": "~/.aws/sso/cache/kiro.json",
-  "endpoint": "ide",
+  "endpoint": "auto",
   "api_region": "us-east-1",
   "upstream_timeout_secs": 60,
   "refresh_early_secs": 120,
   "refresh_interval_secs": 30,
+  "model_cache_ttl_secs": 300,
   "response_store_path": "kiro-gateway.sqlite3",
   "upstream_url": null,
   "proxy_url": null

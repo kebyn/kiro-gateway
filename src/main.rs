@@ -8,6 +8,7 @@ mod credential;
 mod endpoint;
 mod error;
 mod http;
+mod model_catalog;
 mod protocol;
 mod response_store;
 mod transform;
@@ -23,7 +24,7 @@ use response_store::ResponseStore;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Debug, Parser)]
-#[command(name = "kiro-gateway-rs", version, about = "Single-tenant Kiro API gateway")]
+#[command(name = "kiro-gateway", version, about = "Single-tenant Kiro API gateway")]
 struct Args {
     #[arg(long, env = "KIRO_CONFIG")]
     config: Option<PathBuf>,
@@ -61,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _refresh_task =
         token_manager.spawn_refresh_task(Duration::from_secs(config.refresh_interval_secs));
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await?;
-    tracing::info!("kiro-gateway-rs listening on {}:{}", config.host, config.port);
+    tracing::info!("kiro-gateway listening on {}:{}", config.host, config.port);
     axum::serve(listener, http::router::router(state)).await?;
     Ok(())
 }

@@ -42,14 +42,36 @@ pub async fn health(State(_state): State<AppState>) -> impl IntoResponse {
     (
         StatusCode::OK,
         axum::Json(
-            serde_json::json!({"ok":true,"service":"kiro-gateway-rs","build_epoch":env!("KIRO_BUILD_EPOCH")}),
+            serde_json::json!({"ok":true,"service":"kiro-gateway","build_epoch":env!("KIRO_BUILD_EPOCH")}),
         ),
     )
 }
-async fn models() -> impl IntoResponse {
-    axum::Json(
-        serde_json::json!({"object":"list","data":[{"id":"kiro","object":"model","owned_by":"kiro"}]}),
-    )
+async fn models(State(state): State<AppState>) -> impl IntoResponse {
+    let models = match state.token_manager.available_models().await {
+        Ok(models) => models,
+        Err(error) => {
+            tracing::warn!(error = %error, "model discovery failed");
+            Vec::new()
+        }
+    };
+    let data = models
+        .into_iter()
+        .map(|model| {
+            let mut value =
+                serde_json::json!({"id":model.model_id,"object":"model","owned_by":"kiro"});
+            if let Some(name) = model.model_name {
+                value["model_name"] = serde_json::Value::String(name);
+            }
+            if let Some(description) = model.description {
+                value["description"] = serde_json::Value::String(description);
+            }
+            if let Some(token_limits) = model.token_limits {
+                value["token_limits"] = serde_json::to_value(token_limits).unwrap_or_default();
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    axum::Json(serde_json::json!({"object":"list","data":data}))
 }
 
 #[cfg(test)]
@@ -61,6 +83,7 @@ mod tests {
         auth::{AuthMethod, Credential},
         config::{AdminConfig, AppConfig},
         credential::TokenManager,
+        model_catalog::{ModelInfo, TokenLimits},
         response_store::ResponseStore,
     };
     use axum::body::Body;
@@ -127,5 +150,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn models_route_returns_remote_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            response_store_path: directory.path().join("responses.sqlite3").display().to_string(),
+            ..Default::default()
+        };
+        let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        let token_manager = Arc::new(TokenManager::new(&config, credential).unwrap());
+        token_manager.seed_models_for_tests(vec![ModelInfo {
+            model_id: "claude-sonnet-4.5".into(),
+            model_name: Some("Sonnet".into()),
+            description: Some("balanced".into()),
+            token_limits: Some(TokenLimits {
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(8_192),
+            }),
+        }]);
+        let state = AppState {
+            config: Arc::new(config.clone()),
+            token_manager,
+            responses: ResponseStore::open(&config.response_store_path).unwrap(),
+            upstream: build_upstream(&config, reqwest::Client::new()),
+            sessions: Default::default(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header("x-api-key", "client")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["data"][0]["id"], "claude-sonnet-4.5");
+        assert_eq!(json["data"][0]["model_name"], "Sonnet");
+        assert_eq!(json["data"][0]["token_limits"]["maxInputTokens"], 200_000);
+    }
+
+    #[tokio::test]
+    async fn models_route_returns_empty_data_when_discovery_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            response_store_path: directory.path().join("responses.sqlite3").display().to_string(),
+            ..Default::default()
+        };
+        let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        let state = AppState {
+            config: Arc::new(config.clone()),
+            token_manager: Arc::new(TokenManager::new(&config, credential).unwrap()),
+            responses: ResponseStore::open(&config.response_store_path).unwrap(),
+            upstream: build_upstream(&config, reqwest::Client::new()),
+            sessions: Default::default(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header("x-api-key", "client")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!({"object":"list","data":[]}));
     }
 }

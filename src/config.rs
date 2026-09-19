@@ -52,6 +52,7 @@ pub struct AppConfig {
     pub upstream_timeout_secs: u64,
     pub refresh_early_secs: i64,
     pub refresh_interval_secs: u64,
+    pub model_cache_ttl_secs: u64,
     pub response_store_path: String,
     pub log_json: bool,
     pub trust_forwarded_headers: bool,
@@ -68,7 +69,7 @@ impl Default for AppConfig {
             credential_source: "auto".to_owned(),
             credential_path: None,
             credential_json_path: None,
-            endpoint: "ide".to_owned(),
+            endpoint: "auto".to_owned(),
             api_region: "us-east-1".to_owned(),
             mcp_region: None,
             upstream_url: None,
@@ -76,6 +77,7 @@ impl Default for AppConfig {
             upstream_timeout_secs: 60,
             refresh_early_secs: 120,
             refresh_interval_secs: 30,
+            model_cache_ttl_secs: 300,
             response_store_path: "kiro-gateway.sqlite3".to_owned(),
             log_json: false,
             trust_forwarded_headers: false,
@@ -146,6 +148,9 @@ impl AppConfig {
         if let Some(v) = env_parse("KIRO_REFRESH_INTERVAL_SECS")? {
             self.refresh_interval_secs = v;
         }
+        if let Some(v) = env_parse("KIRO_MODEL_CACHE_TTL_SECS")? {
+            self.model_cache_ttl_secs = v;
+        }
         if let Some(v) = env_bool("KIRO_ADMIN_ENABLED")? {
             self.admin.enabled = v;
         }
@@ -191,6 +196,9 @@ impl AppConfig {
         if self.upstream_timeout_secs == 0 || self.refresh_interval_secs == 0 {
             return Err(AppError::Config("timeouts must be positive".into()));
         }
+        if self.model_cache_ttl_secs == 0 {
+            return Err(AppError::Config("model_cache_ttl_secs must be positive".into()));
+        }
         if self.refresh_early_secs < 0 {
             return Err(AppError::Config("refresh_early_secs must not be negative".into()));
         }
@@ -203,7 +211,7 @@ impl AppConfig {
                 self.credential_source
             )));
         }
-        if !matches!(self.endpoint.to_ascii_lowercase().as_str(), "ide" | "cli") {
+        if !matches!(self.endpoint.to_ascii_lowercase().as_str(), "auto" | "ide" | "cli") {
             return Err(AppError::Config(format!("unsupported endpoint: {}", self.endpoint)));
         }
         for (name, value) in [
@@ -301,6 +309,17 @@ mod tests {
             admin: AdminConfig { enabled: false, ..Default::default() },
             ..Default::default()
         };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn defaults_to_credential_aware_endpoint_selection() {
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.endpoint, "auto");
         assert!(config.validate().is_ok());
     }
 }

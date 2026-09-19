@@ -1,6 +1,6 @@
 use super::{AuthMethod, Credential, SecretString};
 use crate::error::AppError;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, types::ValueRef};
 use serde_json::Value;
 use std::path::Path;
 
@@ -59,10 +59,10 @@ pub fn load(path: &Path) -> Result<Vec<Credential>, AppError> {
                 first.machine_id = id;
             }
         }
-        if let Ok(profile) = conn.query_row::<String, _, _>(
+        if let Ok(Some(profile)) = conn.query_row(
             "SELECT value FROM state WHERE key = 'api.codewhisperer.profile'",
             [],
-            |row| row.get(0),
+            |row| read_text_value(row, 0),
         ) {
             if let Ok(value) = serde_json::from_str::<Value>(&profile) {
                 super::profile_resolver::resolve_profile(&value, first);
@@ -82,14 +82,23 @@ fn read_any(conn: &Connection, key: &str) -> Option<String> {
         "SELECT value FROM settings WHERE key = ?1",
         "SELECT data FROM state WHERE key = ?1",
     ] {
-        if let Ok(v) = conn.query_row(sql, [key], |row| row.get::<_, String>(0)).optional() {
-            if v.is_some() {
-                return v;
-            }
+        if let Ok(Some(Some(value))) =
+            conn.query_row(sql, [key], |row| read_text_value(row, 0)).optional()
+        {
+            return Some(value);
         }
     }
     None
 }
+
+fn read_text_value(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
+    Ok(match row.get_ref(index)? {
+        ValueRef::Text(value) => Some(String::from_utf8_lossy(value).into_owned()),
+        ValueRef::Blob(value) => String::from_utf8(value.to_vec()).ok(),
+        ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) => None,
+    })
+}
+
 fn parse_token(raw: &str) -> Option<Credential> {
     let value: Value = serde_json::from_str(raw).ok()?;
     let get = |names: &[&str]| names.iter().find_map(|n| value.get(*n).and_then(Value::as_str));
@@ -115,9 +124,9 @@ fn load_state_tables(conn: &Connection) -> Vec<Credential> {
     let mut out = Vec::new();
     for sql in ["SELECT value FROM state", "SELECT data FROM state"] {
         if let Ok(mut stmt) = conn.prepare(sql) {
-            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-                for row in rows.flatten() {
-                    if let Some(c) = parse_token(&row) {
+            if let Ok(rows) = stmt.query_map([], |row| read_text_value(row, 0)) {
+                for raw in rows.flatten().flatten() {
+                    if let Some(c) = parse_token(&raw) {
                         out.push(c);
                     }
                 }
@@ -129,33 +138,128 @@ fn load_state_tables(conn: &Connection) -> Vec<Credential> {
 
 #[cfg(test)]
 mod tests {
-    use super::load;
+    use super::{AuthMethod, load};
     use rusqlite::Connection;
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+    };
 
-    #[test]
-    fn reads_auth_kv_and_profile_state_without_writing() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("data.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        connection.execute_batch("CREATE TABLE auth_kv(key TEXT PRIMARY KEY, value TEXT); CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT);").unwrap();
+    fn create_realistic_database(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE auth_kv (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                CREATE TABLE state (
+                    key TEXT PRIMARY KEY,
+                    value BLOB
+                );
+                CREATE TABLE conversations (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                CREATE TABLE conversations_v2 (
+                    key TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (key, conversation_id)
+                );
+                "#,
+            )
+            .unwrap();
         connection
             .execute(
                 "INSERT INTO auth_kv(key,value) VALUES('kirocli:odic:token', ?1)",
-                [r#"{"accessToken":"a","refreshToken":"r","region":"us-west-2"}"#],
+                [r#"{"access_token":"access-token-fixture","refresh_token":"refresh-token-fixture","region":"us-west-2","expires_at":"2030-01-02T03:04:05Z"}"#],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO auth_kv(key,value) VALUES('kirocli:odic:device-registration', ?1)",
+                [r#"{"client_id":"client-id-fixture","client_secret":"client-secret-fixture","region":"us-east-2"}"#],
             )
             .unwrap();
         connection
             .execute(
                 "INSERT INTO state(key,value) VALUES('api.codewhisperer.profile', ?1)",
-                [r#"{"arn":"arn:aws:codewhisperer:eu-west-1:123:profile/x"}"#],
+                [r#"{"arn":"arn:aws:codewhisperer:eu-west-1:123:profile/fixture","profile_name":"fixture"}"#.as_bytes()],
             )
             .unwrap();
-        drop(connection);
+    }
+
+    #[test]
+    fn reads_realistic_auth_kv_and_blob_profile_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data.sqlite3");
+        create_realistic_database(&path);
+        let before = fs::metadata(&path).unwrap();
+
         let credentials = load(&path).unwrap();
+
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().ok(), after.modified().ok());
+        assert_eq!(credentials.len(), 1);
+        let credential = &credentials[0];
+        assert_eq!(credential.auth_method, AuthMethod::Sso);
         assert_eq!(
-            credentials[0].profile_arn.as_deref(),
-            Some("arn:aws:codewhisperer:eu-west-1:123:profile/x")
+            credential.access_token.as_ref().map(|value| value.expose_secret()),
+            Some("access-token-fixture")
         );
-        assert_eq!(credentials[0].api_region, "eu-west-1");
+        assert_eq!(
+            credential.refresh_token.as_ref().map(|value| value.expose_secret()),
+            Some("refresh-token-fixture")
+        );
+        assert_eq!(
+            credential.client_id.as_ref().map(|value| value.expose_secret()),
+            Some("client-id-fixture")
+        );
+        assert_eq!(
+            credential.client_secret.as_ref().map(|value| value.expose_secret()),
+            Some("client-secret-fixture")
+        );
+        assert_eq!(
+            credential.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:eu-west-1:123:profile/fixture")
+        );
+        assert_eq!(credential.api_region, "eu-west-1");
+        assert_eq!(credential.sso_region.as_deref(), Some("us-east-2"));
+    }
+
+    #[test]
+    #[ignore = "requires a local Kiro CLI SQLite database"]
+    fn reads_real_kiro_cli_database_read_only() {
+        let path = env::var_os("KIRO_REAL_SQLITE_PATH")
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".local/share/kiro-cli/data.sqlite3"))
+            })
+            .expect("HOME or KIRO_REAL_SQLITE_PATH must be set");
+        assert!(path.is_file(), "SQLite database does not exist");
+        let before = fs::metadata(&path).unwrap();
+
+        let credentials = load(&path).expect("real Kiro CLI SQLite database should be readable");
+
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().ok(), after.modified().ok());
+        assert!(!credentials.is_empty());
+        let credential = &credentials[0];
+        assert!(matches!(credential.auth_method, AuthMethod::Social | AuthMethod::Sso));
+        assert!(credential.access_token.as_ref().is_some_and(|value| !value.is_empty()));
+        assert!(credential.refresh_token.as_ref().is_some_and(|value| !value.is_empty()));
+        assert!(credential.client_id.as_ref().is_some_and(|value| !value.is_empty()));
+        assert!(credential.client_secret.as_ref().is_some_and(|value| !value.is_empty()));
+        assert!(credential.profile_arn.as_deref().is_some_and(|value| !value.is_empty()));
+        assert!(!credential.api_region.is_empty());
+        assert_eq!(credential.endpoint, "cli");
     }
 }
