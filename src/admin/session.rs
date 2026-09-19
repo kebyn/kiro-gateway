@@ -31,18 +31,25 @@ impl SessionStore {
         session
     }
     pub fn get(&self, token: &str) -> Option<Session> {
-        let session = self.sessions.read().get(token).cloned();
-        session.filter(|v| v.expires_at > Instant::now())
+        let now = Instant::now();
+        let mut sessions = self.sessions.write();
+        let session = sessions.get(token).cloned();
+        match session {
+            Some(session) if session.expires_at > now => Some(session),
+            Some(_) => {
+                sessions.remove(token);
+                None
+            }
+            None => None,
+        }
     }
     pub fn remove(&self, token: &str) {
         self.sessions.write().remove(token);
     }
-    pub fn clear(&self) {
-        self.sessions.write().clear();
-    }
     pub fn allow_login(&self, key: &str, limit: u32) -> bool {
         let now = Instant::now();
         let mut attempts = self.attempts.write();
+        attempts.retain(|_, (started, _)| now.duration_since(*started) < Duration::from_secs(60));
         let entry = attempts.entry(key.to_owned()).or_insert((now, 0));
         if now.duration_since(entry.0) >= Duration::from_secs(60) {
             *entry = (now, 0);
@@ -52,5 +59,27 @@ impl SessionStore {
         }
         entry.1 += 1;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionStore;
+    use std::time::Duration;
+
+    #[test]
+    fn expired_sessions_are_removed_on_lookup() {
+        let store = SessionStore::default();
+        let session = store.create(Duration::ZERO);
+        assert!(store.get(&session.token).is_none());
+        assert!(store.get(&session.token).is_none());
+    }
+
+    #[test]
+    fn login_attempts_are_limited_per_key() {
+        let store = SessionStore::default();
+        assert!(store.allow_login("global", 1));
+        assert!(!store.allow_login("global", 1));
+        assert!(store.allow_login("other", 1));
     }
 }

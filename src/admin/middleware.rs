@@ -40,7 +40,7 @@ pub async fn admin_session(
         .headers()
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_cookie)
+        .and_then(parse_session_cookie)
         .ok_or(AppError::Unauthorized)?;
     let session = state.sessions.get(&cookie).ok_or(AppError::Unauthorized)?;
     if !is_safe_method(request.method()) {
@@ -51,11 +51,6 @@ pub async fn admin_session(
         }
     }
     let mut response = next.run(request).await;
-    if let Ok(value) =
-        HeaderValue::from_str(&format!("{}={}; Path=/; HttpOnly; SameSite=Lax", cookie, ""))
-    {
-        let _ = value;
-    }
     response.headers_mut().insert(
         "x-csrf-token",
         HeaderValue::from_str(&session.csrf_token).unwrap_or(HeaderValue::from_static("")),
@@ -63,7 +58,7 @@ pub async fn admin_session(
     Ok(response)
 }
 
-fn parse_cookie(value: &str) -> Option<String> {
+pub(crate) fn parse_session_cookie(value: &str) -> Option<String> {
     value
         .split(';')
         .find_map(|part| part.trim().strip_prefix("kiro_admin_session=").map(ToOwned::to_owned))

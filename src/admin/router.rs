@@ -19,7 +19,6 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/credential", get(handlers::credential))
         .route("/credential/reload", post(handlers::credential_reload))
         .route("/credential/refresh", post(handlers::credential_refresh))
-        .route("/request-logs", get(handlers::request_logs).delete(handlers::clear_request_logs))
         .route("/responses/{id}/events", get(handlers::response_events))
         .route("/responses/{id}", get(handlers::response).delete(handlers::delete_response))
         .layer(middleware::from_fn_with_state(state.clone(), admin_middleware::admin_session));
