@@ -15,7 +15,8 @@ pub struct ResponsesRequest {
     #[serde(default)]
     pub tool_choice: Option<Value>,
     #[serde(default)]
-    pub parallel_tool_calls: Option<bool>,
+    #[serde(rename = "parallel_tool_calls")]
+    pub _parallel_tool_calls: Option<bool>,
     #[serde(default)]
     pub previous_response_id: Option<String>,
     #[serde(default)]

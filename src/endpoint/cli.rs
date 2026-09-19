@@ -1,6 +1,6 @@
 use crate::{
     auth::Credential,
-    endpoint::{EndpointKind, KiroEndpoint, conversation_body},
+    endpoint::{KiroEndpoint, conversation_body},
     error::AppError,
     protocol::internal::InternalRequest,
 };
@@ -16,20 +16,12 @@ impl CliEndpoint {
 }
 
 impl KiroEndpoint for CliEndpoint {
-    fn kind(&self) -> EndpointKind {
-        EndpointKind::Cli
-    }
     fn api_url(&self, credential: &Credential) -> String {
         self.upstream_url.clone().unwrap_or_else(|| {
             format!(
                 "https://codewhisperer.{}.amazonaws.com/generateAssistantResponse",
                 credential.api_region
             )
-        })
-    }
-    fn mcp_url(&self, credential: &Credential) -> String {
-        self.upstream_url.clone().unwrap_or_else(|| {
-            format!("https://codewhisperer.{}.amazonaws.com/mcp", credential.api_region)
         })
     }
     fn transform_api_body(
@@ -53,14 +45,6 @@ impl KiroEndpoint for CliEndpoint {
             .header("x-amz-user-agent", "kiro-cli/1.0 kiro-gateway-rs/0.1")
             .header("x-kiro-machine-id", &credential.machine_id)
             .header("origin", "https://app.kiro.dev")
-    }
-    fn decorate_mcp(
-        &self,
-        builder: reqwest::RequestBuilder,
-        credential: &Credential,
-    ) -> reqwest::RequestBuilder {
-        self.decorate_api(builder, credential)
-            .header("accept", "application/vnd.amazon.eventstream")
     }
     fn classify_error(&self, status: reqwest::StatusCode, body: &str) -> AppError {
         AppError::Upstream(format!(

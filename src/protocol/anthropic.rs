@@ -36,10 +36,12 @@ pub struct AnthropicTool {
 }
 #[derive(Debug, Deserialize)]
 pub struct CountTokensRequest {
-    pub model: String,
+    #[serde(rename = "model")]
+    pub _model: String,
     pub messages: Vec<AnthropicMessage>,
     #[serde(default)]
-    pub system: Option<Value>,
+    #[serde(rename = "system")]
+    pub _system: Option<Value>,
     #[serde(default)]
     pub tools: Vec<AnthropicTool>,
 }

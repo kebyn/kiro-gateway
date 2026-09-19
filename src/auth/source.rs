@@ -6,22 +6,9 @@ use crate::{
     error::AppError,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SourceKind {
-    ExplicitJson,
-    ExplicitSqlite,
-    Environment,
-    Auto,
-}
-
 #[derive(Clone, Debug)]
 pub struct CredentialCandidate {
     pub credential: super::Credential,
-    pub source: SourceKind,
-}
-
-pub trait CredentialSource: Send + Sync {
-    fn load(&self) -> Result<Vec<CredentialCandidate>, AppError>;
 }
 
 pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError> {
@@ -33,7 +20,7 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
                 .into_iter()
                 .map(|mut c| {
                     c.source = Some(path.display().to_string());
-                    CredentialCandidate { credential: c, source: SourceKind::ExplicitJson }
+                    CredentialCandidate { credential: c }
                 })
                 .collect::<Vec<_>>()
         })
@@ -54,13 +41,13 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
             candidates.extend(sqlite::load(&AppConfig::expanded_path(path))?.into_iter().map(
                 |mut c| {
                     c.source = Some(path.to_owned());
-                    CredentialCandidate { credential: c, source: SourceKind::ExplicitSqlite }
+                    CredentialCandidate { credential: c }
                 },
             ));
         }
         "env" => candidates.extend(env::load().into_iter().map(|mut c| {
             c.source = Some("environment".into());
-            CredentialCandidate { credential: c, source: SourceKind::Environment }
+            CredentialCandidate { credential: c }
         })),
         "api_key" | "apikey" => {
             let key = std::env::var("KIRO_API_KEY")
@@ -74,13 +61,12 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
                     machine_id: uuid::Uuid::new_v4().to_string(),
                     ..Default::default()
                 },
-                source: SourceKind::Environment,
             });
         }
         _ => {
             candidates.extend(env::load().into_iter().map(|mut c| {
                 c.source = Some("environment".into());
-                CredentialCandidate { credential: c, source: SourceKind::Environment }
+                CredentialCandidate { credential: c }
             }));
             if let Some(path) = config.credential_json_path.as_deref() {
                 let path = AppConfig::expanded_path(path);
@@ -98,7 +84,7 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
                 if path.exists() {
                     candidates.extend(sqlite::load(&path)?.into_iter().map(|mut c| {
                         c.source = Some(path.display().to_string());
-                        CredentialCandidate { credential: c, source: SourceKind::ExplicitSqlite }
+                        CredentialCandidate { credential: c }
                     }));
                 }
             }

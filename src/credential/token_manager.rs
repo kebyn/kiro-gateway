@@ -133,8 +133,4 @@ impl TokenManager {
             }
         })
     }
-
-    pub fn bearer_token(&self) -> Option<String> {
-        self.credential.read().access_token.as_ref().map(|s| s.expose_secret().to_owned())
-    }
 }

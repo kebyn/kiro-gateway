@@ -102,11 +102,6 @@ impl Default for Credential {
 }
 
 impl Credential {
-    pub fn usable(&self) -> bool {
-        matches!(self.auth_method, AuthMethod::ApiKey)
-            || self.access_token.as_ref().is_some_and(|v| !v.is_empty())
-            || self.refresh_token.as_ref().is_some_and(|v| !v.is_empty())
-    }
     pub fn needs_refresh(&self, now: DateTime<Utc>, early_secs: i64) -> bool {
         if matches!(self.auth_method, AuthMethod::ApiKey) {
             return false;

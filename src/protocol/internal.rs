@@ -72,9 +72,6 @@ pub struct InternalRequest {
 }
 
 impl InternalRequest {
-    pub fn last_user_text(&self) -> String {
-        self.messages.iter().rev().find(|m| m.role == "user").map(content_text).unwrap_or_default()
-    }
     pub fn input_text(&self) -> String {
         self.messages.iter().map(content_text).collect::<Vec<_>>().join("\n")
     }
