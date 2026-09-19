@@ -61,6 +61,21 @@ docker run --rm -p 8990:8990 \
 
 镜像以 UID `10001` 的非 root 用户运行，并设置 `KIRO_HOST=0.0.0.0`。如使用 JSON/SQLite 凭据或需要保留 Responses 数据库，请挂载对应文件或目录，并确保该用户具有所需的读写权限。
 
+CI 会将镜像发布到 GitHub Container Registry：
+
+```sh
+docker pull ghcr.io/kebyn/kiro-gateway:latest
+docker run --rm -p 8990:8990 \
+  -e KIRO_CLIENT_API_KEY='client-key-change-me' \
+  -e KIRO_ADMIN_API_KEY='admin-key-change-me' \
+  -e KIRO_CREDENTIAL_SOURCE='env' \
+  -e KIRO_ACCESS_TOKEN='access-token-from-your-provider' \
+  ghcr.io/kebyn/kiro-gateway:latest
+```
+
+推送到 `master` 会更新 `latest`；推送 Git tag 时会同时发布同名镜像 tag 和 `latest`，例如
+`ghcr.io/kebyn/kiro-gateway:v1.0.0`。Pull Request 和其他分支只执行镜像构建校验，不会发布。
+
 ## 接口与鉴权
 
 `GET /health` 无需鉴权。所有 `/v1/*` 接口接受以下任一请求头，值必须与 `client_api_key` 一致：
