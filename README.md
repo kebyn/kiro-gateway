@@ -45,7 +45,7 @@ cargo build --release --locked
 ./target/release/kiro-gateway-rs --config config.json
 ```
 
-`--config` 也可通过 `KIRO_CONFIG` 指定。`--check-config` 会解析并打印最终配置后退出；输出包含网关 API Key，不要写入日志或在共享终端使用。
+`--config` 也可通过 `KIRO_CONFIG` 指定。`--check-config` 会解析并打印最终配置后退出；敏感字段会显示为 `[REDACTED]`，但仍不要把输出写入共享日志。
 
 ### Docker
 
@@ -115,8 +115,8 @@ Authorization: Bearer client-key-change-me
 | `refresh_interval_secs` | `30` | 后台检查刷新间隔，必须大于 `0` |
 | `response_store_path` | `kiro-gateway.sqlite3` | Responses 本地 SQLite 路径；支持 `~/` 展开 |
 | `mcp_region` | 空 | 保留字段，当前未参与运行时行为 |
-| `log_json` | `false` | 保留字段，当前未参与日志初始化 |
-| `trust_forwarded_headers` | `false` | 保留字段，当前未改变转发头处理 |
+| `log_json` | `false` | 使用 JSON 格式输出 tracing 日志 |
+| `trust_forwarded_headers` | `false` | 为 `true` 时使用 `X-Forwarded-For` 作为 Admin 登录限流键；仅应在可信反向代理后启用 |
 
 `config.example.json` 适合本机 HTTP 调试，因此将 `admin.cookie_secure` 设为 `false`。生产环境通过 HTTPS 使用时应设为 `true`。
 
@@ -157,13 +157,13 @@ Authorization: Bearer client-key-change-me
 | --- | --- |
 | `KIRO_ACCESS_TOKEN` | 上游访问 Token |
 | `KIRO_REFRESH_TOKEN` | 上游刷新 Token |
-| `KIRO_API_KEY` | 上游 API Key；未设置 `KIRO_CLIENT_API_KEY` 时也会作为客户端密钥回退值 |
+| `KIRO_API_KEY` | 上游 API Key |
 | `KIRO_CLIENT_ID` | OIDC 客户端 ID |
 | `KIRO_CLIENT_SECRET` | OIDC 客户端 Secret |
 | `KIRO_MACHINE_ID` | 上游机器 ID；未设置时生成随机 UUID |
 | `KIRO_TOKEN_ENDPOINT` | 覆盖 Token 刷新 URL |
 
-建议始终显式设置 `KIRO_CLIENT_API_KEY`，避免将上游 `KIRO_API_KEY` 同时用作网关客户端密钥。
+`KIRO_CLIENT_API_KEY` 与上游 `KIRO_API_KEY` 必须分别配置；上游密钥不会自动成为网关客户端密钥。
 
 ## 凭据来源与刷新
 
@@ -391,13 +391,11 @@ Admin 路由：
 | `GET` | `/credential` | 凭据状态和刷新状态，不返回 Token |
 | `POST` | `/credential/reload` | 从已配置来源重新加载单个凭据 |
 | `POST` | `/credential/refresh` | 立即检查并刷新凭据 |
-| `GET` | `/request-logs` | 当前返回空列表，尚未持久化请求日志 |
-| `DELETE` | `/request-logs` | 当前返回 `204` |
 | `GET` | `/responses/{id}` | 读取完整的本地 Response 记录 |
 | `GET` | `/responses/{id}/events` | 按 `sequence_number` 读取 Response 生命周期事件 |
 | `DELETE` | `/responses/{id}` | 删除本地 Response 记录 |
 
-当 `admin.allowed_origins` 非空时，带 `Origin` 的登录和 Admin 请求必须精确匹配列表中的一个值。登录尝试按 `x-forwarded-for` 值或全局键进行内存限流。
+当 `admin.allowed_origins` 非空时，带 `Origin` 的登录和 Admin 请求必须精确匹配列表中的一个值。默认所有 Admin 登录共享一个内存限流键；只有显式启用 `trust_forwarded_headers` 时才使用 `x-forwarded-for`，因此不要在不可信客户端可直接访问时开启该选项。
 
 ## 数据与安全边界
 

@@ -84,17 +84,6 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, AppError> {
-        let path = path.as_ref();
-        let text = fs::read_to_string(path)
-            .map_err(|e| AppError::Config(format!("cannot read {}: {e}", path.display())))?;
-        let mut config: Self = serde_json::from_str(&text)
-            .map_err(|e| AppError::Config(format!("invalid config JSON: {e}")))?;
-        config.apply_env()?;
-        config.validate()?;
-        Ok(config)
-    }
-
     pub fn from_env_and_optional_file(path: Option<&Path>) -> Result<Self, AppError> {
         let mut config = match path {
             Some(path) if path.exists() => {
@@ -112,7 +101,7 @@ impl AppConfig {
     }
 
     fn apply_env(&mut self) -> Result<(), AppError> {
-        if let Some(v) = env_string("KIRO_CLIENT_API_KEY").or_else(|| env_string("KIRO_API_KEY")) {
+        if let Some(v) = env_string("KIRO_CLIENT_API_KEY") {
             self.client_api_key = v;
         }
         if let Some(v) = env_string("KIRO_ADMIN_API_KEY") {
