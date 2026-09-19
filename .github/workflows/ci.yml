@@ -9,9 +9,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           cache-dependency-path: admin-ui/pnpm-lock.yaml
       - run: corepack pnpm@9.15.4 --dir admin-ui install --frozen-lockfile
@@ -31,7 +34,7 @@ jobs:
           components: rustfmt,clippy
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
       - run: node --check admin-ui/src/build.mjs
       - run: node admin-ui/src/build.mjs
       - run: cargo fmt --all -- --check
