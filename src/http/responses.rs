@@ -788,7 +788,7 @@ mod tests {
     use crate::{
         AppState,
         app_state::build_upstream,
-        auth::{AuthMethod, Credential},
+        auth::{AuthMethod, Credential, SecretString},
         config::AppConfig,
         credential::TokenManager,
         protocol::internal::{InternalMessage, InternalResponse, InternalToolCall},
@@ -801,6 +801,10 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use std::{path::Path, sync::Arc};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn response(text: &str) -> InternalResponse {
         InternalResponse {
@@ -834,10 +838,52 @@ mod tests {
         }
     }
 
+    async fn state_with_json_upstream(path: &Path) -> (AppState, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = br#"{"content":"answer","usage":{"inputTokens":1,"outputTokens":1},"stopReason":"end_turn"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            response_store_path: path.display().to_string(),
+            upstream_url: Some(format!("http://{address}")),
+            ..Default::default()
+        };
+        let credential = Credential {
+            auth_method: AuthMethod::ApiKey,
+            access_token: Some(SecretString::new("token")),
+            ..Default::default()
+        };
+        let token_manager = Arc::new(TokenManager::new(&config, credential).unwrap());
+        let client = reqwest::Client::new();
+        (
+            AppState {
+                config: Arc::new(config.clone()),
+                token_manager,
+                responses: ResponseStore::open(path).unwrap(),
+                upstream: build_upstream(&config, client),
+                sessions: Default::default(),
+            },
+            server,
+        )
+    }
+
     #[tokio::test]
     async fn live_stream_emits_incremental_events_and_store_false_leaves_no_record() {
         let directory = tempfile::tempdir().unwrap();
-        let state = state(&directory.path().join("responses.sqlite3"));
+        let (state, server) =
+            state_with_json_upstream(&directory.path().join("responses.sqlite3")).await;
         let request: ResponsesRequest = serde_json::from_value(json!({
             "model":"kiro",
             "input":"hello",
@@ -847,6 +893,7 @@ mod tests {
         .unwrap();
         let response = create(State(state.clone()), Json(request)).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
+        server.await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("response.created"));
         assert!(body.contains("response.output_text.delta"));
@@ -863,7 +910,8 @@ mod tests {
     #[tokio::test]
     async fn stored_live_stream_persists_ordered_events_and_final_response() {
         let directory = tempfile::tempdir().unwrap();
-        let state = state(&directory.path().join("responses.sqlite3"));
+        let (state, server) =
+            state_with_json_upstream(&directory.path().join("responses.sqlite3")).await;
         let request: ResponsesRequest = serde_json::from_value(json!({
             "model":"kiro",
             "input":"hello",
@@ -873,6 +921,7 @@ mod tests {
         .unwrap();
         let response = create(State(state.clone()), Json(request)).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
+        server.await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         let id = body
             .lines()

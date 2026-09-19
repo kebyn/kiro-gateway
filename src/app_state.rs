@@ -4,11 +4,10 @@ use crate::{
     credential::TokenManager,
     endpoint::{EndpointKind, endpoint_for},
     error::AppError,
-    protocol::internal::{InternalEvent, InternalRequest, InternalResponse, Usage},
+    protocol::internal::{InternalRequest, InternalResponse},
     response_store::ResponseStore,
     upstream::request::{InternalEventStream, UpstreamClient},
 };
-use futures_util::stream;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -28,25 +27,11 @@ impl AppState {
         self.token_manager.ensure_fresh().await?;
         let credential = self.token_manager.credential();
         if credential.access_token.as_ref().is_none_or(|token| token.is_empty()) {
-            let text = format!(
-                "Kiro gateway is configured; upstream is not available for model {}. Request received: {}",
-                request.model,
-                request.last_user_text()
-            );
-            let events = vec![
-                Ok(InternalEvent::TextDelta { text }),
-                Ok(InternalEvent::Usage {
-                    usage: Usage::new(0, request.input_text().chars().count() as u64),
-                }),
-                Ok(InternalEvent::Stop { reason: "end_turn".into() }),
-            ];
-            return Ok(Box::pin(stream::iter(events)));
+            return Err(AppError::Credential(
+                "no usable upstream access token is configured".into(),
+            ));
         }
         self.upstream.event_stream(request, &credential).await
-    }
-
-    pub async fn stream(&self, request: &InternalRequest) -> Result<InternalEventStream, AppError> {
-        self.event_stream(request).await
     }
 
     pub async fn complete(&self, request: &InternalRequest) -> Result<InternalResponse, AppError> {

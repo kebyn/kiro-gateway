@@ -132,6 +132,7 @@ impl ToolCallAccumulator {
         Some(key)
     }
 
+    #[cfg(test)]
     pub fn finish(&mut self, id: Option<&str>) -> Option<InternalToolCall> {
         self.finish_with_state(id, true)
     }
@@ -166,9 +167,11 @@ impl ToolCallAccumulator {
         }
         self.arrival_order.iter().filter_map(|key| self.buffers.get(key).map(to_call)).collect()
     }
+    #[cfg(test)]
     pub fn incomplete(&self) -> bool {
         self.buffers.values().any(|b| !b.complete)
     }
+    #[cfg(test)]
     pub fn calls(&self) -> Vec<InternalToolCall> {
         self.arrival_order.iter().filter_map(|key| self.buffers.get(key).map(to_call)).collect()
     }

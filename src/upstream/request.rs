@@ -2,14 +2,12 @@ use crate::{
     auth::{AuthMethod, Credential},
     endpoint::KiroEndpoint,
     error::AppError,
-    protocol::internal::{
-        InternalEvent, InternalRequest, InternalResponse, InternalToolCall, Usage,
-    },
+    protocol::internal::{InternalEvent, InternalRequest, InternalResponse, Usage},
     transform::truncation::XmlLeakFilter,
     upstream::{
         error::UpstreamStreamError,
         event_stream::{EventStreamDecoder, decode_internal_events},
-        integrity::StreamIntegrity,
+        integrity::{RetryDecision, StreamIntegrity},
         tool_state::ToolCallAccumulator,
     },
 };
@@ -45,12 +43,12 @@ impl UpstreamClient {
         let request = request.clone();
         let credential = credential.clone();
         Ok(Box::pin(stream! {
-            let mut emitted = false;
             for attempt in 0..=1_u8 {
                 let response = match send_once(&client, endpoint.as_ref(), &request, &credential).await {
                     Ok(response) => response,
+                    Err(SendOnceError::Transport(_)) if attempt == 0 => continue,
                     Err(error) => {
-                        yield Err(error);
+                        yield Err(error.into_app_error());
                         return;
                     }
                 };
@@ -62,6 +60,7 @@ impl UpstreamClient {
                 if is_json {
                     let body = match response.bytes().await {
                         Ok(body) => body,
+                        Err(_) if attempt == 0 => continue,
                         Err(error) => {
                             yield Err(AppError::Upstream(error.to_string()));
                             return;
@@ -83,11 +82,17 @@ impl UpstreamClient {
 
                 let mut bytes = response.bytes_stream();
                 let mut decoder = EventStreamDecoder::new();
+                let mut integrity = StreamIntegrity { attempts: attempt, ..Default::default() };
                 let mut retry = false;
                 while let Some(chunk) = bytes.next().await {
                     let chunk = match chunk {
                         Ok(chunk) => chunk,
                         Err(error) => {
+                            integrity.incomplete = true;
+                            if matches!(integrity.should_retry(), RetryDecision::Retry) {
+                                retry = true;
+                                break;
+                            }
                             yield Err(AppError::Upstream(error.to_string()));
                             return;
                         }
@@ -95,7 +100,8 @@ impl UpstreamClient {
                     let messages = match decoder.push(&chunk) {
                         Ok(messages) => messages,
                         Err(error) => {
-                            if !emitted && attempt == 0 {
+                            integrity.incomplete = true;
+                            if matches!(integrity.should_retry(), RetryDecision::Retry) {
                                 retry = true;
                                 break;
                             }
@@ -111,7 +117,8 @@ impl UpstreamClient {
                                 return;
                             }
                             Err(error) => {
-                                if !emitted && attempt == 0 {
+                                integrity.incomplete = true;
+                                if matches!(integrity.should_retry(), RetryDecision::Retry) {
                                     retry = true;
                                     break;
                                 }
@@ -123,7 +130,7 @@ impl UpstreamClient {
                             // Empty metadata/context frames are intentionally
                             // not emitted by the decoder. Every yielded event
                             // is therefore observable protocol data.
-                            emitted = true;
+                            integrity.record_emission();
                             yield Ok(event);
                         }
                         if retry {
@@ -138,14 +145,16 @@ impl UpstreamClient {
                     continue;
                 }
                 if let Err(error) = decoder.finish() {
-                    if !emitted && attempt == 0 {
+                    integrity.incomplete = true;
+                    if matches!(integrity.should_retry(), RetryDecision::Retry) {
                         continue;
                     }
                     yield Err(AppError::Integrity(error.to_string()));
                     return;
                 }
-                if !emitted {
-                    if attempt == 0 {
+                if !integrity.emitted_any {
+                    integrity.incomplete = true;
+                    if matches!(integrity.should_retry(), RetryDecision::Retry) {
                         continue;
                     }
                     yield Err(AppError::Integrity("upstream stream was empty".into()));
@@ -154,32 +163,19 @@ impl UpstreamClient {
             }
         }))
     }
+}
 
-    /// Short compatibility alias for callers that refer to the upstream
-    /// interface simply as a stream.
-    pub async fn stream(
-        &self,
-        request: &InternalRequest,
-        credential: &Credential,
-    ) -> Result<InternalEventStream, AppError> {
-        self.event_stream(request, credential).await
-    }
+enum SendOnceError {
+    Transport(String),
+    Application(AppError),
+}
 
-    pub async fn complete(
-        &self,
-        request: &InternalRequest,
-        credential: &Credential,
-    ) -> Result<InternalResponse, AppError> {
-        let mut events = self.event_stream(request, credential).await?;
-        let mut accumulator = InternalEventAccumulator::new();
-        while let Some(event) = events.next().await {
-            accumulator.push(event?)?;
+impl SendOnceError {
+    fn into_app_error(self) -> AppError {
+        match self {
+            Self::Transport(message) => AppError::Upstream(message),
+            Self::Application(error) => error,
         }
-        let output = accumulator.finish();
-        if is_empty_stream(&output) {
-            return Err(AppError::Integrity("upstream stream was empty".into()));
-        }
-        Ok(output)
     }
 }
 
@@ -188,7 +184,7 @@ async fn send_once(
     endpoint: &dyn KiroEndpoint,
     request: &InternalRequest,
     credential: &Credential,
-) -> Result<reqwest::Response, AppError> {
+) -> Result<reqwest::Response, SendOnceError> {
     let body = endpoint.transform_api_body(request, credential);
     let mut builder = client
         .post(endpoint.api_url(credential))
@@ -207,11 +203,11 @@ async fn send_once(
         .decorate_api(builder, credential)
         .send()
         .await
-        .map_err(|error| AppError::Upstream(error.to_string()))?;
+        .map_err(|error| SendOnceError::Transport(error.to_string()))?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(endpoint.classify_error(status, &body));
+        return Err(SendOnceError::Application(endpoint.classify_error(status, &body)));
     }
     Ok(response)
 }
@@ -352,12 +348,6 @@ impl InternalEventAccumulator {
     pub fn finish(mut self) -> InternalResponse {
         finish_stream_response(self.output, &mut self.tools)
     }
-
-    pub fn snapshot(&self) -> InternalResponse {
-        let output = self.output.clone();
-        let mut tools = self.tools.clone();
-        finish_stream_response(output, &mut tools)
-    }
 }
 
 fn apply_internal_event(
@@ -428,13 +418,6 @@ fn finish_stream_response(
     output
 }
 
-fn is_empty_stream(response: &crate::protocol::internal::InternalResponse) -> bool {
-    response.text.is_empty()
-        && response.thinking.is_empty()
-        && response.tool_calls.is_empty()
-        && response.stop_reason.is_none()
-}
-
 fn parse_json_tool_calls(
     body: &serde_json::Value,
 ) -> Vec<crate::protocol::internal::InternalToolCall> {
@@ -501,6 +484,14 @@ fn parse_json_tool_calls(
             Some(crate::protocol::internal::InternalToolCall { id, name, arguments, complete })
         })
         .collect()
+}
+
+#[cfg(test)]
+fn is_empty_stream(response: &crate::protocol::internal::InternalResponse) -> bool {
+    response.text.is_empty()
+        && response.thinking.is_empty()
+        && response.tool_calls.is_empty()
+        && response.stop_reason.is_none()
 }
 
 #[cfg(test)]

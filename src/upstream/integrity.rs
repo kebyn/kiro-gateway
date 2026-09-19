@@ -1,5 +1,3 @@
-use crate::error::AppError;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetryDecision {
     Retry,
@@ -23,8 +21,5 @@ impl StreamIntegrity {
         } else {
             RetryDecision::DoNotRetry
         }
-    }
-    pub fn failure(&self, message: impl Into<String>) -> AppError {
-        AppError::Integrity(message.into())
     }
 }
