@@ -1,4 +1,4 @@
-# kiro-gateway-rs
+# kiro-gateway
 
 单租户 Kiro API 网关，提供 Anthropic Messages、OpenAI Chat Completions 和 OpenAI Responses 兼容接口。服务只选择一个凭据，不包含账号池、轮询或故障切换逻辑。
 
@@ -42,7 +42,7 @@ curl -H 'x-api-key: client-key-change-me' \
 
 ```sh
 cargo build --release --locked
-./target/release/kiro-gateway-rs --config config.json
+./target/release/kiro-gateway --config config.json
 ```
 
 `--config` 也可通过 `KIRO_CONFIG` 指定。`--check-config` 会解析并打印最终配置后退出；敏感字段会显示为 `[REDACTED]`，但仍不要把输出写入共享日志。
@@ -50,13 +50,13 @@ cargo build --release --locked
 ### Docker
 
 ```sh
-docker build -t kiro-gateway-rs .
+docker build -t kiro-gateway .
 docker run --rm -p 8990:8990 \
   -e KIRO_CLIENT_API_KEY='client-key-change-me' \
   -e KIRO_ADMIN_API_KEY='admin-key-change-me' \
   -e KIRO_CREDENTIAL_SOURCE='env' \
   -e KIRO_ACCESS_TOKEN='access-token-from-your-provider' \
-  kiro-gateway-rs
+  kiro-gateway
 ```
 
 镜像以 UID `10001` 的非 root 用户运行，并设置 `KIRO_HOST=0.0.0.0`。如使用 JSON/SQLite 凭据或需要保留 Responses 数据库，请挂载对应文件或目录，并确保该用户具有所需的读写权限。
@@ -86,7 +86,31 @@ Authorization: Bearer client-key-change-me
 | `GET` | `/v1/responses/{id}` | 读取本地存储的 Response |
 | `DELETE` | `/v1/responses/{id}` | 删除本地存储的 Response，成功返回 `204` |
 
-三套生成接口均支持 `stream: true`，响应类型为 SSE。
+三套生成接口均支持 `stream: true`，响应类型为 SSE；流式响应会发送 keep-alive 注释，
+并在完成时发送各自协议要求的终止事件（Anthropic `message_stop`、Chat Completions
+`[DONE]`、Responses `response.completed` 或 `response.incomplete`）。
+
+### Claude Code 流式调试
+
+Claude Code 使用 Anthropic Messages 接口时，应将 `ANTHROPIC_BASE_URL` 指向网关地址，
+并使用网关的客户端密钥作为 `ANTHROPIC_API_KEY`。如果客户端一直等待，可先用同一模型
+执行最小流式请求，确认网关返回 `message_start`、内容块、`message_delta` 和
+`message_stop`：
+
+```sh
+RUST_LOG=debug cargo run --locked -- --config config.json
+
+curl -N -i \
+  -H 'x-api-key: client-key-change-me' \
+  -H 'content-type: application/json' \
+  -H 'accept: text/event-stream' \
+  http://127.0.0.1:8990/v1/messages \
+  -d '{"model":"MODEL_FROM_/v1/models","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"Reply with one short sentence."}]}'
+```
+
+网关的 debug 日志只记录模型、事件数量、响应类型和终止状态，不记录访问令牌或消息
+正文。Anthropic SSE 在上游较慢时会发送 keep-alive 注释；客户端仍应等待最终的
+`message_stop`，而不是把 keep-alive 当作模型内容。
 
 ## 配置
 
@@ -106,13 +130,14 @@ Authorization: Bearer client-key-change-me
 | `credential_source` | `auto` | `auto`、`env`、`json`、`sqlite`、`api_key` 之一 |
 | `credential_path` | 空 | SQLite 凭据路径；支持 `~/` 展开 |
 | `credential_json_path` | 空 | JSON 凭据路径及刷新后的原子写回路径；支持 `~/` 展开 |
-| `endpoint` | `ide` | 上游格式，只能为 `ide` 或 `cli` |
+| `endpoint` | `auto` | 上游格式；`auto` 按凭据选择，或显式指定 `ide` / `cli` |
 | `api_region` | `us-east-1` | API Key 来源使用的默认区域 |
 | `upstream_url` | 空 | 覆盖模型生成上游 URL，主要用于受控代理或测试 |
 | `proxy_url` | 空 | Token 刷新 HTTP 客户端的代理 URL |
 | `upstream_timeout_secs` | `60` | 模型上游请求超时，必须大于 `0` |
 | `refresh_early_secs` | `120` | 到期前提前刷新的秒数 |
 | `refresh_interval_secs` | `30` | 后台检查刷新间隔，必须大于 `0` |
+| `model_cache_ttl_secs` | `300` | Kiro 模型目录缓存时间，秒，必须大于 `0` |
 | `response_store_path` | `kiro-gateway.sqlite3` | Responses 本地 SQLite 路径；支持 `~/` 展开 |
 | `mcp_region` | 空 | 保留字段，当前未参与运行时行为 |
 | `log_json` | `false` | 使用 JSON 格式输出 tracing 日志 |
@@ -131,7 +156,7 @@ Authorization: Bearer client-key-change-me
 | `KIRO_ADMIN_API_KEY` | 覆盖 `admin_api_key` |
 | `KIRO_HOST` | 覆盖 `host` |
 | `KIRO_PORT` | 覆盖 `port` |
-| `KIRO_ENDPOINT` | 覆盖 `endpoint`，也用于环境变量凭据元数据 |
+| `KIRO_ENDPOINT` | 覆盖 `endpoint`；支持 `auto`、`ide`、`cli` |
 | `KIRO_API_REGION` | 覆盖 `api_region`，也用于环境变量凭据 |
 | `KIRO_CREDENTIAL_SOURCE` | 覆盖 `credential_source` |
 | `KIRO_CREDENTIAL_PATH` | 覆盖 SQLite `credential_path` |
@@ -141,6 +166,7 @@ Authorization: Bearer client-key-change-me
 | `KIRO_UPSTREAM_TIMEOUT_SECS` | 覆盖上游请求和刷新超时，必须大于 `0` |
 | `KIRO_REFRESH_EARLY_SECS` | 覆盖提前刷新秒数，不得为负 |
 | `KIRO_REFRESH_INTERVAL_SECS` | 覆盖后台刷新间隔，必须大于 `0` |
+| `KIRO_MODEL_CACHE_TTL_SECS` | 覆盖模型目录缓存 TTL，必须大于 `0` |
 | `KIRO_ADMIN_ENABLED` | 启用或禁用 Admin 页面和 API |
 | `KIRO_ADMIN_SESSION_TTL_SECS` | 覆盖 Admin 会话 TTL，必须大于 `0` |
 | `KIRO_ADMIN_COOKIE_SECURE` | 是否设置 Admin Cookie 的 `Secure` 属性 |
@@ -177,7 +203,55 @@ Authorization: Bearer client-key-change-me
 
 默认 SQLite 探测路径为 `~/.local/share/kiro-cli/data.sqlite3`。SQLite 始终只读，不会被网关修改。
 
+`endpoint=auto` 是默认策略：SQLite/Kiro CLI 凭据使用 CLI 上游协议
+(`runtime.{region}.kiro.dev/generateAssistantResponse`，请求目标为
+`KiroRuntimeService.GenerateAssistantResponse`)，IDE/桌面凭据使用 IDE 上游协议
+(`q.{region}.amazonaws.com`)。显式设置 `endpoint=cli` 或 `endpoint=ide` 会覆盖凭据元数据。这样可以避免
+将只支持 CLI 应用的订阅误发到 IDE 端点而收到
+`Your subscription does not support this application`。网关不会因为 IDE 返回 403 而隐式
+切换到另一个端点；如果需要固定协议，请显式配置端点。
+
 非 API Key 凭据会在启动、每次模型请求以及后台定时任务中检查是否需要刷新。刷新使用单飞锁，成功后更新内存凭据。只要配置了 `credential_json_path`，刷新后的完整凭据就会以临时文件加重命名的方式原子写回该路径；不希望落盘时不要配置该字段。应将凭据 JSON 权限限制为仅服务用户可读写。
+
+### SQLite 凭据验证
+
+SQLite 凭据测试使用接近 Kiro CLI 实际 schema 的临时脱敏数据库，对合成 token、device
+registration、profile 和 region 做完整断言；不会读取或提交用户的真实凭据。运行普通测试即可执行：
+
+```sh
+cargo test --locked auth::sqlite
+```
+
+如需在本机验证真实 Kiro CLI 数据库，测试默认被忽略，并且只读
+`KIRO_REAL_SQLITE_PATH` 指定的文件；未设置时使用
+`~/.local/share/kiro-cli/data.sqlite3`。测试只断言凭据元数据和文件未被修改，不会比较或输出
+真实 token、client secret 等敏感值：
+
+```sh
+cargo test --locked auth::sqlite::tests::reads_real_kiro_cli_database_read_only -- --ignored
+```
+
+CI 不需要挂载真实 `data.sqlite3`；普通 fixture 测试已经覆盖真实表结构和字段格式。
+
+### 模型目录与模型校验
+
+`data.sqlite3` 只提供访问 Kiro 的凭据和 profile 元数据，不保存可用模型目录。首次访问
+`GET /v1/models` 或首次发送带 `model` 的请求时，网关使用当前凭据调用 Kiro
+`ListAvailableModels` 接口，并将成功结果缓存 `model_cache_ttl_secs` 秒（默认 300 秒）。
+`sso_region` 为 `eu-*` 时优先使用 `eu-central-1`，其他区域优先使用 `us-east-1`；收到
+403 时会尝试另一个区域端点。
+
+`/v1/models` 返回 Kiro 返回的全部模型及可用的名称、描述和 token limits 元数据。远程
+请求失败时仍返回 HTTP 200，但 `data` 为空；不会回退到静态 `kiro`。Messages、
+Chat Completions、Responses 和 `count_tokens` 请求中的 `model` 必须存在于当前模型
+目录，否则返回 `400`，且不会调用 Kiro 上游。请求中的模型 ID 会原样转发。
+
+如需在本机使用真实 SQLite 凭据验证完整远程链路，可执行以下默认忽略的测试；它不会
+输出 token，也不会修改数据库：
+
+```sh
+cargo test --locked model_catalog::tests::discovers_models_from_real_kiro_sqlite_credentials -- --ignored
+```
 
 ## Tool Call
 
