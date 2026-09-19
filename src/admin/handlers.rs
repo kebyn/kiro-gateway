@@ -1,6 +1,6 @@
 use crate::{
     AppState,
-    admin::middleware::{clear_session_cookie, session_cookie},
+    admin::middleware::{clear_session_cookie, parse_session_cookie, session_cookie},
     common::auth::constant_time_eq,
     error::AppError,
 };
@@ -28,9 +28,8 @@ pub async fn login(
             return Err(AppError::Forbidden);
         }
     }
-    let client_key =
-        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("global");
-    if !state.sessions.allow_login(client_key, state.config.admin.login_rate_limit_per_minute) {
+    let client_key = login_rate_limit_key(&headers, state.config.trust_forwarded_headers);
+    if !state.sessions.allow_login(&client_key, state.config.admin.login_rate_limit_per_minute) {
         return Err(AppError::Forbidden);
     }
     if !constant_time_eq(&body.api_key, &state.config.admin_api_key) {
@@ -47,23 +46,27 @@ pub async fn login(
             state.config.admin.session_ttl_secs,
         )
         .parse()
-        .unwrap(),
+        .map_err(|_| AppError::Internal("failed to construct session cookie".into()))?,
     );
     Ok((StatusCode::NO_CONTENT, headers))
 }
-pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Some(token) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()).and_then(|v| {
-        v.split(';')
-            .find_map(|p| p.trim().strip_prefix("kiro_admin_session=").map(ToOwned::to_owned))
-    }) {
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    if let Some(token) =
+        headers.get(header::COOKIE).and_then(|v| v.to_str().ok()).and_then(parse_session_cookie)
+    {
         state.sessions.remove(&token);
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        clear_session_cookie(state.config.admin.cookie_secure).parse().unwrap(),
+        clear_session_cookie(state.config.admin.cookie_secure)
+            .parse()
+            .map_err(|_| AppError::Internal("failed to construct session cookie".into()))?,
     );
-    response
+    Ok(response)
 }
 pub async fn session(
     State(state): State<AppState>,
@@ -72,10 +75,7 @@ pub async fn session(
     let token = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split(';')
-                .find_map(|p| p.trim().strip_prefix("kiro_admin_session=").map(ToOwned::to_owned))
-        })
+        .and_then(parse_session_cookie)
         .ok_or(AppError::Unauthorized)?;
     let value = state.sessions.get(&token).ok_or(AppError::Unauthorized)?;
     Ok(Json(
@@ -99,12 +99,6 @@ pub async fn credential_refresh(
     state.token_manager.refresh().await?;
     Ok(Json(serde_json::json!({"ok":true,"credential":state.token_manager.status()})))
 }
-pub async fn request_logs() -> impl IntoResponse {
-    Json(serde_json::json!({"items": []}))
-}
-pub async fn clear_request_logs() -> impl IntoResponse {
-    StatusCode::NO_CONTENT
-}
 pub async fn response(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -126,4 +120,38 @@ pub async fn response_events(
         return Err(AppError::NotFound);
     }
     Ok(Json(state.responses.events(&id)?))
+}
+
+fn login_rate_limit_key(headers: &HeaderMap, trust_forwarded_headers: bool) -> String {
+    if trust_forwarded_headers {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("global")
+            .to_owned()
+    } else {
+        "global".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::login_rate_limit_key;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn forwarded_headers_are_only_used_when_explicitly_trusted() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        assert_eq!(login_rate_limit_key(&headers, false), "global");
+        assert_eq!(login_rate_limit_key(&headers, true), "203.0.113.10");
+    }
+
+    #[test]
+    fn empty_forwarded_header_uses_global_limit_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", " ".parse().unwrap());
+        assert_eq!(login_rate_limit_key(&headers, true), "global");
+    }
 }
