@@ -8,10 +8,10 @@ RUN SOURCE_DATE_EPOCH=0 cargo build --release --locked
 
 FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
 RUN useradd --system --uid 10001 --create-home kiro
-COPY --from=builder /src/target/release/kiro-gateway-rs /usr/local/bin/kiro-gateway-rs
+COPY --from=builder /src/target/release/kiro-gateway /usr/local/bin/kiro-gateway
 USER kiro
 WORKDIR /home/kiro
 EXPOSE 8990
 ENV RUST_LOG=info
 ENV KIRO_HOST=0.0.0.0
-ENTRYPOINT ["/usr/local/bin/kiro-gateway-rs"]
+ENTRYPOINT ["/usr/local/bin/kiro-gateway"]

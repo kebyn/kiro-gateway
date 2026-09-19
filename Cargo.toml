@@ -1,13 +1,13 @@
 [package]
-name = "kiro-gateway-rs"
+name = "kiro-gateway"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 description = "A single-tenant Kiro gateway with Anthropic, OpenAI Chat and Responses APIs"
-repository = "https://github.com/kiro-gateway-rs/kiro-gateway-rs"
-homepage = "https://github.com/kiro-gateway-rs/kiro-gateway-rs"
-documentation = "https://github.com/kiro-gateway-rs/kiro-gateway-rs#readme"
+repository = "https://github.com/kebyn/kiro-gateway"
+homepage = "https://github.com/kebyn/kiro-gateway"
+documentation = "https://github.com/kebyn/kiro-gateway#readme"
 build = "build.rs"
 
 [features]
