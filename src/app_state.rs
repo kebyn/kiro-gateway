@@ -2,7 +2,7 @@ use crate::{
     auth,
     config::AppConfig,
     credential::TokenManager,
-    endpoint::{EndpointKind, endpoint_for},
+    endpoint::EndpointPolicy,
     error::AppError,
     protocol::internal::{InternalRequest, InternalResponse},
     response_store::ResponseStore,
@@ -62,8 +62,9 @@ impl AppState {
 }
 
 pub fn build_upstream(config: &AppConfig, client: reqwest::Client) -> Arc<UpstreamClient> {
-    Arc::new(UpstreamClient::new(
+    Arc::new(UpstreamClient::with_policy(
         client,
-        endpoint_for(EndpointKind::parse(&config.endpoint), config.upstream_url.as_deref()),
+        EndpointPolicy::parse(&config.endpoint),
+        config.upstream_url.clone(),
     ))
 }

@@ -9,6 +9,7 @@ use crate::{
     auth::{self, Credential, CredentialStatus},
     config::AppConfig,
     error::AppError,
+    model_catalog::{ModelCatalog, ModelInfo},
 };
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -28,6 +29,7 @@ pub struct TokenManager {
     early_secs: i64,
     timeout: Duration,
     persistence_path: Option<std::path::PathBuf>,
+    model_catalog: Arc<ModelCatalog>,
 }
 
 impl TokenManager {
@@ -39,6 +41,10 @@ impl TokenManager {
                 .proxy(reqwest::Proxy::all(proxy).map_err(|e| AppError::Config(e.to_string()))?);
         }
         let client = builder.build().map_err(|e| AppError::Config(e.to_string()))?;
+        let model_catalog = Arc::new(ModelCatalog::new(
+            client.clone(),
+            Duration::from_secs(config.model_cache_ttl_secs),
+        ));
         Ok(Self {
             credential: Arc::new(RwLock::new(credential)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -50,6 +56,7 @@ impl TokenManager {
                 .credential_json_path
                 .as_ref()
                 .map(|v| AppConfig::expanded_path(v)),
+            model_catalog,
         })
     }
 
@@ -64,6 +71,28 @@ impl TokenManager {
     }
     pub fn refresh_state(&self) -> RefreshState {
         self.state.read().clone()
+    }
+
+    pub async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
+        self.ensure_fresh().await?;
+        self.model_catalog.get(&self.credential()).await
+    }
+
+    pub async fn validate_model(&self, model: &str) -> Result<(), AppError> {
+        let models = self.available_models().await.map_err(|error| {
+            tracing::warn!(error = %error, "model discovery failed while validating request");
+            AppError::BadRequest("no models are currently available".into())
+        })?;
+        if models.iter().any(|candidate| candidate.model_id == model) {
+            Ok(())
+        } else {
+            Err(AppError::BadRequest(format!("model is not available: {model}")))
+        }
+    }
+
+    #[cfg(test)]
+    pub fn seed_models_for_tests(&self, models: Vec<ModelInfo>) {
+        self.model_catalog.seed(models);
     }
 
     pub async fn ensure_fresh(&self) -> Result<(), AppError> {

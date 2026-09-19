@@ -28,6 +28,31 @@ impl EndpointKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointPolicy {
+    Auto,
+    Ide,
+    Cli,
+}
+
+impl EndpointPolicy {
+    pub fn parse(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "cli" => Self::Cli,
+            _ => Self::Ide,
+        }
+    }
+
+    pub fn resolve(self, credential_endpoint: &str) -> EndpointKind {
+        match self {
+            Self::Auto => EndpointKind::parse(credential_endpoint),
+            Self::Ide => EndpointKind::Ide,
+            Self::Cli => EndpointKind::Cli,
+        }
+    }
+}
+
 pub trait KiroEndpoint: Send + Sync {
     fn api_url(&self, credential: &Credential) -> String;
     fn transform_api_body(
@@ -47,6 +72,24 @@ pub fn endpoint_for(kind: EndpointKind, upstream_url: Option<&str>) -> Box<dyn K
     match kind {
         EndpointKind::Cli => Box::new(cli::CliEndpoint::new(upstream_url.map(str::to_owned))),
         EndpointKind::Ide => Box::new(ide::IdeEndpoint::new(upstream_url.map(str::to_owned))),
+    }
+}
+
+#[cfg(test)]
+mod endpoint_policy_tests {
+    use super::{EndpointKind, EndpointPolicy};
+
+    #[test]
+    fn auto_policy_uses_credential_endpoint() {
+        assert_eq!(EndpointPolicy::Auto.resolve("cli"), EndpointKind::Cli);
+        assert_eq!(EndpointPolicy::Auto.resolve("ide"), EndpointKind::Ide);
+        assert_eq!(EndpointPolicy::Auto.resolve("unknown"), EndpointKind::Ide);
+    }
+
+    #[test]
+    fn explicit_policy_overrides_credential_endpoint() {
+        assert_eq!(EndpointPolicy::Ide.resolve("cli"), EndpointKind::Ide);
+        assert_eq!(EndpointPolicy::Cli.resolve("ide"), EndpointKind::Cli);
     }
 }
 

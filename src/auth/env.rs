@@ -14,7 +14,7 @@ pub fn load() -> Vec<Credential> {
         client_id: std::env::var("KIRO_CLIENT_ID").ok().map(SecretString::new),
         client_secret: std::env::var("KIRO_CLIENT_SECRET").ok().map(SecretString::new),
         api_region: std::env::var("KIRO_API_REGION").unwrap_or_else(|_| "us-east-1".into()),
-        endpoint: std::env::var("KIRO_ENDPOINT").unwrap_or_else(|_| "ide".into()),
+        endpoint: std::env::var("KIRO_ENDPOINT").unwrap_or_else(|_| "auto".into()),
         machine_id: std::env::var("KIRO_MACHINE_ID")
             .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
         ..Default::default()
