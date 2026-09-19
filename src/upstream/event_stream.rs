@@ -213,6 +213,7 @@ pub fn decode_internal_events(
 /// Compatibility entry point for consumers that decode one logical event at a
 /// time. New code should use `decode_internal_events`, because one tool frame
 /// can carry a name, input, and stop marker simultaneously.
+#[cfg(test)]
 pub fn decode_internal_event(message: &EventMessage) -> Result<InternalEvent, UpstreamStreamError> {
     let header_kind = header(message, ":event-type");
     if matches!(header_kind, Some("toolUseEvent" | "tool_use")) {

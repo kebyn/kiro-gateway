@@ -1,10 +1,12 @@
+#[cfg(test)]
+use crate::protocol::internal::InternalResponse;
 use crate::transform::truncation::XmlLeakFilter;
 use crate::{
     AppState,
     error::AppError,
     protocol::{
         anthropic::{CountTokensRequest, MessagesRequest},
-        internal::{InternalEvent, InternalRequest, InternalResponse},
+        internal::{InternalEvent, InternalRequest},
     },
     transform::converter::{anthropic_response, anthropic_stop_reason},
     upstream::request::InternalEventAccumulator,
@@ -208,6 +210,7 @@ pub async fn messages(
     Ok(Sse::new(stream).into_response())
 }
 
+#[cfg(test)]
 fn anthropic_stream_events(
     payload: &serde_json::Value,
     response: &InternalResponse,
@@ -304,12 +307,12 @@ mod tests {
         auth::{AuthMethod, Credential},
         config::AppConfig,
         credential::TokenManager,
+        error::AppError,
         protocol::internal::{InternalResponse, InternalToolCall},
         response_store::ResponseStore,
         transform::converter::anthropic_response,
     };
     use axum::{Json, extract::State};
-    use http_body_util::BodyExt;
     use serde_json::json;
     use std::{path::Path, sync::Arc};
 
@@ -330,7 +333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_stream_starts_before_fallback_completion() {
+    async fn live_stream_rejects_missing_upstream_credential() {
         let directory = tempfile::tempdir().unwrap();
         let request = serde_json::from_value(serde_json::json!({
             "model":"kiro",
@@ -338,17 +341,11 @@ mod tests {
             "stream":true
         }))
         .unwrap();
-        let response =
+        let error =
             messages(State(state(&directory.path().join("responses.sqlite3"))), Json(request))
                 .await
-                .unwrap();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        let event_names: Vec<_> =
-            body.lines().filter_map(|line| line.strip_prefix("event: ")).collect();
-        assert_eq!(event_names.first().copied(), Some("message_start"));
-        assert!(event_names.contains(&"content_block_start"));
-        assert_eq!(event_names.last().copied(), Some("message_stop"));
+                .expect_err("missing upstream credentials must not produce a successful response");
+        assert!(matches!(error, AppError::Credential(message) if message.contains("access token")));
     }
 
     #[test]

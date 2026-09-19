@@ -1,8 +1,10 @@
+#[cfg(test)]
+use crate::protocol::internal::InternalResponse;
 use crate::{
     AppState,
     error::AppError,
     protocol::{
-        internal::{InternalEvent, InternalRequest, InternalResponse},
+        internal::{InternalEvent, InternalRequest},
         openai_chat::ChatRequest,
     },
     transform::converter::{chat_finish_reason, openai_chat_response},
@@ -113,6 +115,7 @@ pub async fn chat_completions(
     Ok(Sse::new(stream).into_response())
 }
 
+#[cfg(test)]
 fn chat_stream_data(payload: &serde_json::Value, response: &InternalResponse) -> Vec<String> {
     let chunk = |delta: serde_json::Value, finish_reason: serde_json::Value| {
         json!({
@@ -156,12 +159,12 @@ mod tests {
         auth::{AuthMethod, Credential},
         config::AppConfig,
         credential::TokenManager,
+        error::AppError,
         protocol::internal::{InternalResponse, InternalToolCall},
         response_store::ResponseStore,
         transform::converter::openai_chat_response,
     };
     use axum::{Json, extract::State};
-    use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use std::{path::Path, sync::Arc};
 
@@ -182,7 +185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_stream_emits_role_then_incremental_content() {
+    async fn live_stream_rejects_missing_upstream_credential() {
         let directory = tempfile::tempdir().unwrap();
         let request = serde_json::from_value(serde_json::json!({
             "model":"kiro",
@@ -190,18 +193,13 @@ mod tests {
             "stream":true
         }))
         .unwrap();
-        let response = chat_completions(
+        let error = chat_completions(
             State(state(&directory.path().join("responses.sqlite3"))),
             Json(request),
         )
         .await
-        .unwrap();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.starts_with("data: {"));
-        assert!(body.contains("\"role\":\"assistant\""));
-        assert!(body.contains("\"content\":\"Kiro gateway"));
-        assert!(body.ends_with("data: [DONE]\n\n"));
+        .expect_err("missing upstream credentials must not produce a successful response");
+        assert!(matches!(error, AppError::Credential(message) if message.contains("access token")));
     }
 
     #[test]
