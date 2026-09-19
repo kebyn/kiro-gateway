@@ -1,6 +1,6 @@
 use crate::{
     error::AppError,
-    protocol::internal::{InternalMessage, InternalResponse, InternalTool},
+    protocol::internal::{InternalMessage, InternalTool},
     response_store::{
         model::{ResponseEvent, ResponseRecord, ResponseStatus},
         sqlite::SqliteStore,
@@ -9,6 +9,7 @@ use crate::{
 use chrono::Utc;
 use serde_json::Value;
 use std::{path::Path, sync::Arc};
+#[cfg(test)]
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -19,6 +20,7 @@ impl ResponseStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {
         Ok(Self { inner: Arc::new(SqliteStore::open(path.as_ref())?) })
     }
+    #[cfg(test)]
     pub fn create(
         &self,
         model: &str,
@@ -65,14 +67,6 @@ impl ResponseStore {
     pub fn delete(&self, id: &str) -> Result<bool, AppError> {
         self.inner.delete(id)
     }
-    pub fn event(
-        &self,
-        response_id: &str,
-        event_type: &str,
-        payload: &Value,
-    ) -> Result<(), AppError> {
-        self.inner.add_event(response_id, event_type, payload).map(|_| ())
-    }
     pub fn append_event(
         &self,
         response_id: &str,
@@ -97,9 +91,6 @@ impl ResponseStore {
             .get("tools")
             .and_then(|value| serde_json::from_value(value.clone()).ok())
             .unwrap_or_default()
-    }
-    pub fn response_payload(response: &InternalResponse) -> Value {
-        serde_json::json!({"output_text": response.text, "thinking": response.thinking, "tool_calls": response.tool_calls, "usage": response.usage, "stop_reason": response.stop_reason, "incomplete": response.incomplete})
     }
 }
 

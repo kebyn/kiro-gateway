@@ -7,4 +7,3 @@ pub mod source;
 pub mod sqlite;
 
 pub use model::{AuthMethod, Credential, CredentialStatus, SecretString};
-pub use source::{CredentialCandidate, CredentialSource, SourceKind};

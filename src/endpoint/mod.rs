@@ -29,20 +29,13 @@ impl EndpointKind {
 }
 
 pub trait KiroEndpoint: Send + Sync {
-    fn kind(&self) -> EndpointKind;
     fn api_url(&self, credential: &Credential) -> String;
-    fn mcp_url(&self, credential: &Credential) -> String;
     fn transform_api_body(
         &self,
         request: &InternalRequest,
         credential: &Credential,
     ) -> serde_json::Value;
     fn decorate_api(
-        &self,
-        builder: reqwest::RequestBuilder,
-        credential: &Credential,
-    ) -> reqwest::RequestBuilder;
-    fn decorate_mcp(
         &self,
         builder: reqwest::RequestBuilder,
         credential: &Credential,
