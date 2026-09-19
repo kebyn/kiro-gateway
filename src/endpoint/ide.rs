@@ -36,7 +36,8 @@ impl KiroEndpoint for IdeEndpoint {
         builder
             .header("x-amz-target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
             .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-user-agent", "kiro-gateway-rs/0.1")
+            .header("x-amzn-codewhisperer-optout", "true")
+            .header("x-amz-user-agent", "kiro-gateway/0.1")
             .header("x-kiro-machine-id", &credential.machine_id)
             .header("x-amzn-kiro-agent-mode", "agent")
             .header("origin", "https://app.kiro.dev")

@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, State},
     response::{
         IntoResponse, Response,
-        sse::{Event, Sse},
+        sse::{Event, KeepAlive, Sse},
     },
 };
 use futures_util::StreamExt;
@@ -40,6 +40,14 @@ pub async fn create(
     if internal.tools.is_empty() {
         internal.tools = previous_tools;
     }
+    state.token_manager.validate_model(&internal.model).await?;
+    tracing::debug!(
+        model = %internal.model,
+        stream = internal.stream,
+        store,
+        tools = internal.tools.len(),
+        "accepted OpenAI Responses request"
+    );
     let model = internal.model.clone();
     let id = format!("resp_{}", uuid::Uuid::now_v7());
     let stored_messages = response_messages(&internal.messages, &InternalResponse::default());
@@ -530,7 +538,7 @@ fn responses_live_stream(
             let _ = state.responses.update(record, status, json!({"messages":messages,"tools":stored_tools,"response":payload}));
         }
     };
-    Sse::new(stream)
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 fn responses_payload_with_live_items(
@@ -791,6 +799,7 @@ mod tests {
         auth::{AuthMethod, Credential, SecretString},
         config::AppConfig,
         credential::TokenManager,
+        model_catalog::ModelInfo,
         protocol::internal::{InternalMessage, InternalResponse, InternalToolCall},
         protocol::openai_responses::ResponsesRequest,
         response_store::{ResponseStatus, ResponseStore},
@@ -828,6 +837,12 @@ mod tests {
         };
         let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
         let token_manager = Arc::new(TokenManager::new(&config, credential).unwrap());
+        token_manager.seed_models_for_tests(vec![ModelInfo {
+            model_id: "kiro".into(),
+            model_name: None,
+            description: None,
+            token_limits: None,
+        }]);
         let client = reqwest::Client::new();
         AppState {
             config: Arc::new(config.clone()),
@@ -866,6 +881,12 @@ mod tests {
             ..Default::default()
         };
         let token_manager = Arc::new(TokenManager::new(&config, credential).unwrap());
+        token_manager.seed_models_for_tests(vec![ModelInfo {
+            model_id: "kiro".into(),
+            model_name: None,
+            description: None,
+            token_limits: None,
+        }]);
         let client = reqwest::Client::new();
         (
             AppState {
@@ -892,6 +913,13 @@ mod tests {
         }))
         .unwrap();
         let response = create(State(state.clone()), Json(request)).await.unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         server.await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
@@ -905,6 +933,28 @@ mod tests {
             .and_then(|value| value["response"]["id"].as_str().map(ToOwned::to_owned))
             .unwrap();
         assert!(state.responses.get(&id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn non_stream_returns_openai_response_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, server) =
+            state_with_json_upstream(&directory.path().join("responses.sqlite3")).await;
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"kiro",
+            "input":"hello",
+            "store":false,
+            "stream":false
+        }))
+        .unwrap();
+        let response = create(State(state), Json(request)).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        server.await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output_text"], "answer");
     }
 
     #[tokio::test]

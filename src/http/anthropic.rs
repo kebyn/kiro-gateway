@@ -16,7 +16,7 @@ use axum::{
     extract::State,
     response::{
         IntoResponse, Response,
-        sse::{Event, Sse},
+        sse::{Event, KeepAlive, Sse},
     },
 };
 use futures_util::StreamExt;
@@ -31,6 +31,14 @@ pub async fn messages(
     Json(body): Json<MessagesRequest>,
 ) -> Result<Response, AppError> {
     let request: InternalRequest = body.into();
+    state.token_manager.validate_model(&request.model).await?;
+    tracing::debug!(
+        model = %request.model,
+        stream = request.stream,
+        messages = request.messages.len(),
+        tools = request.tools.len(),
+        "accepted Anthropic Messages request"
+    );
     let stream_response = request.stream;
     let model = request.model.clone();
     if !stream_response {
@@ -41,6 +49,7 @@ pub async fn messages(
     let message_id = format!("msg_{}", uuid::Uuid::now_v7());
     let input_tokens = request.input_text().chars().count() as u64 / 4;
     let stream = async_stream::stream! {
+        tracing::debug!(model = %model, "starting Anthropic SSE response");
         let start = json!({
             "type":"message_start",
             "message": {
@@ -72,6 +81,7 @@ pub async fn messages(
             let event = match item {
                 Ok(event) => event,
                 Err(error) => {
+                    tracing::warn!(model = %model, error = %error, "Anthropic upstream stream failed");
                     yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":error.to_string()}}).to_string()));
                     yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":0}}).to_string()));
                     yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
@@ -80,6 +90,7 @@ pub async fn messages(
                 }
             };
             if let InternalEvent::Error { message } = &event {
+                tracing::warn!(model = %model, message = %message, "Anthropic upstream returned an error event");
                 yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":message}}).to_string()));
                 yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":0}}).to_string()));
                 yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
@@ -198,6 +209,14 @@ pub async fn messages(
         }
         if failed { return; }
         let response = accumulator.finish();
+        tracing::debug!(
+            model = %model,
+            text_chars = response.text.chars().count(),
+            thinking_chars = response.thinking.chars().count(),
+            tool_calls = response.tool_calls.len(),
+            stop_reason = ?response.stop_reason,
+            "completed Anthropic SSE response"
+        );
         for index in block_order {
             if !closed_blocks.contains(&index) {
                 yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
@@ -207,7 +226,7 @@ pub async fn messages(
         yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":anthropic_stop_reason(&response),"stop_sequence":null},"usage":{"output_tokens":output_tokens}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
     };
-    Ok(Sse::new(stream).into_response())
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
 }
 
 #[cfg(test)]
@@ -283,8 +302,10 @@ fn anthropic_stream_events(
     events
 }
 pub async fn count_tokens(
+    State(state): State<AppState>,
     Json(body): Json<CountTokensRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    state.token_manager.validate_model(&body._model).await?;
     let text = body
         .messages
         .iter()
@@ -308,6 +329,7 @@ mod tests {
         config::AppConfig,
         credential::TokenManager,
         error::AppError,
+        model_catalog::ModelInfo,
         protocol::internal::{InternalResponse, InternalToolCall},
         response_store::ResponseStore,
         transform::converter::anthropic_response,
@@ -315,6 +337,10 @@ mod tests {
     use axum::{Json, extract::State};
     use serde_json::json;
     use std::{path::Path, sync::Arc};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn state(path: &Path) -> AppState {
         let config = AppConfig {
@@ -323,9 +349,79 @@ mod tests {
             ..Default::default()
         };
         let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        let token_manager = Arc::new(TokenManager::new(&config, credential).unwrap());
+        token_manager.seed_models_for_tests(vec![ModelInfo {
+            model_id: "kiro".into(),
+            model_name: None,
+            description: None,
+            token_limits: None,
+        }]);
         AppState {
             config: Arc::new(config.clone()),
-            token_manager: Arc::new(TokenManager::new(&config, credential).unwrap()),
+            token_manager,
+            responses: ResponseStore::open(path).unwrap(),
+            upstream: build_upstream(&config, reqwest::Client::new()),
+            sessions: Default::default(),
+        }
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let length = socket.read(&mut chunk).await.unwrap();
+            assert!(length > 0, "request closed before headers were complete");
+            bytes.extend_from_slice(&chunk[..length]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_default();
+        while bytes.len() < header_end + content_length {
+            let length = socket.read(&mut chunk).await.unwrap();
+            assert!(length > 0, "request closed before body was complete");
+            bytes.extend_from_slice(&chunk[..length]);
+        }
+    }
+
+    async fn serve_json(listener: TcpListener, body: Vec<u8>) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_http_request(&mut socket).await;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+    }
+
+    async fn stream_state(path: &Path, upstream_url: String) -> AppState {
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            upstream_url: Some(upstream_url),
+            ..Default::default()
+        };
+        let credential = Credential {
+            auth_method: AuthMethod::ApiKey,
+            access_token: Some(crate::auth::SecretString::new("token")),
+            ..Default::default()
+        };
+        let token_manager = Arc::new(TokenManager::new(&config, credential).unwrap());
+        token_manager.seed_models_for_tests(vec![ModelInfo {
+            model_id: "kiro".into(),
+            model_name: None,
+            description: None,
+            token_limits: None,
+        }]);
+        AppState {
+            config: Arc::new(config.clone()),
+            token_manager,
             responses: ResponseStore::open(path).unwrap(),
             upstream: build_upstream(&config, reqwest::Client::new()),
             sessions: Default::default(),
@@ -346,6 +442,109 @@ mod tests {
                 .await
                 .expect_err("missing upstream credentials must not produce a successful response");
         assert!(matches!(error, AppError::Credential(message) if message.contains("access token")));
+    }
+
+    #[tokio::test]
+    async fn live_stream_emits_anthropic_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_json(
+            listener,
+            br#"{"content":"hello","stopReason":"end_turn"}"#.to_vec(),
+        ));
+
+        let state = stream_state(
+            &directory.path().join("responses.sqlite3"),
+            format!("http://{address}/generateAssistantResponse"),
+        )
+        .await;
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":true
+        }))
+        .unwrap();
+        let response = messages(State(state), Json(request)).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: message_start\n"));
+        assert!(body.contains("event: content_block_start\n"));
+        assert!(body.contains("hello"));
+        assert!(body.contains("event: message_delta\n"));
+        assert!(body.contains("event: message_stop\n"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_stream_emits_tool_use_blocks_for_anthropic_clients() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_json(
+            listener,
+            br#"{"toolUses":[{"toolUseId":"call_1","name":"bash","input":{"command":"pwd"}}],"stopReason":"tool_use"}"#.to_vec(),
+        ));
+
+        let state = stream_state(
+            &directory.path().join("responses.sqlite3"),
+            format!("http://{address}/generateAssistantResponse"),
+        )
+        .await;
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"user","content":"run pwd"}],
+            "tools":[{"name":"bash","input_schema":{"type":"object"}}],
+            "stream":true
+        }))
+        .unwrap();
+        let response = messages(State(state), Json(request)).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("\"type\":\"tool_use\""));
+        assert!(body.contains("\"name\":\"bash\""));
+        assert!(body.contains("\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\""));
+        assert!(body.contains("\"stop_reason\":\"tool_use\""));
+        assert!(body.contains("event: message_stop\n"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_stream_messages_returns_anthropic_json_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_json(
+            listener,
+            br#"{"content":"hello","stopReason":"end_turn"}"#.to_vec(),
+        ));
+
+        let state = stream_state(
+            &directory.path().join("responses.sqlite3"),
+            format!("http://{address}/generateAssistantResponse"),
+        )
+        .await;
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":false
+        }))
+        .unwrap();
+        let response = messages(State(state), Json(request)).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["content"][0]["text"], "hello");
+        assert_eq!(body["stop_reason"], "end_turn");
+        server.await.unwrap();
     }
 
     #[test]

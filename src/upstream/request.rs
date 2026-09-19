@@ -1,6 +1,6 @@
 use crate::{
     auth::{AuthMethod, Credential},
-    endpoint::KiroEndpoint,
+    endpoint::{EndpointPolicy, KiroEndpoint, endpoint_for},
     error::AppError,
     protocol::internal::{InternalEvent, InternalRequest, InternalResponse, Usage},
     transform::truncation::XmlLeakFilter,
@@ -16,17 +16,50 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
-use std::{pin::Pin, sync::Arc};
+use std::{collections::HashSet, pin::Pin};
 
 pub type InternalEventStream = Pin<Box<dyn Stream<Item = Result<InternalEvent, AppError>> + Send>>;
 
 pub struct UpstreamClient {
     client: Client,
-    endpoint: Arc<dyn KiroEndpoint>,
+    endpoint: EndpointSource,
 }
+
+#[derive(Clone)]
+enum EndpointSource {
+    Dynamic { policy: EndpointPolicy, upstream_url: Option<String> },
+}
+
+enum ResolvedEndpoint {
+    Owned(Box<dyn KiroEndpoint>),
+}
+
+impl ResolvedEndpoint {
+    fn as_ref(&self) -> &dyn KiroEndpoint {
+        match self {
+            Self::Owned(endpoint) => endpoint.as_ref(),
+        }
+    }
+}
+
+impl EndpointSource {
+    fn resolve(&self, credential: &Credential) -> ResolvedEndpoint {
+        match self {
+            Self::Dynamic { policy, upstream_url } => ResolvedEndpoint::Owned(endpoint_for(
+                policy.resolve(&credential.endpoint),
+                upstream_url.as_deref(),
+            )),
+        }
+    }
+}
+
 impl UpstreamClient {
-    pub fn new(client: Client, endpoint: Box<dyn KiroEndpoint>) -> Self {
-        Self { client, endpoint: endpoint.into() }
+    pub fn with_policy(
+        client: Client,
+        policy: EndpointPolicy,
+        upstream_url: Option<String>,
+    ) -> Self {
+        Self { client, endpoint: EndpointSource::Dynamic { policy, upstream_url } }
     }
 
     /// Starts a live upstream event stream. The request is sent only when the
@@ -44,7 +77,8 @@ impl UpstreamClient {
         let credential = credential.clone();
         Ok(Box::pin(stream! {
             for attempt in 0..=1_u8 {
-                let response = match send_once(&client, endpoint.as_ref(), &request, &credential).await {
+                let resolved_endpoint = endpoint.resolve(&credential);
+                let response = match send_once(&client, resolved_endpoint.as_ref(), &request, &credential).await {
                     Ok(response) => response,
                     Err(SendOnceError::Transport(_)) if attempt == 0 => continue,
                     Err(error) => {
@@ -52,6 +86,11 @@ impl UpstreamClient {
                         return;
                     }
                 };
+                tracing::debug!(
+                    model = %request.model,
+                    content_type = ?response.headers().get(reqwest::header::CONTENT_TYPE),
+                    "received upstream response"
+                );
                 let is_json = response
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
@@ -83,6 +122,7 @@ impl UpstreamClient {
                 let mut bytes = response.bytes_stream();
                 let mut decoder = EventStreamDecoder::new();
                 let mut integrity = StreamIntegrity { attempts: attempt, ..Default::default() };
+                let mut event_count = 0_usize;
                 let mut retry = false;
                 while let Some(chunk) = bytes.next().await {
                     let chunk = match chunk {
@@ -127,6 +167,7 @@ impl UpstreamClient {
                             }
                         };
                         for event in events {
+                            event_count += 1;
                             // Empty metadata/context frames are intentionally
                             // not emitted by the decoder. Every yielded event
                             // is therefore observable protocol data.
@@ -159,6 +200,12 @@ impl UpstreamClient {
                     }
                     yield Err(AppError::Integrity("upstream stream was empty".into()));
                 }
+                tracing::debug!(
+                    model = %request.model,
+                    events = event_count,
+                    completed = integrity.completed,
+                    "upstream event stream ended"
+                );
                 return;
             }
         }))
@@ -186,13 +233,13 @@ async fn send_once(
     credential: &Credential,
 ) -> Result<reqwest::Response, SendOnceError> {
     let body = endpoint.transform_api_body(request, credential);
+    tracing::debug!(model = %request.model, "sending upstream request");
     let mut builder = client
         .post(endpoint.api_url(credential))
         .bearer_auth(
             credential.access_token.as_ref().map(|v| v.expose_secret()).unwrap_or_default(),
         )
         .json(&body)
-        .header("x-amzn-codewhisperer-optout", "true")
         .header("accept", "application/vnd.amazon.eventstream, application/json");
     if matches!(credential.auth_method, AuthMethod::ApiKey) {
         builder = builder.header("tokentype", "API_KEY");
@@ -218,6 +265,9 @@ async fn send_once(
 fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
     let body: Value = serde_json::from_slice(body)
         .map_err(|error| AppError::Upstream(format!("invalid JSON upstream response: {error}")))?;
+    let mut nodes = Vec::new();
+    collect_json_nodes(&body, &mut nodes, 0);
+    tracing::debug!(shape = %json_shape(&body), "received JSON upstream response shape");
     if let Some(error) = body.get("error") {
         let message = error
             .get("message")
@@ -227,38 +277,50 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
             .to_owned();
         return Ok(vec![InternalEvent::Error { message }]);
     }
+    if let Some(message) = json_error_message(&nodes) {
+        return Ok(vec![InternalEvent::Error { message }]);
+    }
     let mut events = Vec::new();
-    if let Some(text) = json_text(&body, &["content", "text", "output_text"])
-        .or_else(|| {
-            body.get("output").and_then(|output| {
-                output.as_array().and_then(|items| {
-                    let text = items
-                        .iter()
-                        .filter_map(|item| json_text(item, &["content", "text", "output_text"]))
-                        .collect::<Vec<_>>()
-                        .join("");
-                    (!text.is_empty()).then_some(text)
-                })
-            })
-        })
-        .filter(|text| !text.is_empty())
+    let mut recognized = has_explicit_empty_response(&nodes);
+    if let Some(text) = nodes
+        .iter()
+        .find_map(|node| json_text(node, &["content", "text", "output_text", "outputText"]))
     {
-        events.push(InternalEvent::TextDelta { text: text.to_owned() });
+        if !text.is_empty() {
+            events.push(InternalEvent::TextDelta { text });
+        }
+        recognized = true;
     }
-    if let Some(text) = json_text(&body, &["thinking", "reasoning"]).filter(|text| !text.is_empty())
+    if let Some(text) =
+        nodes.iter().find_map(|node| json_text(node, &["thinking", "reasoning", "reasoningText"]))
     {
-        events.push(InternalEvent::ThinkingDelta { text: text.to_owned() });
+        if !text.is_empty() {
+            events.push(InternalEvent::ThinkingDelta { text });
+        }
+        recognized = true;
     }
-    for call in parse_json_tool_calls(&body) {
-        let id = call.id.clone();
-        let name = call.name.clone();
-        let arguments = call.arguments_json();
-        let complete = call.complete;
-        events.push(InternalEvent::ToolCallStart { id: id.clone(), name });
-        events.push(InternalEvent::ToolCallDelta { id: id.clone(), arguments, name: None });
-        events.push(InternalEvent::ToolCallEnd { id, complete });
+    let mut seen_tool_calls = HashSet::new();
+    for node in &nodes {
+        for call in parse_json_tool_calls(node) {
+            let dedupe_key = if call.id.is_empty() {
+                format!("{}:{}", call.name, call.arguments_json())
+            } else {
+                call.id.clone()
+            };
+            if !seen_tool_calls.insert(dedupe_key) {
+                continue;
+            }
+            recognized = true;
+            let id = call.id.clone();
+            let name = call.name.clone();
+            let arguments = call.arguments_json();
+            let complete = call.complete;
+            events.push(InternalEvent::ToolCallStart { id: id.clone(), name });
+            events.push(InternalEvent::ToolCallDelta { id: id.clone(), arguments, name: None });
+            events.push(InternalEvent::ToolCallEnd { id, complete });
+        }
     }
-    if let Some(usage) = body.get("usage") {
+    if let Some(usage) = nodes.iter().find_map(|node| node.get("usage")) {
         events.push(InternalEvent::Usage {
             usage: Usage::new(
                 usage
@@ -275,17 +337,26 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
                     .unwrap_or_default(),
             ),
         });
+        recognized = true;
     }
-    let reason = body
-        .get("stopReason")
-        .or_else(|| body.get("stop_reason"))
-        .or_else(|| body.get("finish_reason"))
-        .and_then(Value::as_str)
-        .unwrap_or("end_turn")
-        .to_owned();
-    // A JSON response with no visible fields is still a valid terminal
-    // response when the upstream explicitly returned an object.
-    events.push(InternalEvent::Stop { reason });
+    let reason = nodes
+        .iter()
+        .find_map(|node| {
+            ["stopReason", "stop_reason", "finish_reason", "finishReason"]
+                .iter()
+                .find_map(|name| node.get(*name).and_then(Value::as_str))
+        })
+        .map(ToOwned::to_owned);
+    if reason.is_some() {
+        recognized = true;
+    }
+    if !recognized {
+        return Err(AppError::Integrity(format!(
+            "unrecognized JSON upstream response shape: {}",
+            json_shape(&body)
+        )));
+    }
+    events.push(InternalEvent::Stop { reason: reason.unwrap_or_else(|| "end_turn".into()) });
     Ok(events)
 }
 
@@ -296,24 +367,122 @@ fn json_text(value: &Value, names: &[&str]) -> Option<String> {
             Value::String(text) => Some(text.clone()),
             Value::Object(object) => object
                 .get("text")
+                .or_else(|| object.get("outputText"))
                 .or_else(|| object.get("content"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
+                .and_then(json_value_text),
             Value::Array(items) => {
-                let text = items
-                    .iter()
-                    .filter_map(|item| {
-                        item.as_str()
-                            .or_else(|| item.get("text").and_then(Value::as_str))
-                            .or_else(|| item.get("content").and_then(Value::as_str))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
+                let text = items.iter().filter_map(json_value_text).collect::<Vec<_>>().join("");
                 (!text.is_empty()).then_some(text)
             }
             _ => None,
         }
     })
+}
+
+fn json_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(object) => ["text", "output_text", "outputText", "content"]
+            .iter()
+            .find_map(|name| object.get(*name).and_then(json_value_text)),
+        Value::Array(items) => {
+            let text = items.iter().filter_map(json_value_text).collect::<Vec<_>>().join("");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn json_error_message(nodes: &[&Value]) -> Option<String> {
+    nodes.iter().find_map(|node| {
+        let object = node.as_object()?;
+        let error_type = object.get("__type").and_then(Value::as_str)?;
+        let message = object.get("message").and_then(Value::as_str)?;
+        if message.is_empty() {
+            return None;
+        }
+        Some(format!("{error_type}: {message}"))
+    })
+}
+
+fn collect_json_nodes<'a>(value: &'a Value, nodes: &mut Vec<&'a Value>, depth: usize) {
+    nodes.push(value);
+    if depth >= 6 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for child in object.values() {
+                collect_json_nodes(child, nodes, depth + 1);
+            }
+        }
+        Value::Array(items) => {
+            for child in items.iter().take(32) {
+                collect_json_nodes(child, nodes, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn has_explicit_empty_response(nodes: &[&Value]) -> bool {
+    nodes.iter().any(|node| {
+        let Some(object) = node.as_object() else {
+            return false;
+        };
+        let empty_content =
+            ["content", "output"].iter().filter_map(|name| object.get(*name)).any(|value| {
+                match value {
+                    Value::String(text) => text.is_empty(),
+                    Value::Array(items) => items.is_empty(),
+                    _ => false,
+                }
+            });
+        let completed_status = object
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "complete" | "completed" | "succeeded"));
+        empty_content || completed_status
+    })
+}
+
+fn json_shape(value: &Value) -> String {
+    fn render(value: &Value, depth: usize) -> String {
+        if depth >= 3 {
+            return match value {
+                Value::Array(_) => "array".into(),
+                Value::Object(_) => "object".into(),
+                Value::String(_) => "string".into(),
+                Value::Number(_) => "number".into(),
+                Value::Bool(_) => "bool".into(),
+                Value::Null => "null".into(),
+            };
+        }
+        match value {
+            Value::Object(object) => {
+                let mut keys = object.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                let fields = keys
+                    .into_iter()
+                    .take(16)
+                    .map(|key| format!("{key}:{}", render(&object[&key], depth + 1)))
+                    .collect::<Vec<_>>();
+                let suffix = (object.len() > 16).then_some(",...").unwrap_or_default();
+                format!("object{{{}{suffix}}}", fields.join(","))
+            }
+            Value::Array(items) => {
+                let shapes =
+                    items.iter().take(4).map(|item| render(item, depth + 1)).collect::<Vec<_>>();
+                let suffix = (items.len() > 4).then_some(",...").unwrap_or_default();
+                format!("array[{}{suffix}]", shapes.join(","))
+            }
+            Value::String(_) => "string".into(),
+            Value::Number(_) => "number".into(),
+            Value::Bool(_) => "bool".into(),
+            Value::Null => "null".into(),
+        }
+    }
+    render(value, 0)
 }
 
 /// Shared state machine used by complete responses and by all streaming HTTP
@@ -421,16 +590,24 @@ fn finish_stream_response(
 fn parse_json_tool_calls(
     body: &serde_json::Value,
 ) -> Vec<crate::protocol::internal::InternalToolCall> {
-    let items = body
-        .get("toolUses")
-        .or_else(|| body.get("tool_uses"))
-        .or_else(|| body.get("toolCalls"))
-        .or_else(|| body.get("tool_calls"))
-        .or_else(|| body.get("output"))
-        .and_then(serde_json::Value::as_array);
-    let Some(items) = items else {
+    let mut items = Vec::new();
+    for key in ["toolUses", "tool_uses", "toolUse", "toolCalls", "tool_calls", "toolCall", "output"]
+    {
+        match body.get(key) {
+            Some(serde_json::Value::Array(values)) => items.extend(values.iter()),
+            Some(value @ serde_json::Value::Object(_)) => items.push(value),
+            _ => {}
+        }
+    }
+    if items.is_empty()
+        && body.get("name").is_some()
+        && (body.get("input").is_some() || body.get("arguments").is_some())
+    {
+        items.push(body);
+    }
+    if items.is_empty() {
         return Vec::new();
-    };
+    }
     items
         .iter()
         .filter_map(|item| {
@@ -497,12 +674,12 @@ fn is_empty_stream(response: &crate::protocol::internal::InternalResponse) -> bo
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_internal_event, finish_stream_response, is_empty_stream, json_events,
+        UpstreamClient, apply_internal_event, finish_stream_response, is_empty_stream, json_events,
         parse_json_tool_calls,
     };
     use crate::{
         auth::{AuthMethod, Credential, SecretString},
-        endpoint::{EndpointKind, endpoint_for},
+        endpoint::EndpointPolicy,
         protocol::internal::{InternalEvent, InternalRequest, InternalResponse},
         transform::truncation::XmlLeakFilter,
         upstream::{
@@ -572,9 +749,10 @@ mod tests {
             }
         });
         let upstream_url = format!("http://{address}");
-        let client = super::UpstreamClient::new(
+        let client = super::UpstreamClient::with_policy(
             reqwest::Client::new(),
-            endpoint_for(EndpointKind::Ide, Some(upstream_url.as_str())),
+            EndpointPolicy::Ide,
+            Some(upstream_url),
         );
         let credential = Credential {
             auth_method: AuthMethod::ApiKey,
@@ -606,6 +784,106 @@ mod tests {
         assert!(
             matches!(&collected[..], [InternalEvent::TextDelta { text }, InternalEvent::Stop { reason }] if text == "ok" && reason == "end_turn")
         );
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let length = socket.read(&mut chunk).await.unwrap();
+            assert!(length > 0, "request closed before headers were complete");
+            bytes.extend_from_slice(&chunk[..length]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_default();
+        while bytes.len() < header_end + content_length {
+            let length = socket.read(&mut chunk).await.unwrap();
+            assert!(length > 0, "request closed before body was complete");
+            bytes.extend_from_slice(&chunk[..length]);
+        }
+        String::from_utf8_lossy(&bytes[..header_end + content_length]).into_owned()
+    }
+
+    #[tokio::test]
+    async fn auto_policy_uses_the_current_credential_endpoint_protocol() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (origin, model_id) in [("KIRO_CLI", "ide-model"), ("AI_EDITOR", "ide-model")] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                assert!(request.starts_with("POST /generateAssistantResponse "));
+                assert!(request.contains(&format!("\"origin\":\"{origin}\"")));
+                assert!(request.contains(&format!("\"modelId\":\"{model_id}\"")));
+                assert_eq!(request.matches("x-amzn-codewhisperer-optout:").count(), 1);
+                if origin == "KIRO_CLI" {
+                    assert!(
+                        request
+                            .contains("x-amz-target: KiroRuntimeService.GenerateAssistantResponse")
+                    );
+                    assert!(request.contains("x-amzn-kiro-client-attribution: unrecognized"));
+                    assert!(request.contains("x-kiro-attempt: 1;max=3"));
+                    assert!(request.contains("x-amzn-codewhisperer-optout: false"));
+                } else {
+                    assert!(request.contains("x-amzn-codewhisperer-optout: true"));
+                }
+                let body = event_frame("assistantResponseEvent", json!({"content":"ok"}));
+                let mut body = body;
+                body.extend(event_frame("metadataEvent", json!({"stopReason":"end_turn"})));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+        let client = UpstreamClient::with_policy(
+            reqwest::Client::new(),
+            EndpointPolicy::Auto,
+            Some(format!("http://{address}/generateAssistantResponse")),
+        );
+        let request = InternalRequest {
+            model: "ide-model".into(),
+            messages: vec![crate::protocol::internal::InternalMessage::new(
+                "user",
+                Value::String("hello".into()),
+            )],
+            system: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            conversation_id: None,
+            instructions: None,
+        };
+        for endpoint in ["cli", "ide"] {
+            let credential = Credential {
+                auth_method: AuthMethod::ApiKey,
+                access_token: Some(SecretString::new("token")),
+                endpoint: endpoint.into(),
+                ..Default::default()
+            };
+            let mut events = client.event_stream(&request, &credential).await.unwrap();
+            let mut collected = Vec::new();
+            while let Some(event) = events.next().await {
+                collected.push(event.unwrap());
+            }
+            assert!(matches!(
+                &collected[..],
+                [InternalEvent::TextDelta { text }, InternalEvent::Stop { reason }]
+                    if text == "ok" && reason == "end_turn"
+            ));
+        }
+        server.await.unwrap();
     }
 
     fn response_from_events(events: Vec<(&str, Value)>) -> InternalResponse {
@@ -673,11 +951,101 @@ mod tests {
     }
 
     #[test]
+    fn adapts_nested_runtime_json_response() {
+        let events = json_events(
+            br#"{"assistantResponseEvent":{"content":[{"type":"output_text","text":"nested answer"}],"toolUses":[{"toolUseId":"call_1","name":"lookup","input":{"id":1}}],"usage":{"inputTokens":2,"outputTokens":3},"stopReason":"end_turn"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &events[0],
+            InternalEvent::TextDelta { text } if text == "nested answer"
+        ));
+        assert!(matches!(
+            &events[1],
+            InternalEvent::ToolCallStart { id, name } if id == "call_1" && name == "lookup"
+        ));
+        assert!(
+            matches!(&events[2], InternalEvent::ToolCallDelta { arguments, .. } if arguments == r#"{"id":1}"#)
+        );
+        assert!(matches!(&events[3], InternalEvent::ToolCallEnd { complete: true, .. }));
+        assert!(
+            matches!(&events[4], InternalEvent::Usage { usage } if usage.input_tokens == 2 && usage.output_tokens == 3)
+        );
+        assert!(matches!(
+            &events[5],
+            InternalEvent::Stop { reason } if reason == "end_turn"
+        ));
+    }
+
+    #[test]
+    fn adapts_nested_message_content_json_response() {
+        let events = json_events(
+            br#"{"response":{"message":{"content":[{"type":"text","text":"deep answer"}]}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &events[..],
+            [InternalEvent::TextDelta { text }, InternalEvent::Stop { reason }]
+                if text == "deep answer" && reason == "end_turn"
+        ));
+    }
+
+    #[test]
+    fn rejects_unrecognized_success_json_instead_of_emitting_empty_stop() {
+        let error = json_events(br#"{"status":"ok","metadata":{"requestId":"redacted"}}"#)
+            .expect_err("unknown successful JSON must not become an empty response");
+        assert!(matches!(
+            error,
+            crate::error::AppError::Integrity(message)
+                if message.contains("unrecognized JSON upstream response shape")
+        ));
+    }
+
+    #[test]
+    fn rejects_generic_message_json_instead_of_emitting_empty_stop() {
+        let error = json_events(br#"{"message":"completed","metadata":{"requestId":"redacted"}}"#)
+            .expect_err("generic message JSON must not become an empty response");
+        assert!(matches!(error, crate::error::AppError::Integrity(_)));
+    }
+
+    #[test]
+    fn preserves_explicit_empty_runtime_response() {
+        let events =
+            json_events(br#"{"assistantResponseEvent":{"content":"","stopReason":"end_turn"}}"#)
+                .unwrap();
+        assert!(matches!(
+            &events[..],
+            [InternalEvent::Stop { reason }] if reason == "end_turn"
+        ));
+    }
+
+    #[test]
+    fn preserves_explicit_empty_completed_response() {
+        let events = json_events(br#"{"response":{"status":"completed","output":[]}}"#).unwrap();
+        assert!(matches!(
+            &events[..],
+            [InternalEvent::Stop { reason }] if reason == "end_turn"
+        ));
+    }
+
+    #[test]
     fn adapts_json_upstream_error_to_error_event() {
         let events = json_events(br#"{"error":{"message":"overloaded"}}"#).unwrap();
         assert!(
             matches!(&events[..], [InternalEvent::Error { message }] if message == "overloaded")
         );
+    }
+
+    #[test]
+    fn adapts_cli_json_error_envelope_to_error_event() {
+        let events = json_events(
+            br#"{"Output":{"__type":"ModelError","message":"request rejected"},"Version":"1.0"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &events[..],
+            [InternalEvent::Error { message }] if message == "ModelError: request rejected"
+        ));
     }
 
     #[test]

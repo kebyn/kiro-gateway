@@ -16,7 +16,7 @@ use axum::{
     extract::State,
     response::{
         IntoResponse, Response,
-        sse::{Event, Sse},
+        sse::{Event, KeepAlive, Sse},
     },
 };
 use futures_util::StreamExt;
@@ -28,6 +28,14 @@ pub async fn chat_completions(
     Json(body): Json<ChatRequest>,
 ) -> Result<Response, AppError> {
     let request: InternalRequest = body.into();
+    state.token_manager.validate_model(&request.model).await?;
+    tracing::debug!(
+        model = %request.model,
+        stream = request.stream,
+        messages = request.messages.len(),
+        tools = request.tools.len(),
+        "accepted OpenAI Chat Completions request"
+    );
     let stream_response = request.stream;
     let model = request.model.clone();
     if !stream_response {
@@ -112,7 +120,7 @@ pub async fn chat_completions(
         yield Ok(Event::default().data(finish.to_string()));
         yield Ok(Event::default().data("[DONE]"));
     };
-    Ok(Sse::new(stream).into_response())
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
 }
 
 #[cfg(test)]
@@ -160,6 +168,7 @@ mod tests {
         config::AppConfig,
         credential::TokenManager,
         error::AppError,
+        model_catalog::ModelInfo,
         protocol::internal::{InternalResponse, InternalToolCall},
         response_store::ResponseStore,
         transform::converter::openai_chat_response,
@@ -167,6 +176,10 @@ mod tests {
     use axum::{Json, extract::State};
     use serde_json::{Value, json};
     use std::{path::Path, sync::Arc};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn state(path: &Path) -> AppState {
         let config = AppConfig {
@@ -175,13 +188,93 @@ mod tests {
             ..Default::default()
         };
         let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        let token_manager = Arc::new(TokenManager::new(&config, credential).unwrap());
+        token_manager.seed_models_for_tests(vec![ModelInfo {
+            model_id: "kiro".into(),
+            model_name: None,
+            description: None,
+            token_limits: None,
+        }]);
         AppState {
             config: Arc::new(config.clone()),
-            token_manager: Arc::new(TokenManager::new(&config, credential).unwrap()),
+            token_manager,
             responses: ResponseStore::open(path).unwrap(),
             upstream: build_upstream(&config, reqwest::Client::new()),
             sessions: Default::default(),
         }
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let length = socket.read(&mut chunk).await.unwrap();
+            assert!(length > 0, "request closed before headers were complete");
+            bytes.extend_from_slice(&chunk[..length]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_default();
+        while bytes.len() < header_end + content_length {
+            let length = socket.read(&mut chunk).await.unwrap();
+            assert!(length > 0, "request closed before body was complete");
+            bytes.extend_from_slice(&chunk[..length]);
+        }
+    }
+
+    async fn serve_json(listener: TcpListener, body: Vec<u8>) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_http_request(&mut socket).await;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+    }
+
+    async fn state_with_json_upstream(
+        path: &Path,
+        body: Vec<u8>,
+    ) -> (AppState, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_json(listener, body));
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            response_store_path: path.display().to_string(),
+            upstream_url: Some(format!("http://{address}")),
+            ..Default::default()
+        };
+        let credential = Credential {
+            auth_method: AuthMethod::ApiKey,
+            access_token: Some(crate::auth::SecretString::new("token")),
+            ..Default::default()
+        };
+        let token_manager = Arc::new(TokenManager::new(&config, credential).unwrap());
+        token_manager.seed_models_for_tests(vec![ModelInfo {
+            model_id: "kiro".into(),
+            model_name: None,
+            description: None,
+            token_limits: None,
+        }]);
+        (
+            AppState {
+                config: Arc::new(config.clone()),
+                token_manager,
+                responses: ResponseStore::open(path).unwrap(),
+                upstream: build_upstream(&config, reqwest::Client::new()),
+                sessions: Default::default(),
+            },
+            server,
+        )
     }
 
     #[tokio::test]
@@ -200,6 +293,87 @@ mod tests {
         .await
         .expect_err("missing upstream credentials must not produce a successful response");
         assert!(matches!(error, AppError::Credential(message) if message.contains("access token")));
+    }
+
+    #[tokio::test]
+    async fn live_stream_emits_openai_lifecycle_and_done_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, server) = state_with_json_upstream(
+            &directory.path().join("responses.sqlite3"),
+            br#"{"content":"hello","stopReason":"end_turn"}"#.to_vec(),
+        )
+        .await;
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":true
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(request)).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("\"role\":\"assistant\""));
+        assert!(body.contains("\"content\":\"hello\""));
+        assert!(body.contains("\"finish_reason\":\"stop\""));
+        assert!(body.contains("data: [DONE]\n"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_stream_returns_openai_chat_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, server) = state_with_json_upstream(
+            &directory.path().join("responses.sqlite3"),
+            br#"{"content":"hello","stopReason":"end_turn"}"#.to_vec(),
+        )
+        .await;
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":false
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(request)).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "hello");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_stream_emits_openai_tool_calls() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, server) = state_with_json_upstream(
+            &directory.path().join("responses.sqlite3"),
+            br#"{"toolCalls":[{"id":"call_1","name":"bash","arguments":{"command":"pwd"}}],"stopReason":"tool_use"}"#.to_vec(),
+        )
+        .await;
+        let request = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[{"role":"user","content":"run pwd"}],
+            "tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object"}}}],
+            "stream":true
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(request)).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("\"type\":\"function\""));
+        assert!(body.contains("\"name\":\"bash\""));
+        assert!(body.contains("\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\""));
+        assert!(body.contains("\"finish_reason\":\"tool_calls\""));
+        assert!(body.contains("data: [DONE]\n"));
+        server.await.unwrap();
     }
 
     #[test]
