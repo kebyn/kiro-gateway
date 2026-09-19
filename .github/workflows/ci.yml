@@ -45,4 +45,4 @@ jobs:
     needs: frontend
     steps:
       - uses: actions/checkout@v4
-      - run: docker build --tag kiro-gateway-rs:ci .
+      - run: docker build --tag kiro-gateway:ci .

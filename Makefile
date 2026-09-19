@@ -31,4 +31,4 @@ package:
 	cargo package --locked --allow-dirty
 
 docker:
-	docker build -t kiro-gateway-rs:local .
+	docker build -t kiro-gateway:local .
