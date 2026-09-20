@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -16,6 +16,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub struct SqliteStore {
     conn: std::sync::Mutex<Connection>,
+    path: PathBuf,
 }
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, AppError> {
@@ -26,6 +27,7 @@ impl SqliteStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(include_str!("../../migrations/001_initial.sql"))?;
+        harden_sidecars(path);
         // The initial scaffold created a conversations table that was never
         // read or written. Remove it during upgrade so the schema reflects the
         // response_id-based continuation model instead of advertising a
@@ -65,7 +67,7 @@ impl SqliteStore {
                 [],
             )?;
         }
-        Ok(Self { conn: std::sync::Mutex::new(conn) })
+        Ok(Self { conn: std::sync::Mutex::new(conn), path: path.to_owned() })
     }
     pub fn put(&self, record: &ResponseRecord) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|_| AppError::Storage("store lock poisoned".into()))?;
@@ -73,6 +75,7 @@ impl SqliteStore {
             "INSERT INTO responses(id, object, status, model, payload, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET object=excluded.object, status=excluded.status, model=excluded.model, payload=excluded.payload, created_at=excluded.created_at, updated_at=excluded.updated_at",
             params![record.id, record.object, serde_json::to_string(&record.status)?, record.model, serde_json::to_string(&record.payload)?, record.created_at.timestamp(), record.updated_at.timestamp()],
         )?;
+        harden_sidecars(&self.path);
         Ok(())
     }
     pub fn get(&self, id: &str) -> Result<Option<ResponseRecord>, AppError> {
@@ -107,6 +110,7 @@ impl SqliteStore {
             "INSERT INTO response_events(response_id, sequence_number, event_type, payload, created_at) VALUES(?1, ?2, ?3, ?4, ?5)",
             params![response_id, sequence, event_type, serde_json::to_string(&stored_payload)?, created_at.timestamp()],
         )?;
+        harden_sidecars(&self.path);
         Ok(ResponseEvent {
             response_id: response_id.to_owned(),
             sequence_number: sequence as u64,
@@ -154,3 +158,16 @@ fn prepare_store_file(path: &Path) -> Result<(), AppError> {
         .map_err(|error| AppError::Storage(error.to_string()))?;
     Ok(())
 }
+
+#[cfg(unix)]
+fn harden_sidecars(path: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+        if sidecar.exists() {
+            let _ = fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_sidecars(_path: &Path) {}

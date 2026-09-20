@@ -53,6 +53,7 @@ pub async fn chat_completions(
     let request: InternalRequest = body.into();
     state.token_manager.validate_model(&request.model).await?;
     tracing::debug!(
+        protocol = "openai_chat",
         model = %request.model,
         stream = request.stream,
         messages = request.messages.len(),

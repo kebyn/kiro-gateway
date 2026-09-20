@@ -78,6 +78,7 @@ pub async fn messages(
     let request: InternalRequest = body.into();
     state.token_manager.validate_model(&request.model).await?;
     tracing::debug!(
+        protocol = "anthropic",
         model = %request.model,
         stream = request.stream,
         messages = request.messages.len(),

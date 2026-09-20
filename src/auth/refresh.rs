@@ -33,9 +33,7 @@ pub async fn refresh(
         .ok_or_else(|| AppError::Credential("refresh token is missing".into()))?
         .expose_secret()
         .to_owned();
-    let oidc = matches!(credential.auth_method, AuthMethod::Oidc)
-        || (matches!(credential.auth_method, AuthMethod::Unknown)
-            && credential.client_id.is_some());
+    let oidc = matches!(credential.auth_method, AuthMethod::Oidc);
     let region = credential.sso_region.as_deref().unwrap_or(&credential.api_region);
     let default_url = if oidc {
         format!("https://oidc.{region}.amazonaws.com/token")

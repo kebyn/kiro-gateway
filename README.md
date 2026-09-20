@@ -129,7 +129,7 @@ curl -N -i \
 
 ## 配置
 
-配置文件为 JSON。未列出的字段使用下表默认值；`apiKey`、`adminApiKey`、`defaultEndpoint` 分别是 `client_api_key`、`admin_api_key`、`endpoint` 的兼容别名。
+配置文件为 JSON。只接受下表列出的 snake_case 字段；未知字段和历史别名会直接拒绝启动。
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -149,11 +149,15 @@ curl -N -i \
 | `api_region` | `us-east-1` | API Key 来源使用的默认区域 |
 | `upstream_url` | 空 | 覆盖模型生成上游 URL，主要用于受控代理或测试 |
 | `proxy_url` | 空 | Token 刷新 HTTP 客户端的代理 URL |
+| `token_endpoint` | 空 | 覆盖 Token 刷新 URL，只能使用 `http`/`https` |
 | `upstream_timeout_secs` | `60` | 模型上游请求超时，必须大于 `0` |
 | `refresh_early_secs` | `120` | 到期前提前刷新的秒数 |
 | `refresh_interval_secs` | `30` | 后台检查刷新间隔，必须大于 `0` |
 | `model_cache_ttl_secs` | `300` | Kiro 模型目录缓存时间，秒，必须大于 `0` |
 | `response_store_path` | `kiro-gateway.sqlite3` | Responses 本地 SQLite 路径；支持 `~/` 展开 |
+| `max_request_body_bytes` | `8388608` | 请求体上限（8 MiB），必须大于 `0` |
+| `max_upstream_body_bytes` | `16777216` | Kiro JSON/EventStream 响应体上限（16 MiB），必须大于 `0` |
+| `graceful_shutdown_timeout_secs` | `30` | SIGTERM/CTRL-C 后等待活动流的最长时间 |
 | `mcp_region` | 空 | 保留字段，当前未参与运行时行为 |
 | `log_json` | `false` | 使用 JSON 格式输出 tracing 日志 |
 | `trust_forwarded_headers` | `false` | 为 `true` 时使用 `X-Forwarded-For` 作为 Admin 登录限流键；仅应在可信反向代理后启用 |
@@ -178,10 +182,14 @@ curl -N -i \
 | `KIRO_CREDENTIAL_JSON_PATH` | 覆盖 JSON `credential_json_path` |
 | `KIRO_UPSTREAM_URL` | 覆盖模型上游 URL |
 | `KIRO_PROXY_URL` | 覆盖刷新客户端代理 URL |
+| `KIRO_TOKEN_ENDPOINT` | 覆盖 `token_endpoint`，只接受 `http`/`https` |
 | `KIRO_UPSTREAM_TIMEOUT_SECS` | 覆盖上游请求和刷新超时，必须大于 `0` |
 | `KIRO_REFRESH_EARLY_SECS` | 覆盖提前刷新秒数，不得为负 |
 | `KIRO_REFRESH_INTERVAL_SECS` | 覆盖后台刷新间隔，必须大于 `0` |
 | `KIRO_MODEL_CACHE_TTL_SECS` | 覆盖模型目录缓存 TTL，必须大于 `0` |
+| `KIRO_MAX_REQUEST_BODY_BYTES` | 覆盖请求体上限，必须大于 `0` |
+| `KIRO_MAX_UPSTREAM_BODY_BYTES` | 覆盖上游响应体上限，必须大于 `0` |
+| `KIRO_GRACEFUL_SHUTDOWN_TIMEOUT_SECS` | 覆盖优雅停机等待时间，必须大于 `0` |
 | `KIRO_ADMIN_ENABLED` | 启用或禁用 Admin 页面和 API |
 | `KIRO_ADMIN_SESSION_TTL_SECS` | 覆盖 Admin 会话 TTL，必须大于 `0` |
 | `KIRO_ADMIN_COOKIE_SECURE` | 是否设置 Admin Cookie 的 `Secure` 属性 |
@@ -212,7 +220,7 @@ curl -N -i \
 
 - `env`：从 `KIRO_ACCESS_TOKEN`、`KIRO_REFRESH_TOKEN` 或 `KIRO_API_KEY` 构造一个凭据。
 - `api_key`：只读取 `KIRO_API_KEY`，并使用配置中的区域和端点。
-- `json`：读取 `credential_json_path`。支持 snake_case/camelCase 字段；应提供单个凭据对象。
+- `json`：读取 `credential_json_path`。只接受单个凭据对象和规范 snake_case 字段：`auth_method`、`access_token`、`refresh_token`、`api_key`、`client_id`、`client_secret` 及其他文档字段；数组、camelCase、`token` 等未定义字段会拒绝。
 - `sqlite`：以只读模式打开 `credential_path`，读取受支持的 Kiro Token、设备注册和 profile 元数据。
 - `auto`：依次检查环境变量、已配置且存在的 JSON、已配置或默认位置的 SQLite。没有候选或发现多个候选都会拒绝启动，必须明确选择来源。
 
@@ -227,6 +235,8 @@ curl -N -i \
 切换到另一个端点；如果需要固定协议，请显式配置端点。
 
 非 API Key 凭据会在启动、每次模型请求以及后台定时任务中检查是否需要刷新。刷新使用单飞锁，成功后更新内存凭据。只要配置了 `credential_json_path`，刷新后的完整凭据就会以临时文件加重命名的方式原子写回该路径；不希望落盘时不要配置该字段。应将凭据 JSON 权限限制为仅服务用户可读写。
+
+规范 `auth_method` 值为 `api_key`、`social`、`oidc` 和 `refresh_token`；`unknown` 只用于内部解析状态，不能出现在外部凭据文件中。SQLite 中 Kiro CLI 历史 key 名（包括 `odic`）仅作为表 schema 读取，加载后的凭据统一为 `oidc`。
 
 ### SQLite 凭据验证
 
@@ -507,7 +517,11 @@ corepack pnpm@9.15.4 --dir admin-ui build
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
+cargo package --locked --allow-dirty
 SOURCE_DATE_EPOCH=0 ./scripts/verify-reproducible.sh
+cargo audit
+cargo deny --locked check
+docker build -t kiro-gateway:local .
 ```
 
 也可使用：

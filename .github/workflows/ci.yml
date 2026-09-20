@@ -21,7 +21,9 @@ jobs:
       - run: node --check admin-ui/src/build.mjs
       - run: corepack pnpm@9.15.4 --dir admin-ui build
       - run: test -s admin-ui/dist/index.html
-      - run: git diff --exit-code -- admin-ui/dist/index.html
+      - run: test -s admin-ui/dist/app.js
+      - run: test -s admin-ui/dist/styles.css
+      - run: git diff --exit-code -- admin-ui/dist
 
   rust:
     runs-on: ubuntu-24.04
