@@ -126,7 +126,7 @@ pub async fn messages(
             let event = match item {
                 Ok(event) => event,
                 Err(error) => {
-                    tracing::warn!(model = %model, error = %error, "Anthropic upstream stream failed");
+                    tracing::warn!(model = %model, error_class = "upstream", "Anthropic upstream stream failed");
                     yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":error.to_string()}}).to_string()));
                     yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
                     failed = true;
@@ -134,7 +134,7 @@ pub async fn messages(
                 }
             };
             if let InternalEvent::Error { message } = &event {
-                tracing::warn!(model = %model, message = %message, "Anthropic upstream returned an error event");
+                tracing::warn!(model = %model, error_class = "upstream", "Anthropic upstream returned an error event");
                 yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":message}}).to_string()));
                 yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
                 failed = true;

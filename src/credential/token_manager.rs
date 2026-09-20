@@ -164,8 +164,11 @@ impl TokenManager {
         tokio::spawn(async move {
             loop {
                 sleep(interval).await;
-                if let Err(error) = manager.ensure_fresh().await {
-                    tracing::warn!(error = %error, "background credential refresh failed");
+                if let Err(_error) = manager.ensure_fresh().await {
+                    tracing::warn!(
+                        error_class = "credential_refresh",
+                        "background credential refresh failed"
+                    );
                 }
             }
         })

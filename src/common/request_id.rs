@@ -1,4 +1,5 @@
 use axum::{extract::Request, middleware::Next, response::Response};
+use tracing::Instrument;
 use uuid::Uuid;
 
 pub async fn request_id(mut request: Request, next: Next) -> Response {
@@ -10,7 +11,8 @@ pub async fn request_id(mut request: Request, next: Next) -> Response {
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| Uuid::now_v7().to_string());
     request.extensions_mut().insert(request_id.clone());
-    let mut response = next.run(request).await;
+    let span = tracing::info_span!("http_request", request_id = %request_id);
+    let mut response = next.run(request).instrument(span).await;
     if let Ok(value) = request_id.parse() {
         response.headers_mut().insert("x-request-id", value);
     }

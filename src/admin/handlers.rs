@@ -30,7 +30,7 @@ pub async fn login(
     }
     let client_key = login_rate_limit_key(&headers, state.config.trust_forwarded_headers);
     if !state.sessions.allow_login(&client_key, state.config.admin.login_rate_limit_per_minute) {
-        return Err(AppError::Forbidden);
+        return Err(AppError::RateLimited);
     }
     if !constant_time_eq(&body.api_key, &state.config.admin_api_key) {
         return Err(AppError::Unauthorized);
