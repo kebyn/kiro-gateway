@@ -37,6 +37,54 @@ pub struct ResponsesError {
 }
 
 impl ResponsesRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("model must not be empty".into());
+        }
+        let validate_item = |item: &Value| -> Result<(), String> {
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    for field in ["call_id", "name"] {
+                        if item.get(field).and_then(Value::as_str).is_none() {
+                            return Err(format!("function_call requires {field}"));
+                        }
+                    }
+                }
+                Some("function_call_output") => {
+                    if item.get("call_id").and_then(Value::as_str).is_none() {
+                        return Err("function_call_output requires call_id".into());
+                    }
+                }
+                Some("message") => {
+                    if item.get("role").and_then(Value::as_str).is_none()
+                        || item.get("content").is_none()
+                    {
+                        return Err("message requires role and content".into());
+                    }
+                }
+                Some(other) => return Err(format!("unsupported Responses input type: {other}")),
+                None => {}
+            }
+            Ok(())
+        };
+        match &self.input {
+            Value::Array(items) => {
+                for item in items {
+                    validate_item(item)?;
+                }
+            }
+            Value::Object(item) => validate_item(&Value::Object(item.clone()))?,
+            _ => {}
+        }
+        for tool in &self.tools {
+            if tool.get("function").is_some() || tool.get("name").and_then(Value::as_str).is_none()
+            {
+                return Err("Responses tools must use the flat function shape".into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn into_internal(self, previous: Vec<InternalMessage>) -> InternalRequest {
         let mut messages = previous;
         let previous_len = messages.len();
@@ -236,6 +284,17 @@ mod tests {
         .unwrap();
         let internal = request.into_internal(Vec::new());
         assert!(internal.messages.is_empty() || internal.messages[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn validation_rejects_legacy_tool_call_id_and_nested_tool_shape() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"kiro",
+            "input":[{"type":"function_call_output","tool_call_id":"legacy","output":"x"}],
+            "tools":[{"type":"function","function":{"name":"lookup"}}]
+        }))
+        .unwrap();
+        assert!(request.validate().is_err());
     }
 
     #[test]
