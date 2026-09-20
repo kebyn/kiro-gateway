@@ -1,7 +1,7 @@
 use crate::{
     AppState,
     common::auth::{constant_time_eq, extract_api_key, is_safe_method},
-    error::AppError,
+    error::{AppError, Protocol, protocol_error_response},
 };
 use axum::{
     extract::{Request, State},
@@ -20,7 +20,16 @@ pub async fn client_api_key(
     {
         Ok(next.run(request).await)
     } else {
-        Err(AppError::Unauthorized)
+        let protocol = match request.uri().path() {
+            "/v1/messages" | "/v1/messages/count_tokens" => Some(Protocol::Anthropic),
+            "/v1/chat/completions" => Some(Protocol::ChatCompletions),
+            "/v1/responses" => Some(Protocol::Responses),
+            _ => None,
+        };
+        match protocol {
+            Some(protocol) => Ok(protocol_error_response(protocol, AppError::Unauthorized)),
+            None => Err(AppError::Unauthorized),
+        }
     }
 }
 

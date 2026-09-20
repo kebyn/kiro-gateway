@@ -82,8 +82,11 @@ impl TokenManager {
     }
 
     pub async fn validate_model(&self, model: &str) -> Result<(), AppError> {
-        let models = self.available_models().await.map_err(|error| {
-            tracing::warn!(error = %error, "model discovery failed while validating request");
+        let models = self.available_models().await.map_err(|_error| {
+            tracing::warn!(
+                error_class = "model_discovery",
+                "model discovery failed while validating request"
+            );
             AppError::BadRequest("no models are currently available".into())
         })?;
         if models.iter().any(|candidate| candidate.model_id == model) {

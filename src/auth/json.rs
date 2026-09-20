@@ -74,6 +74,9 @@ fn parse(value: CredentialFile) -> Result<Credential, AppError> {
             ));
         }
     };
+    if api_key.is_some() && !matches!(auth_method, AuthMethod::ApiKey) {
+        return Err(AppError::Credential("api_key credential must use auth_method api_key".into()));
+    }
     let credential = Credential {
         auth_method,
         access_token: api_key.or(access_token).map(SecretString::new),

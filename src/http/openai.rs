@@ -136,6 +136,12 @@ pub async fn chat_completions(
         }
         if failed { return; }
         let response = accumulator.finish();
+        tracing::debug!(
+            protocol = "openai_chat",
+            model = %model,
+            stream_end_status = if response.incomplete { "incomplete" } else { "completed" },
+            "OpenAI Chat stream completed"
+        );
         let finish = json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":chat_finish_reason(&response)}]});
         yield Ok(Event::default().data(finish.to_string()));
         yield Ok(Event::default().data("[DONE]"));
