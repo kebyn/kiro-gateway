@@ -1,6 +1,6 @@
 use crate::{
     auth::{AuthMethod, Credential},
-    endpoint::{EndpointPolicy, KiroEndpoint, endpoint_for},
+    endpoint::{EndpointAdapter, EndpointPolicy, endpoint_for},
     error::AppError,
     protocol::internal::{InternalEvent, InternalRequest, InternalResponse, Usage},
     transform::truncation::XmlLeakFilter,
@@ -22,39 +22,13 @@ pub type InternalEventStream = Pin<Box<dyn Stream<Item = Result<InternalEvent, A
 
 pub struct UpstreamClient {
     client: Client,
-    endpoint: EndpointSource,
+    endpoint_policy: EndpointPolicy,
+    upstream_url: Option<String>,
     max_body_bytes: usize,
 }
 
-#[derive(Clone)]
-enum EndpointSource {
-    Dynamic { policy: EndpointPolicy, upstream_url: Option<String> },
-}
-
-enum ResolvedEndpoint {
-    Owned(Box<dyn KiroEndpoint>),
-}
-
-impl ResolvedEndpoint {
-    fn as_ref(&self) -> &dyn KiroEndpoint {
-        match self {
-            Self::Owned(endpoint) => endpoint.as_ref(),
-        }
-    }
-}
-
-impl EndpointSource {
-    fn resolve(&self, credential: &Credential) -> ResolvedEndpoint {
-        match self {
-            Self::Dynamic { policy, upstream_url } => ResolvedEndpoint::Owned(endpoint_for(
-                policy.resolve(&credential.endpoint),
-                upstream_url.as_deref(),
-            )),
-        }
-    }
-}
-
 impl UpstreamClient {
+    #[allow(dead_code)]
     pub fn with_policy(
         client: Client,
         policy: EndpointPolicy,
@@ -69,7 +43,7 @@ impl UpstreamClient {
         upstream_url: Option<String>,
         max_body_bytes: usize,
     ) -> Self {
-        Self { client, endpoint: EndpointSource::Dynamic { policy, upstream_url }, max_body_bytes }
+        Self { client, endpoint_policy: policy, upstream_url, max_body_bytes }
     }
 
     /// Starts a live upstream event stream. The request is sent only when the
@@ -82,14 +56,18 @@ impl UpstreamClient {
         credential: &Credential,
     ) -> Result<InternalEventStream, AppError> {
         let client = self.client.clone();
-        let endpoint = self.endpoint.clone();
+        let endpoint_policy = self.endpoint_policy;
+        let upstream_url = self.upstream_url.clone();
         let max_body_bytes = self.max_body_bytes;
         let request = request.clone();
         let credential = credential.clone();
         Ok(Box::pin(stream! {
             for attempt in 0..=1_u8 {
-                let resolved_endpoint = endpoint.resolve(&credential);
-                let response = match send_once(&client, resolved_endpoint.as_ref(), &request, &credential).await {
+                let endpoint = endpoint_for(
+                    endpoint_policy.resolve(&credential.endpoint),
+                    upstream_url.as_deref(),
+                );
+                let response = match send_once(&client, &endpoint, &request, &credential).await {
                     Ok(response) => response,
                     Err(SendOnceError::Transport(_)) if attempt == 0 => continue,
                     Err(error) => {
@@ -256,7 +234,7 @@ impl SendOnceError {
 
 async fn send_once(
     client: &Client,
-    endpoint: &dyn KiroEndpoint,
+    endpoint: &EndpointAdapter,
     request: &InternalRequest,
     credential: &Credential,
 ) -> Result<reqwest::Response, SendOnceError> {
@@ -294,7 +272,7 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
     let body: Value = serde_json::from_slice(body)
         .map_err(|error| AppError::Upstream(format!("invalid JSON upstream response: {error}")))?;
     let mut nodes = Vec::new();
-    collect_json_nodes(&body, &mut nodes, 0);
+    collect_json_nodes(&body, &mut nodes, 0).map_err(|error| AppError::Integrity(error.into()))?;
     tracing::debug!(shape = %json_shape(&body), "received JSON upstream response shape");
     if let Some(error) = body.get("error") {
         let message = error
@@ -433,24 +411,35 @@ fn json_error_message(nodes: &[&Value]) -> Option<String> {
     })
 }
 
-fn collect_json_nodes<'a>(value: &'a Value, nodes: &mut Vec<&'a Value>, depth: usize) {
-    nodes.push(value);
-    if depth >= 6 {
-        return;
+const MAX_JSON_DEPTH: usize = 8;
+const MAX_JSON_NODES: usize = 512;
+
+fn collect_json_nodes<'a>(
+    value: &'a Value,
+    nodes: &mut Vec<&'a Value>,
+    depth: usize,
+) -> Result<(), &'static str> {
+    if depth > MAX_JSON_DEPTH {
+        return Err("upstream JSON nesting exceeds configured depth");
     }
+    if nodes.len() >= MAX_JSON_NODES {
+        return Err("upstream JSON contains too many nodes");
+    }
+    nodes.push(value);
     match value {
         Value::Object(object) => {
             for child in object.values() {
-                collect_json_nodes(child, nodes, depth + 1);
+                collect_json_nodes(child, nodes, depth + 1)?;
             }
         }
         Value::Array(items) => {
-            for child in items.iter().take(32) {
-                collect_json_nodes(child, nodes, depth + 1);
+            for child in items.iter().take(64) {
+                collect_json_nodes(child, nodes, depth + 1)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn has_explicit_empty_response(nodes: &[&Value]) -> bool {
@@ -543,6 +532,8 @@ impl InternalEventAccumulator {
     }
 
     pub fn finish(mut self) -> InternalResponse {
+        let tail = self.xml_filter.finish();
+        self.output.text.push_str(&tail);
         finish_stream_response(self.output, &mut self.tools)
     }
 }

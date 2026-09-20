@@ -6,6 +6,9 @@ use crate::{
 };
 use uuid::Uuid;
 
+pub const CLI_USER_AGENT: &str = "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI";
+pub const CLI_USER_AGENT_WITH_VERSION: &str = "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-0.9.2 app/AmazonQ-For-CLI";
+
 #[derive(Clone, Debug)]
 pub struct CliEndpoint {
     upstream_url: Option<String>,
@@ -70,22 +73,13 @@ impl KiroEndpoint for CliEndpoint {
             .header("x-amzn-codewhisperer-optout", "false")
             .header("x-amzn-kiro-client-attribution", "unrecognized")
             .header("x-kiro-attempt", "1;max=3")
-            .header(
-                "x-amz-user-agent",
-                "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI",
-            )
-            .header(
-                "user-agent",
-                "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-0.9.2 app/AmazonQ-For-CLI",
-            )
+            .header("x-amz-user-agent", CLI_USER_AGENT)
+            .header("user-agent", CLI_USER_AGENT_WITH_VERSION)
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
     }
-    fn classify_error(&self, status: reqwest::StatusCode, body: &str) -> AppError {
-        AppError::Upstream(format!(
-            "CLI endpoint returned {status}: {}",
-            body.chars().take(256).collect::<String>()
-        ))
+    fn classify_error(&self, status: reqwest::StatusCode, _body: &str) -> AppError {
+        AppError::Upstream(format!("CLI endpoint returned {status}"))
     }
 }
 

@@ -68,10 +68,58 @@ pub trait KiroEndpoint: Send + Sync {
     fn classify_error(&self, status: reqwest::StatusCode, body: &str) -> AppError;
 }
 
-pub fn endpoint_for(kind: EndpointKind, upstream_url: Option<&str>) -> Box<dyn KiroEndpoint> {
+#[derive(Clone, Debug)]
+pub enum EndpointAdapter {
+    Ide(ide::IdeEndpoint),
+    Cli(cli::CliEndpoint),
+}
+
+impl EndpointAdapter {
+    pub fn api_url(&self, credential: &Credential) -> String {
+        match self {
+            Self::Ide(endpoint) => endpoint.api_url(credential),
+            Self::Cli(endpoint) => endpoint.api_url(credential),
+        }
+    }
+
+    pub fn transform_api_body(
+        &self,
+        request: &InternalRequest,
+        credential: &Credential,
+    ) -> serde_json::Value {
+        match self {
+            Self::Ide(endpoint) => endpoint.transform_api_body(request, credential),
+            Self::Cli(endpoint) => endpoint.transform_api_body(request, credential),
+        }
+    }
+
+    pub fn decorate_api(
+        &self,
+        builder: reqwest::RequestBuilder,
+        credential: &Credential,
+    ) -> reqwest::RequestBuilder {
+        match self {
+            Self::Ide(endpoint) => endpoint.decorate_api(builder, credential),
+            Self::Cli(endpoint) => endpoint.decorate_api(builder, credential),
+        }
+    }
+
+    pub fn classify_error(&self, status: reqwest::StatusCode, body: &str) -> AppError {
+        match self {
+            Self::Ide(endpoint) => endpoint.classify_error(status, body),
+            Self::Cli(endpoint) => endpoint.classify_error(status, body),
+        }
+    }
+}
+
+pub fn endpoint_for(kind: EndpointKind, upstream_url: Option<&str>) -> EndpointAdapter {
     match kind {
-        EndpointKind::Cli => Box::new(cli::CliEndpoint::new(upstream_url.map(str::to_owned))),
-        EndpointKind::Ide => Box::new(ide::IdeEndpoint::new(upstream_url.map(str::to_owned))),
+        EndpointKind::Cli => {
+            EndpointAdapter::Cli(cli::CliEndpoint::new(upstream_url.map(str::to_owned)))
+        }
+        EndpointKind::Ide => {
+            EndpointAdapter::Ide(ide::IdeEndpoint::new(upstream_url.map(str::to_owned)))
+        }
     }
 }
 
