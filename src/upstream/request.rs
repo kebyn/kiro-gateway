@@ -23,6 +23,7 @@ pub type InternalEventStream = Pin<Box<dyn Stream<Item = Result<InternalEvent, A
 pub struct UpstreamClient {
     client: Client,
     endpoint: EndpointSource,
+    max_body_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -59,7 +60,16 @@ impl UpstreamClient {
         policy: EndpointPolicy,
         upstream_url: Option<String>,
     ) -> Self {
-        Self { client, endpoint: EndpointSource::Dynamic { policy, upstream_url } }
+        Self::with_policy_and_limit(client, policy, upstream_url, 16 * 1024 * 1024)
+    }
+
+    pub fn with_policy_and_limit(
+        client: Client,
+        policy: EndpointPolicy,
+        upstream_url: Option<String>,
+        max_body_bytes: usize,
+    ) -> Self {
+        Self { client, endpoint: EndpointSource::Dynamic { policy, upstream_url }, max_body_bytes }
     }
 
     /// Starts a live upstream event stream. The request is sent only when the
@@ -73,6 +83,7 @@ impl UpstreamClient {
     ) -> Result<InternalEventStream, AppError> {
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
+        let max_body_bytes = self.max_body_bytes;
         let request = request.clone();
         let credential = credential.clone();
         Ok(Box::pin(stream! {
@@ -97,6 +108,13 @@ impl UpstreamClient {
                     .and_then(|value| value.to_str().ok())
                     .is_some_and(|value| value.contains("json"));
                 if is_json {
+                    if response
+                        .content_length()
+                        .is_some_and(|length| length > max_body_bytes as u64)
+                    {
+                        yield Err(AppError::Upstream("upstream response exceeds configured body limit".into()));
+                        return;
+                    }
                     let body = match response.bytes().await {
                         Ok(body) => body,
                         Err(_) if attempt == 0 => continue,
@@ -105,6 +123,10 @@ impl UpstreamClient {
                             return;
                         }
                     };
+                    if body.len() > max_body_bytes {
+                        yield Err(AppError::Upstream("upstream response exceeds configured body limit".into()));
+                        return;
+                    }
                     match json_events(&body) {
                         Ok(events) => {
                             for event in events {
@@ -122,6 +144,7 @@ impl UpstreamClient {
                 let mut bytes = response.bytes_stream();
                 let mut decoder = EventStreamDecoder::new();
                 let mut integrity = StreamIntegrity { attempts: attempt, ..Default::default() };
+                let mut body_bytes = 0_usize;
                 let mut event_count = 0_usize;
                 let mut retry = false;
                 while let Some(chunk) = bytes.next().await {
@@ -137,6 +160,11 @@ impl UpstreamClient {
                             return;
                         }
                     };
+                    body_bytes = body_bytes.saturating_add(chunk.len());
+                    if body_bytes > max_body_bytes {
+                        yield Err(AppError::Upstream("upstream event stream exceeds configured body limit".into()));
+                        return;
+                    }
                     let messages = match decoder.push(&chunk) {
                         Ok(messages) => messages,
                         Err(error) => {

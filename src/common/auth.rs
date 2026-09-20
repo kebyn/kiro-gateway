@@ -1,7 +1,13 @@
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 pub fn constant_time_eq(left: &str, right: &str) -> bool {
-    left.as_bytes().ct_eq(right.as_bytes()).into()
+    // Hashing first gives both inputs the same fixed-size representation. The
+    // comparison therefore does not short-circuit on either length or the
+    // first differing byte.
+    let left_digest = Sha256::digest(left.as_bytes());
+    let right_digest = Sha256::digest(right.as_bytes());
+    left_digest.as_slice().ct_eq(right_digest.as_slice()).into()
 }
 
 pub fn extract_api_key(headers: &http::HeaderMap) -> Option<String> {
@@ -34,5 +40,8 @@ mod tests {
         assert_eq!(extract_api_key(&headers).as_deref(), Some("xyz"));
         assert!(constant_time_eq("same", "same"));
         assert!(!constant_time_eq("same", "other"));
+        assert!(!constant_time_eq("", "x"));
+        assert!(!constant_time_eq("short", &"x".repeat(100_000)));
+        assert!(constant_time_eq("x".repeat(100_000).as_str(), "x".repeat(100_000).as_str()));
     }
 }

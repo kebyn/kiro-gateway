@@ -28,6 +28,7 @@ pub struct TokenManager {
     client: Client,
     early_secs: i64,
     timeout: Duration,
+    token_endpoint: Option<String>,
     persistence_path: Option<std::path::PathBuf>,
     model_catalog: Arc<ModelCatalog>,
 }
@@ -52,6 +53,7 @@ impl TokenManager {
             client,
             early_secs: config.refresh_early_secs,
             timeout: Duration::from_secs(config.upstream_timeout_secs),
+            token_endpoint: config.token_endpoint.clone(),
             persistence_path: config
                 .credential_json_path
                 .as_ref()
@@ -118,7 +120,12 @@ impl TokenManager {
             let mut credential = self.credential();
             let result = timeout(
                 self.timeout,
-                auth::refresh::refresh(&self.client, &mut credential, self.timeout),
+                auth::refresh::refresh(
+                    &self.client,
+                    &mut credential,
+                    self.timeout,
+                    self.token_endpoint.as_deref(),
+                ),
             )
             .await
             .map_err(|_| AppError::Upstream("token refresh timed out".into()))?;

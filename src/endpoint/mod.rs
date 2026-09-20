@@ -171,7 +171,7 @@ pub fn conversation_body(
         request.conversation_id.clone().unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
     let state = serde_json::json!({"conversationId":conversation_id,"history":history,"currentMessage":current,"chatTriggerType":"MANUAL","agentTaskType":"vibe"});
     let mut body = serde_json::json!({"conversationState":state});
-    if !matches!(credential.auth_method, AuthMethod::Sso) {
+    if !matches!(credential.auth_method, AuthMethod::Oidc) {
         if let Some(profile_arn) = &credential.profile_arn {
             body["profileArn"] = serde_json::Value::String(profile_arn.clone());
         }

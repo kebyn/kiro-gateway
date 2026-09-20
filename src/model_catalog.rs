@@ -280,7 +280,7 @@ mod tests {
             format!("http://{address}"),
         );
         let credential = Credential {
-            auth_method: AuthMethod::Sso,
+            auth_method: AuthMethod::Oidc,
             access_token: Some(SecretString::new("token")),
             profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/test".into()),
             ..Default::default()
@@ -319,7 +319,7 @@ mod tests {
             format!("http://{address}"),
         );
         let credential = Credential {
-            auth_method: AuthMethod::Sso,
+            auth_method: AuthMethod::Oidc,
             access_token: Some(SecretString::new("token")),
             ..Default::default()
         };
@@ -356,7 +356,7 @@ mod tests {
             format!("http://{address}"),
         );
         let credential = Credential {
-            auth_method: AuthMethod::Sso,
+            auth_method: AuthMethod::Oidc,
             access_token: Some(SecretString::new("token")),
             ..Default::default()
         };
@@ -391,7 +391,7 @@ mod tests {
             format!("http://{address}"),
         );
         let credential = Credential {
-            auth_method: AuthMethod::Sso,
+            auth_method: AuthMethod::Oidc,
             access_token: Some(SecretString::new("token")),
             ..Default::default()
         };
@@ -431,7 +431,7 @@ mod tests {
             format!("http://{address}"),
         );
         let credential = Credential {
-            auth_method: AuthMethod::Sso,
+            auth_method: AuthMethod::Oidc,
             access_token: Some(SecretString::new("token")),
             ..Default::default()
         };
