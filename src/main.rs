@@ -22,6 +22,7 @@ use config::AppConfig;
 use credential::TokenManager;
 use response_store::ResponseStore;
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::oneshot;
 
 #[derive(Debug, Parser)]
 #[command(name = "kiro-gateway", version, about = "Single-tenant Kiro API gateway")]
@@ -59,12 +60,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upstream: build_upstream(&config, client),
         sessions: Default::default(),
     };
-    let _refresh_task =
+    let refresh_task =
         token_manager.spawn_refresh_task(Duration::from_secs(config.refresh_interval_secs));
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await?;
     tracing::info!("kiro-gateway listening on {}:{}", config.host, config.port);
-    axum::serve(listener, http::router::router(state)).await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = axum::serve(listener, http::router::router(state))
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => result,
+        _ = shutdown_signal() => {
+            let _ = shutdown_tx.send(());
+            match tokio::time::timeout(
+                Duration::from_secs(config.graceful_shutdown_timeout_secs),
+                &mut server,
+            ).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!("graceful shutdown timed out; active streams were cancelled");
+                    Ok(())
+                }
+            }
+        }
+    };
+    refresh_task.abort();
+    let _ = refresh_task.await;
+    result?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(signal) => signal,
+            Err(error) => {
+                tracing::warn!(%error, "failed to install SIGTERM handler; falling back to Ctrl-C");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn init_tracing(json: bool) {

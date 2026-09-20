@@ -177,4 +177,18 @@ mod tests {
         let _store = ResponseStore::open(&path).unwrap();
         assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
     }
+
+    #[test]
+    fn sqlite_uses_wal_and_busy_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("responses.sqlite3");
+        let _store = ResponseStore::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let journal: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        let synchronous: i64 =
+            connection.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(journal.to_ascii_lowercase(), "wal");
+        assert!(synchronous >= 1);
+    }
 }

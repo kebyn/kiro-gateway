@@ -20,6 +20,7 @@ pub struct SessionStore {
 }
 impl SessionStore {
     pub fn create(&self, ttl: Duration) -> Session {
+        self.cleanup_expired();
         let mut rng = rand::rng();
         let token: String =
             (&mut rng).sample_iter(&Alphanumeric).take(48).map(char::from).collect();
@@ -33,15 +34,18 @@ impl SessionStore {
     pub fn get(&self, token: &str) -> Option<Session> {
         let now = Instant::now();
         let mut sessions = self.sessions.write();
+        sessions.retain(|_, session| session.expires_at > now);
         let session = sessions.get(token).cloned();
         match session {
             Some(session) if session.expires_at > now => Some(session),
-            Some(_) => {
-                sessions.remove(token);
-                None
-            }
             None => None,
+            Some(_) => None,
         }
+    }
+
+    pub fn cleanup_expired(&self) {
+        let now = Instant::now();
+        self.sessions.write().retain(|_, session| session.expires_at > now);
     }
     pub fn remove(&self, token: &str) {
         self.sessions.write().remove(token);

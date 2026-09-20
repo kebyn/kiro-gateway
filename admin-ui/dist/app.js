@@ -1,18 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
-
-const root = resolve(new URL('.', import.meta.url).pathname, '..');
-const output = resolve(root, 'dist');
-await mkdir(output, { recursive: true });
-
-const html = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kiro Gateway Admin</title>
-<link rel="stylesheet" href="/admin/styles.css"></head>
-<body><main><h1>Kiro Gateway Admin</h1><form id="login"><label for="key">Admin API key</label><input id="key" type="password" autocomplete="current-password" required><button>Sign in</button></form><p id="status">Signed out</p><p id="error" class="error" role="alert"></p><section id="panel" hidden><button id="refresh">Refresh credential</button> <button id="logout">Sign out</button><pre id="credential"></pre></section></main><script type="module" src="/admin/app.js"></script></body></html>`;
-
-const css = `body{font:16px system-ui;margin:2rem;max-width:60rem}main{display:grid;gap:1rem}form{display:flex;gap:.5rem;align-items:center}input,button{padding:.55rem}pre{background:#f5f5f5;padding:1rem;overflow:auto;white-space:pre-wrap}.error{color:#b00020}`;
-
-const js = `let csrfToken='';
+let csrfToken='';
 const loginForm=document.querySelector('#login');
 const key=document.querySelector('#key');
 const status=document.querySelector('#status');
@@ -26,8 +12,4 @@ const loadSession=async()=>{try{const response=await request('/admin/auth/sessio
 loginForm.addEventListener('submit',async event=>{event.preventDefault();showError();try{await request('/admin/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:key.value})});key.value='';await loadSession();}catch(cause){showError(cause.message);}});
 document.querySelector('#refresh').addEventListener('click',async()=>{try{await request('/admin/credential/refresh',{method:'POST'});await loadCredential();}catch(cause){showError(cause.message);}});
 document.querySelector('#logout').addEventListener('click',async()=>{try{await request('/admin/auth/logout',{method:'POST'});await loadSession();}catch(cause){showError(cause.message);}});
-loadSession();`;
-
-await writeFile(resolve(output, 'index.html'), html);
-await writeFile(resolve(output, 'styles.css'), css);
-await writeFile(resolve(output, 'app.js'), js);
+loadSession();

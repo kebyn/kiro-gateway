@@ -33,6 +33,8 @@ pub fn router(state: AppState) -> Router {
         let admin_routes = admin::router::router(state.clone());
         router = router
             .route("/admin", get(crate::admin_ui::index))
+            .route("/admin/app.js", get(crate::admin_ui::app_js))
+            .route("/admin/styles.css", get(crate::admin_ui::styles_css))
             .nest("/admin", admin_routes.clone())
             .nest("/api/admin", admin_routes);
     }
@@ -50,8 +52,8 @@ pub async fn health(State(_state): State<AppState>) -> impl IntoResponse {
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
     let models = match state.token_manager.available_models().await {
         Ok(models) => models,
-        Err(error) => {
-            tracing::warn!(error = %error, "model discovery failed");
+        Err(_error) => {
+            tracing::warn!(error_class = "model_discovery", "model discovery failed");
             Vec::new()
         }
     };
@@ -146,11 +148,31 @@ mod tests {
             upstream: build_upstream(&config, reqwest::Client::new()),
             sessions: Default::default(),
         };
-        let response = router(state)
+        let app = router(state);
+        let response = app
+            .clone()
             .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_SECURITY_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some(
+                "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+            ),
+        );
+        let asset = app
+            .oneshot(Request::builder().uri("/admin/app.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(
+            asset.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
     }
 
     #[tokio::test]
@@ -232,5 +254,38 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json, serde_json::json!({"object":"list","data":[]}));
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_is_enforced_before_json_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            max_request_body_bytes: 16,
+            response_store_path: directory.path().join("responses.sqlite3").display().to_string(),
+            ..Default::default()
+        };
+        let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        let state = AppState {
+            config: Arc::new(config.clone()),
+            token_manager: Arc::new(TokenManager::new(&config, credential).unwrap()),
+            responses: ResponseStore::open(&config.response_store_path).unwrap(),
+            upstream: build_upstream(&config, reqwest::Client::new()),
+            sessions: Default::default(),
+        };
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "client")
+                    .header("content-type", "application/json")
+                    .body(Body::from("x".repeat(128)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
