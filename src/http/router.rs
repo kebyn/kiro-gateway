@@ -362,4 +362,41 @@ mod tests {
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "authentication_error");
     }
+
+    #[tokio::test]
+    async fn admin_login_rate_limit_returns_429() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            admin: AdminConfig {
+                login_rate_limit_per_minute: 1,
+                cookie_secure: false,
+                ..Default::default()
+            },
+            response_store_path: directory.path().join("responses.sqlite3").display().to_string(),
+            ..Default::default()
+        };
+        let credential = Credential { auth_method: AuthMethod::ApiKey, ..Default::default() };
+        let state = AppState {
+            config: Arc::new(config.clone()),
+            token_manager: Arc::new(TokenManager::new(&config, credential).unwrap()),
+            responses: ResponseStore::open(&config.response_store_path).unwrap(),
+            upstream: build_upstream(&config, reqwest::Client::new()),
+            sessions: Default::default(),
+        };
+        let app = router(state);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"api_key":"admin"}"#))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+        let second = app.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 }
