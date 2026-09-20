@@ -270,8 +270,9 @@ async fn send_once(
         .map_err(|error| SendOnceError::Transport(error.to_string()))?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(SendOnceError::Application(endpoint.classify_error(status, &body)));
+        // Do not retain or log an upstream error body; the protocol adapters
+        // expose only a classified, sanitized error.
+        return Err(SendOnceError::Application(endpoint.classify_error(status, "")));
     }
     Ok(response)
 }
@@ -1029,6 +1030,17 @@ mod tests {
             crate::error::AppError::Integrity(message)
                 if message.contains("unrecognized JSON upstream response shape")
         ));
+    }
+
+    #[test]
+    fn rejects_json_that_exceeds_node_depth_budget() {
+        let mut value = serde_json::json!({"content":"ok"});
+        for _ in 0..12 {
+            value = serde_json::json!({"nested": value});
+        }
+        let body = serde_json::to_vec(&value).unwrap();
+        let error = json_events(&body).expect_err("deep upstream JSON must be rejected");
+        assert!(error.to_string().contains("nesting"));
     }
 
     #[test]

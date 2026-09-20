@@ -21,5 +21,9 @@
   "model_cache_ttl_secs": 300,
   "response_store_path": "kiro-gateway.sqlite3",
   "upstream_url": null,
-  "proxy_url": null
+  "proxy_url": null,
+  "token_endpoint": null,
+  "max_request_body_bytes": 8388608,
+  "max_upstream_body_bytes": 16777216,
+  "graceful_shutdown_timeout_secs": 30
 }

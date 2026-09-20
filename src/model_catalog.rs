@@ -49,16 +49,23 @@ struct CacheEntry {
 pub struct ModelCatalog {
     client: Client,
     ttl: Duration,
+    max_body_bytes: usize,
     base_url: Option<String>,
     cache: Arc<RwLock<Option<CacheEntry>>>,
     refresh_lock: Arc<Mutex<()>>,
 }
 
 impl ModelCatalog {
+    #[allow(dead_code)]
     pub fn new(client: Client, ttl: Duration) -> Self {
+        Self::new_with_limit(client, ttl, 16 * 1024 * 1024)
+    }
+
+    pub fn new_with_limit(client: Client, ttl: Duration, max_body_bytes: usize) -> Self {
         Self {
             client,
             ttl,
+            max_body_bytes,
             base_url: None,
             cache: Arc::new(RwLock::new(None)),
             refresh_lock: Arc::new(Mutex::new(())),
@@ -149,9 +156,22 @@ impl ModelCatalog {
             })?;
             let status = response.status();
             if status.is_success() {
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > self.max_body_bytes as u64)
+                {
+                    return Err(AppError::Upstream(
+                        "model discovery response exceeds configured body limit".into(),
+                    ));
+                }
                 let body = response.bytes().await.map_err(|error| {
                     AppError::Upstream(format!("model discovery response failed: {error}"))
                 })?;
+                if body.len() > self.max_body_bytes {
+                    return Err(AppError::Upstream(
+                        "model discovery response exceeds configured body limit".into(),
+                    ));
+                }
                 let parsed = serde_json::from_slice::<ListAvailableModelsResponse>(&body).map_err(
                     |error| {
                         AppError::Upstream(format!("invalid model discovery response: {error}"))
@@ -200,6 +220,7 @@ impl ModelCatalog {
         Self {
             client,
             ttl,
+            max_body_bytes: 16 * 1024 * 1024,
             base_url: Some(base_url),
             cache: Arc::new(RwLock::new(None)),
             refresh_lock: Arc::new(Mutex::new(())),

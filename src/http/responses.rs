@@ -66,6 +66,7 @@ pub async fn create(
     }
     state.token_manager.validate_model(&internal.model).await?;
     tracing::debug!(
+        protocol = "openai_responses",
         model = %internal.model,
         stream = internal.stream,
         store,

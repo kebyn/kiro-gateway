@@ -95,14 +95,14 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn from_env_and_optional_file(path: Option<&Path>) -> Result<Self, AppError> {
         let mut config = match path {
-            Some(path) if path.exists() => {
+            Some(path) => {
                 let text = fs::read_to_string(path).map_err(|error| {
                     AppError::Config(format!("cannot read {}: {error}", path.display()))
                 })?;
                 serde_json::from_str(&text)
                     .map_err(|error| AppError::Config(format!("invalid config JSON: {error}")))?
             }
-            _ => Self::default(),
+            None => Self::default(),
         };
         config.apply_env()?;
         config.validate()?;
@@ -374,5 +374,12 @@ mod tests {
         config.token_endpoint = None;
         config.max_request_body_bytes = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn an_explicit_missing_config_path_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.json");
+        assert!(AppConfig::from_env_and_optional_file(Some(&path)).is_err());
     }
 }

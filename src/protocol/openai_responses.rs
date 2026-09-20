@@ -103,13 +103,11 @@ fn append_item(messages: &mut Vec<InternalMessage>, item: &Value, previous_len: 
             messages.push(message);
             true
         }
-        Some("message") | None if item.get("role").and_then(Value::as_str).is_some() => {
+        Some("message") if item.get("role").and_then(Value::as_str).is_some() => {
             let role = item.get("role").and_then(Value::as_str).unwrap();
-            let content = item
-                .get("content")
-                .cloned()
-                .or_else(|| item.get("text").cloned())
-                .unwrap_or(Value::Null);
+            let Some(content) = item.get("content").cloned() else {
+                return false;
+            };
             let mut message = InternalMessage::new(role, content);
             message.name = item.get("name").and_then(Value::as_str).map(ToOwned::to_owned);
             messages.push(message);

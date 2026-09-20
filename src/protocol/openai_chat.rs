@@ -33,14 +33,13 @@ pub struct ChatMessage {
 #[derive(Debug, Deserialize)]
 pub struct ChatToolCall {
     pub id: String,
-    #[serde(default)]
-    pub r#type: Option<String>,
+    pub r#type: String,
     pub function: ChatFunctionCall,
 }
 #[derive(Debug, Deserialize)]
 pub struct ChatFunctionCall {
     pub name: String,
-    pub arguments: Value,
+    pub arguments: String,
 }
 #[derive(Debug, Deserialize)]
 pub struct ChatTool {
@@ -90,9 +89,9 @@ fn parse_message(message: ChatMessage) -> InternalMessage {
     parsed.tool_calls = message
         .tool_calls
         .into_iter()
-        .filter(|call| call.r#type.as_deref().is_none_or(|kind| kind == "function"))
+        .filter(|call| call.r#type == "function")
         .map(|call| {
-            let (arguments, complete) = parse_arguments(call.function.arguments);
+            let (arguments, complete) = parse_arguments(Value::String(call.function.arguments));
             InternalToolCall { id: call.id, name: call.function.name, arguments, complete }
         })
         .collect();

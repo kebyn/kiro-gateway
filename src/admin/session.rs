@@ -51,6 +51,7 @@ impl SessionStore {
         self.sessions.write().remove(token);
     }
     pub fn allow_login(&self, key: &str, limit: u32) -> bool {
+        self.cleanup_expired();
         let now = Instant::now();
         let mut attempts = self.attempts.write();
         attempts.retain(|_, (started, _)| now.duration_since(*started) < Duration::from_secs(60));

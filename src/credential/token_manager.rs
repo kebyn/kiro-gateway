@@ -42,9 +42,10 @@ impl TokenManager {
                 .proxy(reqwest::Proxy::all(proxy).map_err(|e| AppError::Config(e.to_string()))?);
         }
         let client = builder.build().map_err(|e| AppError::Config(e.to_string()))?;
-        let model_catalog = Arc::new(ModelCatalog::new(
+        let model_catalog = Arc::new(ModelCatalog::new_with_limit(
             client.clone(),
             Duration::from_secs(config.model_cache_ttl_secs),
+            config.max_upstream_body_bytes,
         ));
         Ok(Self {
             credential: Arc::new(RwLock::new(credential)),
