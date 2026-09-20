@@ -65,6 +65,7 @@ impl TokenManager {
     }
     pub fn replace_credential(&self, credential: Credential) {
         *self.credential.write() = credential;
+        self.model_catalog.invalidate();
     }
     pub fn status(&self) -> CredentialStatus {
         self.credential.read().status(Utc::now(), self.early_secs)
@@ -161,5 +162,40 @@ impl TokenManager {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenManager;
+    use crate::{
+        auth::{AuthMethod, Credential},
+        config::AppConfig,
+        model_catalog::ModelInfo,
+    };
+
+    #[test]
+    fn replacing_credential_invalidates_cached_models() {
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            ..Default::default()
+        };
+        let manager = TokenManager::new(
+            &config,
+            Credential { auth_method: AuthMethod::ApiKey, ..Default::default() },
+        )
+        .unwrap();
+        manager.seed_models_for_tests(vec![ModelInfo {
+            model_id: "old-model".into(),
+            model_name: None,
+            description: None,
+            token_limits: None,
+        }]);
+        assert!(manager.model_catalog.has_cached_result());
+
+        manager.replace_credential(Credential::default());
+
+        assert!(!manager.model_catalog.has_cached_result());
     }
 }

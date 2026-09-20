@@ -181,6 +181,15 @@ impl ModelCatalog {
         Some(entry.result.clone().map_err(AppError::Upstream))
     }
 
+    pub(crate) fn invalidate(&self) {
+        *self.cache.write() = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cached_result(&self) -> bool {
+        self.cached_result().is_some()
+    }
+
     #[cfg(test)]
     pub fn seed(&self, models: Vec<ModelInfo>) {
         *self.cache.write() = Some(CacheEntry { fetched_at: Instant::now(), result: Ok(models) });
