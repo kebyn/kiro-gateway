@@ -24,21 +24,21 @@ fn parse(value: Value) -> Result<Credential, AppError> {
             object.get(*n).and_then(Value::as_str).filter(|v| !v.is_empty()).map(ToOwned::to_owned)
         })
     };
-    let auth_method = string(&["auth_method", "authMethod", "type"])
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            if string(&["api_key", "kiro_api_key"]).is_some() {
-                AuthMethod::ApiKey
-            } else {
-                AuthMethod::Unknown
-            }
-        });
+    let api_key = string(&["api_key", "apiKey", "kiro_api_key", "kiroApiKey"]);
+    let auth_method =
+        string(&["auth_method", "authMethod", "type"]).and_then(|v| v.parse().ok()).unwrap_or_else(
+            || {
+                if api_key.is_some() { AuthMethod::ApiKey } else { AuthMethod::Unknown }
+            },
+        );
     let expires_at = string(&["expires_at", "expiresAt"])
         .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
         .map(|v| v.with_timezone(&chrono::Utc));
     Ok(Credential {
         auth_method,
-        access_token: string(&["access_token", "accessToken", "token"]).map(SecretString::new),
+        access_token: string(&["access_token", "accessToken", "token"])
+            .or(api_key)
+            .map(SecretString::new),
         refresh_token: string(&["refresh_token", "refreshToken"]).map(SecretString::new),
         client_id: string(&["client_id", "clientId"]).map(SecretString::new),
         client_secret: string(&["client_secret", "clientSecret"]).map(SecretString::new),
@@ -52,4 +52,23 @@ fn parse(value: Value) -> Result<Credential, AppError> {
         expires_at,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+    use crate::auth::AuthMethod;
+    use serde_json::json;
+
+    #[test]
+    fn loads_api_key_aliases_as_the_access_token() {
+        for key in ["api_key", "apiKey", "kiro_api_key", "kiroApiKey"] {
+            let credential = parse(json!({key: "upstream-secret"})).unwrap();
+            assert_eq!(credential.auth_method, AuthMethod::ApiKey);
+            assert_eq!(
+                credential.access_token.as_ref().map(|value| value.expose_secret()),
+                Some("upstream-secret")
+            );
+        }
+    }
 }
