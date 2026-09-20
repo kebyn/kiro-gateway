@@ -1,7 +1,7 @@
 SHELL := /bin/sh
 export SOURCE_DATE_EPOCH ?= 0
 
-.PHONY: fmt frontend check test build reproducible release package docker
+.PHONY: fmt frontend check test build reproducible release package docker audit deny
 fmt:
 	cargo fmt --all
 
@@ -32,3 +32,9 @@ package:
 
 docker:
 	docker build -t kiro-gateway:local .
+
+audit:
+	cargo audit
+
+deny:
+	cargo deny --locked check
