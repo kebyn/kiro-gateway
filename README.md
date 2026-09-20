@@ -76,6 +76,68 @@ docker run --rm -p 8990:8990 \
 推送到 `master` 会更新 `latest`；推送 Git tag 时会同时发布同名镜像 tag 和 `latest`，例如
 `ghcr.io/kebyn/kiro-gateway:v1.0.0`。Pull Request 和其他分支只执行镜像构建校验，不会发布。
 
+### Docker Compose（host 网络）
+
+仓库中的 [`compose.yaml`](compose.yaml) 直接使用 GHCR 发布的镜像，并采用 Docker
+`host` 网络模式。模板把网关固定绑定到宿主机的 `127.0.0.1:8990`，没有 `ports` 映射，
+因此局域网和公网主机不能直接连接这个服务。
+
+先准备配置、环境变量和 Responses 数据目录：
+
+```sh
+cp config.example.json config.json
+cp .env.example .env
+chmod 600 .env
+mkdir -p data
+```
+
+编辑 `.env`，替换客户端密钥、Admin 密钥和上游凭据占位符。`.env.example` 默认设置
+`KIRO_CREDENTIAL_SOURCE=env`；`KIRO_API_KEY` 不能与 `KIRO_ACCESS_TOKEN` 或
+`KIRO_REFRESH_TOKEN` 同时填写，后两者可按上游要求一起配置。镜像以 UID `10001` 的
+非 root 用户运行，启动前请确保该 UID 能读取 `config.json` 并写入 `data/`。例如在
+Linux 上可以使用：
+
+```sh
+sudo chown 10001:10001 config.json data
+chmod 600 config.json
+chmod 700 data
+```
+
+检查合并后的 Compose 配置并启动服务：
+
+```sh
+docker compose config
+docker compose up -d
+docker compose logs -f kiro-gateway
+```
+
+健康检查和停止命令：
+
+```sh
+curl --fail http://127.0.0.1:8990/health
+docker compose down
+```
+
+由于服务只监听宿主机回环地址，需要对外提供访问时，应在同一宿主机上终止 TLS 的
+反向代理，并将请求转发到 `http://127.0.0.1:8990`。不要在 Compose 中添加 `ports`
+映射或把 `KIRO_HOST` 改为 `0.0.0.0`，除非确实要改变这个本机访问边界。
+
+默认凭据来自 `.env`。如果使用 JSON 或 Kiro CLI SQLite 凭据，需要在 `compose.yaml`
+的 `volumes` 中额外挂载文件，并把 `config.json` 中的来源和容器内路径改为对应值，
+例如：
+
+```yaml
+volumes:
+  - ./credentials/kiro.json:/etc/kiro-gateway/kiro.json:ro
+  - ${HOME}/.local/share/kiro-cli/data.sqlite3:/var/lib/kiro-gateway/kiro-cli.sqlite3:ro
+```
+
+JSON 凭据使用 `credential_source: "json"` 和 `/etc/kiro-gateway/kiro.json`，SQLite
+凭据使用 `credential_source: "sqlite"` 和 `/var/lib/kiro-gateway/kiro-cli.sqlite3`。
+只读挂载适合读取现有凭据；如果需要把刷新后的 JSON 原子写回文件，应改用受控的可写
+挂载，并确保 UID `10001` 具有文件权限。`data/` 中的 Responses SQLite 会保存请求、
+输出和工具数据明文，请限制目录权限并按保留策略备份或删除。
+
 ## 接口与鉴权
 
 `GET /health` 无需鉴权。所有 `/v1/*` 接口接受以下任一请求头，值必须与 `client_api_key` 一致：
