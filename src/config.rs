@@ -4,6 +4,7 @@ use std::{
     str::FromStr,
 };
 
+use rand::{TryRngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
@@ -22,7 +23,7 @@ pub struct AdminConfig {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             session_ttl_secs: 8 * 60 * 60,
             cookie_secure: true,
             allowed_origins: Vec::new(),
@@ -93,6 +94,16 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub fn generated_template() -> Result<Self, AppError> {
+        Ok(Self {
+            client_api_key: random_api_key()?,
+            admin_api_key: random_api_key()?,
+            admin: AdminConfig { enabled: true, ..Default::default() },
+            credential_source: "env".to_owned(),
+            ..Default::default()
+        })
+    }
+
     pub fn from_env_and_optional_file(path: Option<&Path>) -> Result<Self, AppError> {
         let mut config = match path {
             Some(path) => {
@@ -265,6 +276,22 @@ impl AppConfig {
     }
 }
 
+fn random_api_key() -> Result<String, AppError> {
+    const KEY_BYTES: usize = 32;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut bytes = [0_u8; KEY_BYTES];
+    OsRng.try_fill_bytes(&mut bytes).map_err(|error| {
+        AppError::Config(format!("cannot generate a secure random API key: {error}"))
+    })?;
+    let mut key = String::with_capacity(KEY_BYTES * 2);
+    for byte in bytes {
+        key.push(HEX[usize::from(byte >> 4)] as char);
+        key.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    Ok(key)
+}
+
 fn env_string(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
@@ -299,6 +326,33 @@ fn env_bool(name: &str) -> Result<Option<bool>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::{AdminConfig, AppConfig};
+
+    #[test]
+    fn runtime_defaults_disable_admin() {
+        assert!(!AppConfig::default().admin.enabled);
+    }
+
+    #[test]
+    fn generated_templates_have_independent_random_keys_and_enable_admin() {
+        let first = AppConfig::generated_template().unwrap();
+        let second = AppConfig::generated_template().unwrap();
+
+        assert!(first.admin.enabled);
+        assert_eq!(first.credential_source, "env");
+        assert_ne!(first.client_api_key, first.admin_api_key);
+        assert_ne!(first.client_api_key, second.client_api_key);
+        assert_ne!(first.admin_api_key, second.admin_api_key);
+        for key in [
+            &first.client_api_key,
+            &first.admin_api_key,
+            &second.client_api_key,
+            &second.admin_api_key,
+        ] {
+            assert_eq!(key.len(), 64);
+            assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert!(first.validate().is_ok());
+    }
 
     #[test]
     fn canonical_fields_are_accepted() {
@@ -347,6 +401,16 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_admin_requires_an_admin_key() {
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin: AdminConfig { enabled: true, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]
