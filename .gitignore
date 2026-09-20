@@ -1,7 +1,11 @@
 /target/
 /dist/
 *.sqlite3
+*.sqlite3-*
 *.db
+config.json
+data/
 .env
 .env.*
+!.env.example
 admin-ui/node_modules/
