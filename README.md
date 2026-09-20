@@ -75,6 +75,7 @@ docker build -t kiro-gateway .
 docker run --rm -p 8990:8990 \
   -e KIRO_CLIENT_API_KEY='client-key-change-me' \
   -e KIRO_ADMIN_API_KEY='admin-key-change-me' \
+  -e KIRO_ADMIN_ENABLED='true' \
   -e KIRO_CREDENTIAL_SOURCE='env' \
   -e KIRO_ACCESS_TOKEN='access-token-from-your-provider' \
   kiro-gateway
@@ -89,6 +90,7 @@ docker pull ghcr.io/kebyn/kiro-gateway:latest
 docker run --rm -p 8990:8990 \
   -e KIRO_CLIENT_API_KEY='client-key-change-me' \
   -e KIRO_ADMIN_API_KEY='admin-key-change-me' \
+  -e KIRO_ADMIN_ENABLED='true' \
   -e KIRO_CREDENTIAL_SOURCE='env' \
   -e KIRO_ACCESS_TOKEN='access-token-from-your-provider' \
   ghcr.io/kebyn/kiro-gateway:latest
@@ -115,8 +117,13 @@ mkdir -p data
 编辑 `.env`，替换客户端密钥、Admin 密钥和上游凭据占位符。`.env.example` 默认设置
 `KIRO_CREDENTIAL_SOURCE=env`；`KIRO_API_KEY` 不能与 `KIRO_ACCESS_TOKEN` 或
 `KIRO_REFRESH_TOKEN` 同时填写，后两者可按上游要求一起配置。镜像以 UID `10001` 的
-非 root 用户运行，启动前请确保该 UID 能读取 `config.json` 并写入 `data/`。例如在
-Linux 上可以使用：
+非 root 用户运行，启动前请确保该 UID 能读取 `config.json` 并写入 `data/`。
+
+`config.example.json` 默认关闭 Admin；如需在 Compose 中启用 Admin，请在 `.env` 中同时设置
+`KIRO_ADMIN_ENABLED=true` 和 `KIRO_ADMIN_API_KEY`，或直接把 `config.json` 的
+`admin.enabled` 改为 `true`。
+
+例如在 Linux 上可以使用：
 
 ```sh
 sudo chown 10001:10001 config.json data
