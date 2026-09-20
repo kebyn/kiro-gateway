@@ -1,0 +1,15 @@
+services:
+  kiro-gateway:
+    image: ghcr.io/kebyn/kiro-gateway:latest
+    restart: unless-stopped
+    network_mode: host
+    command: ["--config", "/etc/kiro-gateway/config.json"]
+    env_file:
+      - .env
+    environment:
+      KIRO_HOST: "127.0.0.1"
+      KIRO_PORT: "8990"
+      KIRO_RESPONSE_STORE_PATH: /var/lib/kiro-gateway/kiro-gateway.sqlite3
+    volumes:
+      - ./config.json:/etc/kiro-gateway/config.json:ro
+      - ./data:/var/lib/kiro-gateway
