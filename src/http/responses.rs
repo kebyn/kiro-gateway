@@ -50,6 +50,7 @@ pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<ResponsesRequest>,
 ) -> Result<Response, AppError> {
+    body.validate().map_err(AppError::BadRequest)?;
     let previous_record = match body.previous_response_id.as_deref() {
         Some(id) => Some(state.responses.get(id)?.ok_or(AppError::NotFound)?),
         None => None,
