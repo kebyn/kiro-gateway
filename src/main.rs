@@ -43,8 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
-    let candidates = discover(&config)?;
-    let credential = candidates.into_iter().next().ok_or("no credential")?.credential;
+    let mut candidates = discover(&config)?;
+    let credential = candidates.pop().ok_or("no credential")?.credential;
     let token_manager = Arc::new(TokenManager::new(&config, credential)?);
     token_manager.ensure_fresh().await?;
     let response_store =

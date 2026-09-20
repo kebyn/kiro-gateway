@@ -95,10 +95,39 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
             "no credential source produced a usable credential".into(),
         ));
     }
-    if candidates.len() > 1 && kind == "auto" {
+    if candidates.len() > 1 {
         return Err(AppError::Credential(
-            "multiple credentials discovered; choose credential_source explicitly".into(),
+            "multiple credentials discovered; configure exactly one credential".into(),
         ));
     }
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::discover;
+    use crate::config::AppConfig;
+    use std::fs;
+
+    #[test]
+    fn explicit_json_source_rejects_multiple_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.json");
+        fs::write(
+            &path,
+            r#"[
+                {"access_token":"first"},
+                {"access_token":"second"}
+            ]"#,
+        )
+        .unwrap();
+        let config = AppConfig {
+            credential_source: "json".into(),
+            credential_json_path: Some(path.display().to_string()),
+            ..Default::default()
+        };
+
+        let error = discover(&config).expect_err("single-tenant source must reject arrays");
+        assert!(error.to_string().contains("multiple credentials"));
+    }
 }
