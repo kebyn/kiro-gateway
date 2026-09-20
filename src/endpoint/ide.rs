@@ -42,10 +42,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("x-amzn-kiro-agent-mode", "agent")
             .header("origin", "https://app.kiro.dev")
     }
-    fn classify_error(&self, status: reqwest::StatusCode, body: &str) -> AppError {
-        AppError::Upstream(format!(
-            "IDE endpoint returned {status}: {}",
-            body.chars().take(256).collect::<String>()
-        ))
+    fn classify_error(&self, status: reqwest::StatusCode, _body: &str) -> AppError {
+        AppError::Upstream(format!("IDE endpoint returned {status}"))
     }
 }

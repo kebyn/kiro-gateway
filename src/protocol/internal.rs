@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum InternalContent {
+    Text(String),
+    Thinking(String),
+    ToolUse(InternalToolCall),
+    ToolResult(InternalToolResult),
+    Unknown(Value),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -38,6 +47,52 @@ impl InternalMessage {
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
         }
+    }
+
+    /// Converts the protocol-specific JSON content into a bounded internal
+    /// vocabulary. Unknown blocks are retained as opaque values so a future
+    /// protocol extension cannot accidentally be interpreted as executable
+    /// tool data.
+    pub fn normalized_content(&self) -> Vec<InternalContent> {
+        normalize_content(&self.content, 0)
+            .into_iter()
+            .chain(self.tool_calls.iter().cloned().map(InternalContent::ToolUse))
+            .chain(self.tool_results.iter().cloned().map(InternalContent::ToolResult))
+            .collect()
+    }
+}
+
+const MAX_CONTENT_DEPTH: usize = 8;
+const MAX_CONTENT_NODES: usize = 256;
+
+fn normalize_content(value: &Value, depth: usize) -> Vec<InternalContent> {
+    if depth > MAX_CONTENT_DEPTH {
+        return vec![InternalContent::Unknown(Value::String("[content depth limit]".into()))];
+    }
+    match value {
+        Value::String(text) => vec![InternalContent::Text(text.clone())],
+        Value::Array(items) => items
+            .iter()
+            .take(MAX_CONTENT_NODES)
+            .flat_map(|item| normalize_content(item, depth + 1))
+            .collect(),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("text") | Some("output_text") | Some("input_text") => object
+                .get("text")
+                .or_else(|| object.get("output_text"))
+                .or_else(|| object.get("input_text"))
+                .and_then(Value::as_str)
+                .map(|text| vec![InternalContent::Text(text.to_owned())])
+                .unwrap_or_else(|| vec![InternalContent::Unknown(value.clone())]),
+            Some("thinking") | Some("reasoning") => object
+                .get("thinking")
+                .or_else(|| object.get("text"))
+                .and_then(Value::as_str)
+                .map(|text| vec![InternalContent::Thinking(text.to_owned())])
+                .unwrap_or_else(|| vec![InternalContent::Unknown(value.clone())]),
+            _ => vec![InternalContent::Unknown(value.clone())],
+        },
+        _ => vec![InternalContent::Unknown(value.clone())],
     }
 }
 
@@ -78,18 +133,41 @@ impl InternalRequest {
 }
 
 pub fn content_text(message: &InternalMessage) -> String {
-    value_text(&message.content)
+    message
+        .normalized_content()
+        .into_iter()
+        .filter_map(|content| match content {
+            InternalContent::Text(text) | InternalContent::Thinking(text) => Some(text),
+            InternalContent::Unknown(value) => Some(value_text(&value)),
+            InternalContent::ToolUse(_) | InternalContent::ToolResult(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 pub fn value_text(value: &Value) -> String {
+    let mut nodes = 0;
+    value_text_bounded(value, 0, &mut nodes)
+}
+
+fn value_text_bounded(value: &Value, depth: usize, nodes: &mut usize) -> String {
+    if depth > MAX_CONTENT_DEPTH || *nodes >= MAX_CONTENT_NODES {
+        return String::new();
+    }
+    *nodes += 1;
     match value {
         Value::String(value) => value.clone(),
-        Value::Array(items) => items.iter().map(value_text).collect::<Vec<_>>().join(""),
+        Value::Array(items) => items
+            .iter()
+            .take(MAX_CONTENT_NODES)
+            .map(|item| value_text_bounded(item, depth + 1, nodes))
+            .collect::<Vec<_>>()
+            .join(""),
         Value::Object(object) => object
             .get("text")
             .or_else(|| object.get("output_text"))
             .or_else(|| object.get("input_text"))
-            .map(value_text)
+            .map(|value| value_text_bounded(value, depth + 1, nodes))
             .unwrap_or_default(),
         Value::Null => String::new(),
         value => value.to_string(),
@@ -169,4 +247,41 @@ pub struct InternalToolResult {
     pub content: Value,
     #[serde(default)]
     pub is_error: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InternalContent, InternalMessage};
+    use serde_json::json;
+
+    #[test]
+    fn normalizes_known_blocks_and_preserves_unknown_values() {
+        let message = InternalMessage::new(
+            "assistant",
+            json!([
+                {"type":"text","text":"hello"},
+                {"type":"thinking","thinking":"hmm"},
+                {"type":"html","text":"<b>keep</b>"}
+            ]),
+        );
+        let content = message.normalized_content();
+        assert!(matches!(content[0], InternalContent::Text(ref value) if value == "hello"));
+        assert!(matches!(content[1], InternalContent::Thinking(ref value) if value == "hmm"));
+        assert!(matches!(content[2], InternalContent::Unknown(_)));
+    }
+
+    #[test]
+    fn does_not_walk_unbounded_json_nodes() {
+        let mut value = json!("leaf");
+        for _ in 0..12 {
+            value = json!([value]);
+        }
+        let message = InternalMessage::new("user", value);
+        assert!(
+            message
+                .normalized_content()
+                .iter()
+                .any(|item| matches!(item, InternalContent::Unknown(_)))
+        );
+    }
 }

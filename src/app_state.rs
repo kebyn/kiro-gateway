@@ -35,12 +35,8 @@ impl AppState {
     }
 
     pub async fn complete(&self, request: &InternalRequest) -> Result<InternalResponse, AppError> {
-        let mut events = self.event_stream(request).await?;
-        let mut accumulator = crate::upstream::request::InternalEventAccumulator::new();
-        while let Some(event) = futures_util::StreamExt::next(&mut events).await {
-            accumulator.push(event?)?;
-        }
-        let response = accumulator.finish();
+        let events = self.event_stream(request).await?;
+        let response = crate::http::stream::drive(events, |_| Ok(())).await?;
         if response.text.is_empty()
             && response.thinking.is_empty()
             && response.tool_calls.is_empty()
