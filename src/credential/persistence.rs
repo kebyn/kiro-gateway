@@ -32,7 +32,7 @@ pub fn write_json(path: &Path, credential: &Credential) -> Result<(), AppError> 
         let mut file = options.open(&temp).map_err(|e| AppError::Credential(e.to_string()))?;
         // SecretString serializes as REDACTED for logs and API output. This is the
         // explicit opt-in persistence path where the actual values are required.
-        let body = serde_json::to_vec_pretty(&serde_json::json!({
+        let mut value = serde_json::json!({
             "auth_method": credential.auth_method,
             "access_token": credential.access_token.as_ref().map(|v| v.expose_secret()),
             "refresh_token": credential.refresh_token.as_ref().map(|v| v.expose_secret()),
@@ -45,8 +45,22 @@ pub fn write_json(path: &Path, credential: &Credential) -> Result<(), AppError> 
             "machine_id": credential.machine_id,
             "expires_at": credential.expires_at,
             "source": credential.source,
-        }))
-        .map_err(|e| AppError::Credential(e.to_string()))?;
+        });
+        if matches!(credential.auth_method, crate::auth::AuthMethod::ApiKey) {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "api_key".into(),
+                    credential
+                        .access_token
+                        .as_ref()
+                        .map(|v| serde_json::Value::String(v.expose_secret().to_owned()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                object.remove("access_token");
+            }
+        }
+        let body =
+            serde_json::to_vec_pretty(&value).map_err(|e| AppError::Credential(e.to_string()))?;
         file.write_all(&body).map_err(|e| AppError::Credential(e.to_string()))?;
         file.sync_all().map_err(|e| AppError::Credential(e.to_string()))?;
         fs::rename(&temp, path).map_err(|e| AppError::Credential(e.to_string()))?;

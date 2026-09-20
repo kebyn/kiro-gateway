@@ -25,6 +25,7 @@ pub async fn refresh(
     client: &Client,
     credential: &mut Credential,
     timeout: Duration,
+    token_endpoint: Option<&str>,
 ) -> Result<(), AppError> {
     let refresh_token = credential
         .refresh_token
@@ -32,7 +33,7 @@ pub async fn refresh(
         .ok_or_else(|| AppError::Credential("refresh token is missing".into()))?
         .expose_secret()
         .to_owned();
-    let oidc = matches!(credential.auth_method, AuthMethod::Sso)
+    let oidc = matches!(credential.auth_method, AuthMethod::Oidc)
         || (matches!(credential.auth_method, AuthMethod::Unknown)
             && credential.client_id.is_some());
     let region = credential.sso_region.as_deref().unwrap_or(&credential.api_region);
@@ -41,7 +42,7 @@ pub async fn refresh(
     } else {
         format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken")
     };
-    let url = std::env::var("KIRO_TOKEN_ENDPOINT").unwrap_or(default_url);
+    let url = token_endpoint.unwrap_or(&default_url);
     let request = if oidc {
         let mut payload =
             serde_json::json!({"grantType":"refresh_token","refreshToken":refresh_token});

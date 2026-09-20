@@ -12,20 +12,15 @@ pub struct CredentialCandidate {
 }
 
 pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError> {
-    let kind = config.credential_source.to_ascii_lowercase();
+    let kind = config.credential_source.as_str();
     let mut candidates = Vec::new();
     let load_json = |path: &Path| {
-        json::load(path).map(|items| {
-            items
-                .into_iter()
-                .map(|mut c| {
-                    c.source = Some(path.display().to_string());
-                    CredentialCandidate { credential: c }
-                })
-                .collect::<Vec<_>>()
+        json::load(path).map(|mut credential| {
+            credential.source = Some(path.display().to_string());
+            vec![CredentialCandidate { credential }]
         })
     };
-    match kind.as_str() {
+    match kind {
         "json" => {
             let path = config
                 .credential_json_path
@@ -45,11 +40,11 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
                 },
             ));
         }
-        "env" => candidates.extend(env::load().into_iter().map(|mut c| {
+        "env" => candidates.extend(env::load()?.into_iter().map(|mut c| {
             c.source = Some("environment".into());
             CredentialCandidate { credential: c }
         })),
-        "api_key" | "apikey" => {
+        "api_key" => {
             let key = std::env::var("KIRO_API_KEY")
                 .map_err(|_| AppError::Credential("KIRO_API_KEY is not set".into()))?;
             candidates.push(CredentialCandidate {
@@ -63,8 +58,8 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
                 },
             });
         }
-        _ => {
-            candidates.extend(env::load().into_iter().map(|mut c| {
+        "auto" => {
+            candidates.extend(env::load()?.into_iter().map(|mut c| {
                 c.source = Some("environment".into());
                 CredentialCandidate { credential: c }
             }));
@@ -89,6 +84,7 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
                 }
             }
         }
+        _ => unreachable!("AppConfig::validate rejects unknown credential source"),
     }
     if candidates.is_empty() {
         return Err(AppError::Credential(
@@ -128,6 +124,6 @@ mod tests {
         };
 
         let error = discover(&config).expect_err("single-tenant source must reject arrays");
-        assert!(error.to_string().contains("multiple credentials"));
+        assert!(error.to_string().contains("credential JSON"));
     }
 }

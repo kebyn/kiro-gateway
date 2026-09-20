@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
     path::Path,
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -20,6 +21,9 @@ impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, AppError> {
         prepare_store_file(path)?;
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(include_str!("../../migrations/001_initial.sql"))?;
         // The initial scaffold created a conversations table that was never

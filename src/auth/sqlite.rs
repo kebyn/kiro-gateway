@@ -18,7 +18,7 @@ pub fn load(path: &Path) -> Result<Vec<Credential>, AppError> {
         if let Some(raw) = raw {
             if let Some(mut credential) = parse_token(&raw) {
                 credential.auth_method =
-                    if key.contains("social") { AuthMethod::Social } else { AuthMethod::Sso };
+                    if key.contains("social") { AuthMethod::Social } else { AuthMethod::Oidc };
                 credential.source = None;
                 result.push(credential);
             }
@@ -72,6 +72,12 @@ pub fn load(path: &Path) -> Result<Vec<Credential>, AppError> {
     if result.is_empty() {
         return Err(AppError::Credential("no supported Kiro token found in SQLite".into()));
     }
+    if result.len() != 1 {
+        return Err(AppError::Credential(
+            "multiple credentials discovered in SQLite; expected exactly one".into(),
+        ));
+    }
+    result[0].validate_external().map_err(AppError::Credential)?;
     Ok(result)
 }
 
@@ -207,7 +213,7 @@ mod tests {
         assert_eq!(before.modified().ok(), after.modified().ok());
         assert_eq!(credentials.len(), 1);
         let credential = &credentials[0];
-        assert_eq!(credential.auth_method, AuthMethod::Sso);
+        assert_eq!(credential.auth_method, AuthMethod::Oidc);
         assert_eq!(
             credential.access_token.as_ref().map(|value| value.expose_secret()),
             Some("access-token-fixture")
@@ -253,7 +259,7 @@ mod tests {
         assert_eq!(before.modified().ok(), after.modified().ok());
         assert!(!credentials.is_empty());
         let credential = &credentials[0];
-        assert!(matches!(credential.auth_method, AuthMethod::Social | AuthMethod::Sso));
+        assert!(matches!(credential.auth_method, AuthMethod::Social | AuthMethod::Oidc));
         assert!(credential.access_token.as_ref().is_some_and(|value| !value.is_empty()));
         assert!(credential.refresh_token.as_ref().is_some_and(|value| !value.is_empty()));
         assert!(credential.client_id.as_ref().is_some_and(|value| !value.is_empty()));

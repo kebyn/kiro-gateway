@@ -33,15 +33,34 @@ impl<'de> Deserialize<'de> for SecretString {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     ApiKey,
     Social,
-    Sso,
+    Oidc,
     RefreshToken,
     Unknown,
 }
+
+impl<'de> Deserialize<'de> for AuthMethod {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value
+            .parse()
+            .map_err(|_| serde::de::Error::custom(format!("unsupported auth_method: {value}")))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthMethodParseError;
+
+impl fmt::Display for AuthMethodParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("auth_method must be api_key, social, oidc, or refresh_token")
+    }
+}
+impl std::error::Error for AuthMethodParseError {}
 
 impl Default for AuthMethod {
     fn default() -> Self {
@@ -49,15 +68,15 @@ impl Default for AuthMethod {
     }
 }
 impl FromStr for AuthMethod {
-    type Err = ();
+    type Err = AuthMethodParseError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(match value.to_ascii_lowercase().as_str() {
-            "api_key" | "apikey" | "api-key" => Self::ApiKey,
-            "social" => Self::Social,
-            "sso" | "odic" => Self::Sso,
-            "refresh_token" | "refresh-token" => Self::RefreshToken,
-            _ => Self::Unknown,
-        })
+        match value {
+            "api_key" => Ok(Self::ApiKey),
+            "social" => Ok(Self::Social),
+            "oidc" => Ok(Self::Oidc),
+            "refresh_token" => Ok(Self::RefreshToken),
+            _ => Err(AuthMethodParseError),
+        }
     }
 }
 
@@ -102,6 +121,30 @@ impl Default for Credential {
 }
 
 impl Credential {
+    /// Validates a credential loaded from an external source. Internal test
+    /// fixtures may still use `Credential::default()`, so this is deliberately
+    /// separate from the structural type itself.
+    pub fn validate_external(&self) -> Result<(), String> {
+        if matches!(self.auth_method, AuthMethod::Unknown) {
+            return Err("auth_method is required and cannot be unknown".into());
+        }
+        if self.api_region.trim().is_empty() {
+            return Err("api_region must not be empty".into());
+        }
+        if !matches!(self.endpoint.as_str(), "auto" | "ide" | "cli") {
+            return Err(format!("unsupported credential endpoint: {}", self.endpoint));
+        }
+        let has_access = self.access_token.as_ref().is_some_and(|v| !v.is_empty());
+        let has_refresh = self.refresh_token.as_ref().is_some_and(|v| !v.is_empty());
+        if !has_access && !has_refresh {
+            return Err("credential must contain access_token, refresh_token, or api_key".into());
+        }
+        if matches!(self.auth_method, AuthMethod::ApiKey) && !has_access {
+            return Err("api_key credential must contain a non-empty api_key".into());
+        }
+        Ok(())
+    }
+
     pub fn needs_refresh(&self, now: DateTime<Utc>, early_secs: i64) -> bool {
         if matches!(self.auth_method, AuthMethod::ApiKey) {
             return false;

@@ -10,6 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use tower_http::limit::RequestBodyLimitLayer;
 
 pub fn router(state: AppState) -> Router {
     let health_route = Router::new().route("/health", get(health));
@@ -35,7 +36,7 @@ pub fn router(state: AppState) -> Router {
             .nest("/admin", admin_routes.clone())
             .nest("/api/admin", admin_routes);
     }
-    router.with_state(state)
+    router.layer(RequestBodyLimitLayer::new(state.config.max_request_body_bytes)).with_state(state)
 }
 
 pub async fn health(State(_state): State<AppState>) -> impl IntoResponse {

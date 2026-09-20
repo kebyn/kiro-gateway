@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct AdminConfig {
     pub enabled: bool,
@@ -31,29 +32,31 @@ impl Default for AdminConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct AppConfig {
     pub host: String,
     pub port: u16,
-    #[serde(alias = "apiKey")]
     pub client_api_key: String,
-    #[serde(alias = "adminApiKey")]
     pub admin_api_key: String,
     pub admin: AdminConfig,
     pub credential_source: String,
     pub credential_path: Option<String>,
     pub credential_json_path: Option<String>,
-    #[serde(alias = "defaultEndpoint")]
     pub endpoint: String,
     pub api_region: String,
     pub mcp_region: Option<String>,
     pub upstream_url: Option<String>,
     pub proxy_url: Option<String>,
+    pub token_endpoint: Option<String>,
     pub upstream_timeout_secs: u64,
     pub refresh_early_secs: i64,
     pub refresh_interval_secs: u64,
     pub model_cache_ttl_secs: u64,
     pub response_store_path: String,
+    pub max_request_body_bytes: usize,
+    pub max_upstream_body_bytes: usize,
+    pub graceful_shutdown_timeout_secs: u64,
     pub log_json: bool,
     pub trust_forwarded_headers: bool,
 }
@@ -74,11 +77,15 @@ impl Default for AppConfig {
             mcp_region: None,
             upstream_url: None,
             proxy_url: None,
+            token_endpoint: None,
             upstream_timeout_secs: 60,
             refresh_early_secs: 120,
             refresh_interval_secs: 30,
             model_cache_ttl_secs: 300,
             response_store_path: "kiro-gateway.sqlite3".to_owned(),
+            max_request_body_bytes: 8 * 1024 * 1024,
+            max_upstream_body_bytes: 16 * 1024 * 1024,
+            graceful_shutdown_timeout_secs: 30,
             log_json: false,
             trust_forwarded_headers: false,
         }
@@ -139,6 +146,9 @@ impl AppConfig {
         if let Some(v) = env_string("KIRO_PROXY_URL") {
             self.proxy_url = Some(v);
         }
+        if let Some(v) = env_string("KIRO_TOKEN_ENDPOINT") {
+            self.token_endpoint = Some(v);
+        }
         if let Some(v) = env_parse("KIRO_UPSTREAM_TIMEOUT_SECS")? {
             self.upstream_timeout_secs = v;
         }
@@ -150,6 +160,15 @@ impl AppConfig {
         }
         if let Some(v) = env_parse("KIRO_MODEL_CACHE_TTL_SECS")? {
             self.model_cache_ttl_secs = v;
+        }
+        if let Some(v) = env_parse("KIRO_MAX_REQUEST_BODY_BYTES")? {
+            self.max_request_body_bytes = v;
+        }
+        if let Some(v) = env_parse("KIRO_MAX_UPSTREAM_BODY_BYTES")? {
+            self.max_upstream_body_bytes = v;
+        }
+        if let Some(v) = env_parse("KIRO_GRACEFUL_SHUTDOWN_TIMEOUT_SECS")? {
+            self.graceful_shutdown_timeout_secs = v;
         }
         if let Some(v) = env_bool("KIRO_ADMIN_ENABLED")? {
             self.admin.enabled = v;
@@ -196,6 +215,12 @@ impl AppConfig {
         if self.upstream_timeout_secs == 0 || self.refresh_interval_secs == 0 {
             return Err(AppError::Config("timeouts must be positive".into()));
         }
+        if self.max_request_body_bytes == 0 || self.max_upstream_body_bytes == 0 {
+            return Err(AppError::Config("body size limits must be positive".into()));
+        }
+        if self.graceful_shutdown_timeout_secs == 0 {
+            return Err(AppError::Config("graceful_shutdown_timeout_secs must be positive".into()));
+        }
         if self.model_cache_ttl_secs == 0 {
             return Err(AppError::Config("model_cache_ttl_secs must be positive".into()));
         }
@@ -203,20 +228,21 @@ impl AppConfig {
             return Err(AppError::Config("refresh_early_secs must not be negative".into()));
         }
         if !matches!(
-            self.credential_source.to_ascii_lowercase().as_str(),
-            "auto" | "env" | "json" | "sqlite" | "api_key" | "apikey"
+            self.credential_source.as_str(),
+            "auto" | "env" | "json" | "sqlite" | "api_key"
         ) {
             return Err(AppError::Config(format!(
                 "unsupported credential_source: {}",
                 self.credential_source
             )));
         }
-        if !matches!(self.endpoint.to_ascii_lowercase().as_str(), "auto" | "ide" | "cli") {
+        if !matches!(self.endpoint.as_str(), "auto" | "ide" | "cli") {
             return Err(AppError::Config(format!("unsupported endpoint: {}", self.endpoint)));
         }
         for (name, value) in [
             ("upstream_url", self.upstream_url.as_deref()),
             ("proxy_url", self.proxy_url.as_deref()),
+            ("token_endpoint", self.token_endpoint.as_deref()),
         ] {
             if let Some(value) = value {
                 let parsed = url::Url::parse(value)
@@ -275,14 +301,25 @@ mod tests {
     use super::{AdminConfig, AppConfig};
 
     #[test]
-    fn aliases_and_validation_work() {
+    fn canonical_fields_are_accepted() {
         let config: AppConfig = serde_json::from_str(
-            r#"{"apiKey":"client","adminApiKey":"admin","defaultEndpoint":"cli"}"#,
+            r#"{"client_api_key":"client","admin_api_key":"admin","endpoint":"cli"}"#,
         )
         .unwrap();
         assert_eq!(config.client_api_key, "client");
         assert_eq!(config.endpoint, "cli");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_aliases_are_rejected() {
+        for value in [
+            r#"{"apiKey":"client","admin_api_key":"admin"}"#,
+            r#"{"client_api_key":"client","adminApiKey":"admin"}"#,
+            r#"{"client_api_key":"client","defaultEndpoint":"cli"}"#,
+        ] {
+            assert!(serde_json::from_str::<AppConfig>(value).is_err());
+        }
     }
 
     #[test]
@@ -321,5 +358,21 @@ mod tests {
         };
         assert_eq!(config.endpoint, "auto");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn token_endpoint_and_body_limits_are_validated() {
+        let mut config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            token_endpoint: Some("https://oidc.example.test/token".into()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        config.token_endpoint = Some("ftp://example.test/token".into());
+        assert!(config.validate().is_err());
+        config.token_endpoint = None;
+        config.max_request_body_bytes = 0;
+        assert!(config.validate().is_err());
     }
 }
