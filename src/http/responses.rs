@@ -1,8 +1,8 @@
 use crate::{
     AppState,
-    error::AppError,
+    error::{AppError, Protocol, protocol_error_response},
     protocol::{
-        internal::{InternalEvent, InternalMessage, InternalResponse, InternalToolCall},
+        internal::{InternalEvent, InternalMessage, InternalResponse, InternalToolCall, Usage},
         openai_responses::ResponsesRequest,
     },
     response_store::{ResponseStatus, ResponseStore},
@@ -12,15 +12,39 @@ use crate::{
 };
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
 };
 use futures_util::StreamExt;
+use parking_lot::Mutex;
 use serde_json::{Value, json};
-use std::{collections::HashMap, convert::Infallible};
+use std::{collections::HashMap, convert::Infallible, sync::Arc};
+
+pub async fn create_route(
+    State(state): State<AppState>,
+    body: Result<Json<ResponsesRequest>, JsonRejection>,
+) -> Response {
+    match body {
+        Ok(body) => match create(State(state), body).await {
+            Ok(response) => response,
+            Err(error) => protocol_error_response(Protocol::Responses, error),
+        },
+        Err(rejection) => {
+            let message = rejection.to_string();
+            let error = if message.to_ascii_lowercase().contains("limit")
+                || message.to_ascii_lowercase().contains("too large")
+            {
+                AppError::PayloadTooLarge
+            } else {
+                AppError::BadRequest(format!("invalid JSON request: {message}"))
+            };
+            protocol_error_response(Protocol::Responses, error)
+        }
+    }
+}
 
 pub async fn create(
     State(state): State<AppState>,
@@ -89,7 +113,7 @@ pub async fn create(
                         "response.in_progress",
                         &json!({"response":response_in_progress_payload(&id, &model)}),
                     );
-                    let failed = response_error_payload(&id, &model, &error.to_string());
+                    let failed = response_failed_payload(&id, &model, &error.to_string());
                     let _ = state.responses.update(
                         record,
                         ResponseStatus::Failed,
@@ -107,7 +131,7 @@ pub async fn create(
         Ok(response) => response,
         Err(error) => {
             if let Some(record) = record {
-                let failed = response_error_payload(&id, &model, &error.to_string());
+                let failed = response_failed_payload(&id, &model, &error.to_string());
                 let _ = state.responses.update(
                     record,
                     ResponseStatus::Failed,
@@ -172,6 +196,13 @@ fn response_error_payload(id: &str, model: &str, message: &str) -> Value {
     })
 }
 
+fn response_failed_payload(id: &str, model: &str, message: &str) -> Value {
+    let mut payload = response_error_payload(id, model, message);
+    payload["status"] = json!("failed");
+    payload["incomplete_details"] = Value::Null;
+    payload
+}
+
 #[derive(Clone, Debug)]
 struct LiveTool {
     call_id: String,
@@ -197,14 +228,24 @@ struct LiveResponseState {
     tool_indices: HashMap<String, usize>,
     item_order: Vec<LiveItem>,
     next_output_index: usize,
+    text: String,
+    thinking: String,
+    stop_reason: Option<String>,
+    usage: Option<Usage>,
+}
+
+#[derive(Clone)]
+struct ResponseSnapshot {
+    messages: Vec<InternalMessage>,
+    tools: Vec<crate::protocol::internal::InternalTool>,
+    response: Value,
+    status: ResponseStatus,
 }
 
 struct IncompleteRecordGuard {
     store: Option<ResponseStore>,
     record_id: String,
-    model: String,
-    messages: Vec<InternalMessage>,
-    tools: Vec<crate::protocol::internal::InternalTool>,
+    snapshot: Arc<Mutex<ResponseSnapshot>>,
 }
 
 impl Drop for IncompleteRecordGuard {
@@ -214,21 +255,48 @@ impl Drop for IncompleteRecordGuard {
         if record.status != ResponseStatus::InProgress {
             return;
         }
-        let payload = response_error_payload(
-            &self.record_id,
-            &self.model,
-            "client disconnected before response completion",
-        );
+        let snapshot = self.snapshot.lock().clone();
+        if snapshot.status != ResponseStatus::InProgress {
+            return;
+        }
+        let mut payload = snapshot.response;
+        payload["status"] = json!("incomplete");
+        payload["error"] = json!({"code":"client_disconnected","message":"client disconnected before response completion"});
+        payload["incomplete_details"] = json!({"reason":"client_disconnect"});
         let _ = store.update(
             record,
             ResponseStatus::Incomplete,
-            json!({"messages":self.messages,"tools":self.tools,"response":payload}),
+            json!({"messages":snapshot.messages,"tools":snapshot.tools,"response":payload}),
         );
         let _ = store.append_event(&self.record_id, "response.incomplete", &payload);
     }
 }
 
 impl LiveResponseState {
+    fn snapshot_response(&self) -> InternalResponse {
+        InternalResponse {
+            text: self.text.clone(),
+            thinking: self.thinking.clone(),
+            tool_calls: self
+                .tools
+                .iter()
+                .map(|tool| InternalToolCall {
+                    id: tool.call_id.clone(),
+                    name: tool.name.clone(),
+                    arguments: serde_json::from_str(&tool.arguments)
+                        .unwrap_or_else(|_| Value::String(tool.arguments.clone())),
+                    complete: tool.ended
+                        && (tool.arguments.trim().is_empty()
+                            || serde_json::from_str::<Value>(&tool.arguments)
+                                .is_ok_and(|value| value.is_object())),
+                })
+                .collect(),
+            usage: self.usage.clone(),
+            stop_reason: self.stop_reason.clone(),
+            incomplete: self.stop_reason.is_none(),
+        }
+    }
+
     fn ensure_text(&mut self) -> (String, usize, bool) {
         if let (Some(id), Some(index)) = (&self.text_item_id, self.text_output_index) {
             return (id.clone(), index, false);
@@ -297,12 +365,16 @@ fn responses_live_stream(
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let stored_messages = response_messages(&internal.messages, &InternalResponse::default());
     let stored_tools = internal.tools.clone();
+    let snapshot = Arc::new(Mutex::new(ResponseSnapshot {
+        messages: stored_messages.clone(),
+        tools: stored_tools.clone(),
+        response: response_in_progress_payload(&id, &model),
+        status: ResponseStatus::InProgress,
+    }));
     let disconnect_guard = record.as_ref().map(|_| IncompleteRecordGuard {
         store: store.then_some(state.responses.clone()),
         record_id: id.clone(),
-        model: model.clone(),
-        messages: stored_messages.clone(),
-        tools: stored_tools.clone(),
+        snapshot: snapshot.clone(),
     });
     let created_at = record
         .as_ref()
@@ -335,7 +407,7 @@ fn responses_live_stream(
             let event = match item {
                 Ok(event) => event,
                 Err(error) => {
-                    let payload = response_error_payload(&id, &model, &error.to_string());
+                    let payload = response_failed_payload(&id, &model, &error.to_string());
                     if store {
                         if let Some(record) = record.clone() {
                             let _ = state.responses.update(record, ResponseStatus::Failed, json!({"messages":stored_messages,"tools":stored_tools,"response":payload}));
@@ -344,16 +416,12 @@ fn responses_live_stream(
                     if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.failed", json!({"response":payload,"error":{"code":"upstream_error","message":error.to_string()}})) {
                         yield Ok(Event::default().event("response.failed").data(data.to_string()));
                     }
-                    match attach_sequence(&state, &id, store, &mut sequence, "response.incomplete", json!({"response":payload,"error":{"code":"upstream_error","message":error.to_string()}})) {
-                        Ok(data) => yield Ok(Event::default().event("response.incomplete").data(data.to_string())),
-                        Err(_) => {}
-                    }
                     failed = true;
                     break;
                 }
             };
             if let InternalEvent::Error { message } = &event {
-                let payload = response_error_payload(&id, &model, message);
+                let payload = response_failed_payload(&id, &model, message);
                 if store {
                     if let Some(record) = record.clone() {
                         let _ = state.responses.update(record, ResponseStatus::Failed, json!({"messages":stored_messages,"tools":stored_tools,"response":payload}));
@@ -362,14 +430,11 @@ fn responses_live_stream(
                 if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.failed", json!({"response":payload,"error":{"code":"upstream_error","message":message}})) {
                     yield Ok(Event::default().event("response.failed").data(data.to_string()));
                 }
-                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.incomplete", json!({"response":payload,"error":{"code":"upstream_error","message":message}})) {
-                    yield Ok(Event::default().event("response.incomplete").data(data.to_string()));
-                }
                 failed = true;
                 break;
             }
             if let Err(error) = accumulator.push(event.clone()) {
-                let payload = response_error_payload(&id, &model, &error.to_string());
+                let payload = response_failed_payload(&id, &model, &error.to_string());
                 if store {
                     if let Some(record) = record.clone() {
                         let _ = state.responses.update(record, ResponseStatus::Failed, json!({"messages":stored_messages,"tools":stored_tools,"response":payload}));
@@ -378,15 +443,13 @@ fn responses_live_stream(
                 if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.failed", json!({"response":payload,"error":{"code":"upstream_error","message":error.to_string()}})) {
                     yield Ok(Event::default().event("response.failed").data(data.to_string()));
                 }
-                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.incomplete", json!({"response":payload,"error":{"code":"upstream_error","message":error.to_string()}})) {
-                    yield Ok(Event::default().event("response.incomplete").data(data.to_string()));
-                }
                 failed = true;
                 break;
             }
             match event {
                 InternalEvent::TextDelta { text } => {
                     let text = text_filter.push(&text);
+                    live.text.push_str(&text);
                     let (item_id, output_index, added) = live.ensure_text();
                     if added {
                         let item = json!({"type":"message","id":item_id,"status":"in_progress","role":"assistant","content":[]});
@@ -466,9 +529,20 @@ fn responses_live_stream(
                         }
                     }
                 }
-                InternalEvent::ThinkingDelta { .. } | InternalEvent::Usage { .. } | InternalEvent::Stop { .. } => {}
+                InternalEvent::ThinkingDelta { text } => live.thinking.push_str(&text),
+                InternalEvent::Usage { usage } => live.usage = Some(usage),
+                InternalEvent::Stop { reason } => live.stop_reason = Some(reason),
                 InternalEvent::Error { .. } => unreachable!(),
             }
+            refresh_snapshot(
+                &snapshot,
+                &internal.messages,
+                &stored_tools,
+                &live,
+                &id,
+                &model,
+                created_at,
+            );
         }
         if failed { return; }
         let response = accumulator.finish();
@@ -537,6 +611,15 @@ fn responses_live_stream(
             let messages = response_messages(&internal.messages, &response);
             let _ = state.responses.update(record, status, json!({"messages":messages,"tools":stored_tools,"response":payload}));
         }
+        {
+            let mut snapshot_state = snapshot.lock();
+            snapshot_state.status = if payload["status"] == "incomplete" {
+                ResponseStatus::Incomplete
+            } else {
+                ResponseStatus::Completed
+            };
+            snapshot_state.response = payload;
+        }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -573,6 +656,23 @@ fn responses_payload_with_live_items(
         output.push(json!({"type":"message","id":format!("msg_{}", uuid::Uuid::now_v7()),"status":status,"role":"assistant","content":[{"type":"output_text","text":"","annotations":[],"logprobs":[]}]}));
     }
     json!({"id":id,"object":"response","created_at":created_at,"status":status,"error":null,"incomplete_details":incomplete_reason.map(|reason| json!({"reason":reason})),"model":model,"output":output,"output_text":response.text,"usage":response.usage})
+}
+
+fn refresh_snapshot(
+    snapshot: &Arc<Mutex<ResponseSnapshot>>,
+    input_messages: &[InternalMessage],
+    tools: &[crate::protocol::internal::InternalTool],
+    live: &LiveResponseState,
+    id: &str,
+    model: &str,
+    created_at: i64,
+) {
+    let response = live.snapshot_response();
+    let payload = responses_payload_with_live_items(id, model, &response, live, created_at);
+    let mut state = snapshot.lock();
+    state.messages = response_messages(input_messages, &response);
+    state.tools = tools.to_vec();
+    state.response = payload;
 }
 
 fn responses_payload(id: &str, model: &str, response: &InternalResponse) -> Value {

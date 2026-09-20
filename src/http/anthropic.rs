@@ -3,7 +3,7 @@ use crate::protocol::internal::InternalResponse;
 use crate::transform::truncation::XmlLeakFilter;
 use crate::{
     AppState,
-    error::AppError,
+    error::{AppError, Protocol, protocol_error_response},
     protocol::{
         anthropic::{CountTokensRequest, MessagesRequest},
         internal::{InternalEvent, InternalRequest},
@@ -13,7 +13,7 @@ use crate::{
 };
 use axum::{
     Json,
-    extract::State,
+    extract::{State, rejection::JsonRejection},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -25,6 +25,51 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
 };
+
+/// Router-facing wrapper that keeps JSON parsing failures in the Anthropic
+/// error contract. The underlying handler remains directly callable in unit
+/// tests and returns `AppError` for internal composition.
+pub async fn route(
+    State(state): State<AppState>,
+    body: Result<Json<MessagesRequest>, JsonRejection>,
+) -> Response {
+    match body {
+        Ok(body) => match messages(State(state), body).await {
+            Ok(response) => response,
+            Err(error) => protocol_error_response(Protocol::Anthropic, error),
+        },
+        Err(rejection) => {
+            protocol_error_response(Protocol::Anthropic, json_rejection_error(rejection))
+        }
+    }
+}
+
+pub async fn count_tokens_route(
+    State(state): State<AppState>,
+    body: Result<Json<CountTokensRequest>, JsonRejection>,
+) -> Response {
+    match body {
+        Ok(body) => match count_tokens(State(state), body).await {
+            Ok(response) => response.into_response(),
+            Err(error) => protocol_error_response(Protocol::Anthropic, error),
+        },
+        Err(rejection) => {
+            protocol_error_response(Protocol::Anthropic, json_rejection_error(rejection))
+        }
+    }
+}
+
+fn json_rejection_error(rejection: JsonRejection) -> AppError {
+    let message = rejection.to_string();
+    if message.to_ascii_lowercase().contains("body limit")
+        || message.to_ascii_lowercase().contains("length limit")
+        || message.to_ascii_lowercase().contains("too large")
+    {
+        AppError::PayloadTooLarge
+    } else {
+        AppError::BadRequest(format!("invalid JSON request: {message}"))
+    }
+}
 
 pub async fn messages(
     State(state): State<AppState>,
@@ -83,7 +128,6 @@ pub async fn messages(
                 Err(error) => {
                     tracing::warn!(model = %model, error = %error, "Anthropic upstream stream failed");
                     yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":error.to_string()}}).to_string()));
-                    yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":0}}).to_string()));
                     yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
                     failed = true;
                     break;
@@ -92,14 +136,12 @@ pub async fn messages(
             if let InternalEvent::Error { message } = &event {
                 tracing::warn!(model = %model, message = %message, "Anthropic upstream returned an error event");
                 yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":message}}).to_string()));
-                yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":0}}).to_string()));
                 yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
                 failed = true;
                 break;
             }
             if let Err(error) = accumulator.push(event.clone()) {
                 yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":error.to_string()}}).to_string()));
-                yield Ok(Event::default().event("message_delta").data(json!({"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":0}}).to_string()));
                 yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
                 failed = true;
                 break;

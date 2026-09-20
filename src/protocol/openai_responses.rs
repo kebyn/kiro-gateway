@@ -89,9 +89,7 @@ fn append_item(messages: &mut Vec<InternalMessage>, item: &Value, previous_len: 
             true
         }
         Some("function_call_output") => {
-            let Some(tool_call_id) =
-                item.get("call_id").or_else(|| item.get("tool_call_id")).and_then(Value::as_str)
-            else {
+            let Some(tool_call_id) = item.get("call_id").and_then(Value::as_str) else {
                 return false;
             };
             let mut message = InternalMessage::new("tool", Value::Null);
@@ -122,12 +120,7 @@ fn append_item(messages: &mut Vec<InternalMessage>, item: &Value, previous_len: 
 }
 
 fn parse_function_call(item: &Value) -> Option<InternalToolCall> {
-    let id = item
-        .get("call_id")
-        .or_else(|| item.get("tool_call_id"))
-        .or_else(|| item.get("id"))?
-        .as_str()?
-        .to_owned();
+    let id = item.get("call_id")?.as_str()?.to_owned();
     let name = item.get("name")?.as_str()?.to_owned();
     let (arguments, arguments_complete) =
         parse_arguments(item.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({})));
@@ -153,13 +146,11 @@ fn parse_arguments(arguments: Value) -> (Value, bool) {
     }
 }
 fn parse_tool(tool: Value) -> Option<InternalTool> {
-    let function = tool.get("function").unwrap_or(&tool);
     Some(InternalTool {
-        name: function.get("name")?.as_str()?.to_owned(),
-        description: function.get("description").and_then(Value::as_str).map(ToOwned::to_owned),
-        input_schema: function
+        name: tool.get("name")?.as_str()?.to_owned(),
+        description: tool.get("description").and_then(Value::as_str).map(ToOwned::to_owned),
+        input_schema: tool
             .get("parameters")
-            .or_else(|| function.get("input_schema"))
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"type":"object"})),
     })
@@ -239,14 +230,14 @@ mod tests {
     }
 
     #[test]
-    fn accepts_item_id_as_call_id_when_call_id_is_absent() {
+    fn rejects_function_call_without_call_id() {
         let request: ResponsesRequest = serde_json::from_value(json!({
             "model":"kiro",
             "input":[{"type":"function_call","id":"fc_only","name":"lookup","arguments":{}}]
         }))
         .unwrap();
         let internal = request.into_internal(Vec::new());
-        assert_eq!(internal.messages[0].tool_calls[0].id, "fc_only");
+        assert!(internal.messages.is_empty() || internal.messages[0].tool_calls.is_empty());
     }
 
     #[test]

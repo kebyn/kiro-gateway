@@ -2,7 +2,7 @@
 use crate::protocol::internal::InternalResponse;
 use crate::{
     AppState,
-    error::AppError,
+    error::{AppError, Protocol, protocol_error_response},
     protocol::{
         internal::{InternalEvent, InternalRequest},
         openai_chat::ChatRequest,
@@ -13,7 +13,7 @@ use crate::{
 };
 use axum::{
     Json,
-    extract::State,
+    extract::{State, rejection::JsonRejection},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -22,6 +22,29 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::json;
 use std::{collections::HashMap, convert::Infallible};
+
+pub async fn route(
+    State(state): State<AppState>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
+) -> Response {
+    match body {
+        Ok(body) => match chat_completions(State(state), body).await {
+            Ok(response) => response,
+            Err(error) => protocol_error_response(Protocol::ChatCompletions, error),
+        },
+        Err(rejection) => {
+            let message = rejection.to_string();
+            let error = if message.to_ascii_lowercase().contains("limit")
+                || message.to_ascii_lowercase().contains("too large")
+            {
+                AppError::PayloadTooLarge
+            } else {
+                AppError::BadRequest(format!("invalid JSON request: {message}"))
+            };
+            protocol_error_response(Protocol::ChatCompletions, error)
+        }
+    }
+}
 
 pub async fn chat_completions(
     State(state): State<AppState>,
@@ -59,7 +82,6 @@ pub async fn chat_completions(
                 Ok(event) => event,
                 Err(error) => {
                     yield Ok(Event::default().event("error").data(json!({"error":{"message":error.to_string(),"type":"upstream_error"}}).to_string()));
-                    yield Ok(Event::default().data(json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}).to_string()));
                     yield Ok(Event::default().data("[DONE]"));
                     failed = true;
                     break;
@@ -67,14 +89,12 @@ pub async fn chat_completions(
             };
             if let InternalEvent::Error { message } = &event {
                 yield Ok(Event::default().event("error").data(json!({"error":{"message":message,"type":"upstream_error"}}).to_string()));
-                yield Ok(Event::default().data(json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}).to_string()));
                 yield Ok(Event::default().data("[DONE]"));
                 failed = true;
                 break;
             }
             if let Err(error) = accumulator.push(event.clone()) {
                 yield Ok(Event::default().event("error").data(json!({"error":{"message":error.to_string(),"type":"upstream_error"}}).to_string()));
-                yield Ok(Event::default().data(json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}).to_string()));
                 yield Ok(Event::default().data("[DONE]"));
                 failed = true;
                 break;

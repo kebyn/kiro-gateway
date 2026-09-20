@@ -16,10 +16,10 @@ pub fn router(state: AppState) -> Router {
     let health_route = Router::new().route("/health", get(health));
     let protected = Router::new()
         .route("/v1/models", get(models))
-        .route("/v1/messages", post(anthropic::messages))
-        .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
-        .route("/v1/chat/completions", post(openai::chat_completions))
-        .route("/v1/responses", post(responses::create))
+        .route("/v1/messages", post(anthropic::route))
+        .route("/v1/messages/count_tokens", post(anthropic::count_tokens_route))
+        .route("/v1/chat/completions", post(openai::route))
+        .route("/v1/responses", post(responses::create_route))
         .route("/v1/responses/{id}", get(responses::get).delete(responses::delete))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
