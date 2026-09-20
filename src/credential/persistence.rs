@@ -64,6 +64,11 @@ pub fn write_json(path: &Path, credential: &Credential) -> Result<(), AppError> 
         file.write_all(&body).map_err(|e| AppError::Credential(e.to_string()))?;
         file.sync_all().map_err(|e| AppError::Credential(e.to_string()))?;
         fs::rename(&temp, path).map_err(|e| AppError::Credential(e.to_string()))?;
+        // Persist the directory entry as well so a crash cannot leave the
+        // old name pointing at an indeterminate temporary file.
+        if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
+            let _ = directory.sync_all();
+        }
         Ok(())
     })();
     if result.is_err() {

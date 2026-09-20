@@ -96,6 +96,7 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
             "multiple credentials discovered; configure exactly one credential".into(),
         ));
     }
+    candidates[0].credential.validate_external().map_err(AppError::Credential)?;
     Ok(candidates)
 }
 
