@@ -78,6 +78,9 @@ pub async fn chat_completions(
         let mut next_tool_index = 0_usize;
         let mut text_filter = XmlLeakFilter::new();
         let mut failed = false;
+        let chunk = |delta: serde_json::Value| {
+            json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":delta,"finish_reason":null}]})
+        };
         while let Some(item) = upstream.next().await {
             let event = match item {
                 Ok(event) => event,
@@ -100,9 +103,6 @@ pub async fn chat_completions(
                 failed = true;
                 break;
             }
-            let chunk = |delta: serde_json::Value| {
-                json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":delta,"finish_reason":null}]})
-            };
             match event {
                 InternalEvent::TextDelta { text } if !text.is_empty() => {
                     let text = text_filter.push(&text);
@@ -136,6 +136,10 @@ pub async fn chat_completions(
             }
         }
         if failed { return; }
+        let tail = text_filter.finish();
+        if !tail.is_empty() {
+            yield Ok(Event::default().data(chunk(json!({"content":tail})).to_string()));
+        }
         let response = accumulator.finish();
         tracing::debug!(
             protocol = "openai_chat",

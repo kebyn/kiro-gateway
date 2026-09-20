@@ -133,7 +133,7 @@ pub fn protocol_error_response(protocol: Protocol, error: AppError) -> Response 
         Protocol::Responses => (
             serde_json::json!({
                 "error": {
-                    "type": "invalid_request_error",
+                    "type": responses_error_type(status),
                     "code": responses_error_code(status),
                     "message": message
                 }
@@ -151,6 +151,7 @@ pub fn anthropic_error_type(status: StatusCode) -> &'static str {
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
         StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
         StatusCode::BAD_GATEWAY => "api_error",
+        StatusCode::NOT_FOUND => "not_found_error",
         _ => "api_error",
     }
 }
@@ -161,6 +162,7 @@ fn openai_error_type(status: StatusCode) -> &'static str {
         StatusCode::UNAUTHORIZED => "authentication_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
         StatusCode::BAD_GATEWAY => "upstream_error",
+        StatusCode::NOT_FOUND => "invalid_request_error",
         _ => "server_error",
     }
 }
@@ -170,6 +172,7 @@ fn openai_error_code(status: StatusCode) -> Option<&'static str> {
         StatusCode::BAD_GATEWAY => Some("upstream_error"),
         StatusCode::PAYLOAD_TOO_LARGE => Some("request_too_large"),
         StatusCode::TOO_MANY_REQUESTS => Some("rate_limit_exceeded"),
+        StatusCode::NOT_FOUND => Some("not_found"),
         _ => None,
     }
 }
@@ -180,7 +183,18 @@ fn responses_error_code(status: StatusCode) -> &'static str {
         StatusCode::BAD_GATEWAY => "upstream_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_exceeded",
         StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::NOT_FOUND => "not_found",
         _ => "server_error",
+    }
+}
+
+fn responses_error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::BAD_GATEWAY => "api_error",
+        StatusCode::INTERNAL_SERVER_ERROR => "server_error",
+        _ => "invalid_request_error",
     }
 }
 

@@ -546,6 +546,23 @@ fn responses_live_stream(
             );
         }
         if failed { return; }
+        let tail = text_filter.finish();
+        if !tail.is_empty() {
+            let (item_id, output_index, added) = live.ensure_text();
+            if added {
+                let item = json!({"type":"message","id":item_id,"status":"in_progress","role":"assistant","content":[]});
+                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":output_index,"item":item})) {
+                    yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
+                }
+                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.content_part.added", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}})) {
+                    yield Ok(Event::default().event("response.content_part.added").data(data.to_string()));
+                }
+            }
+            live.text.push_str(&tail);
+            if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_text.delta", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"delta":tail,"logprobs":[]})) {
+                yield Ok(Event::default().event("response.output_text.delta").data(data.to_string()));
+            }
+        }
         let response = accumulator.finish();
         tracing::debug!(
             protocol = "openai_responses",

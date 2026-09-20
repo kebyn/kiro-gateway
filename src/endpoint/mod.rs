@@ -23,8 +23,12 @@ pub enum EndpointKind {
 }
 
 impl EndpointKind {
-    pub fn parse(value: &str) -> Self {
-        if value.eq_ignore_ascii_case("cli") { Self::Cli } else { Self::Ide }
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        match value {
+            "ide" => Ok(Self::Ide),
+            "cli" => Ok(Self::Cli),
+            _ => Err(AppError::Config(format!("unsupported endpoint: {value}"))),
+        }
     }
 }
 
@@ -36,19 +40,20 @@ pub enum EndpointPolicy {
 }
 
 impl EndpointPolicy {
-    pub fn parse(value: &str) -> Self {
-        match value.to_ascii_lowercase().as_str() {
-            "auto" => Self::Auto,
-            "cli" => Self::Cli,
-            _ => Self::Ide,
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "cli" => Ok(Self::Cli),
+            "ide" => Ok(Self::Ide),
+            _ => Err(AppError::Config(format!("unsupported endpoint: {value}"))),
         }
     }
 
-    pub fn resolve(self, credential_endpoint: &str) -> EndpointKind {
+    pub fn resolve(self, credential_endpoint: &str) -> Result<EndpointKind, AppError> {
         match self {
             Self::Auto => EndpointKind::parse(credential_endpoint),
-            Self::Ide => EndpointKind::Ide,
-            Self::Cli => EndpointKind::Cli,
+            Self::Ide => Ok(EndpointKind::Ide),
+            Self::Cli => Ok(EndpointKind::Cli),
         }
     }
 }
@@ -129,15 +134,15 @@ mod endpoint_policy_tests {
 
     #[test]
     fn auto_policy_uses_credential_endpoint() {
-        assert_eq!(EndpointPolicy::Auto.resolve("cli"), EndpointKind::Cli);
-        assert_eq!(EndpointPolicy::Auto.resolve("ide"), EndpointKind::Ide);
-        assert_eq!(EndpointPolicy::Auto.resolve("unknown"), EndpointKind::Ide);
+        assert_eq!(EndpointPolicy::Auto.resolve("cli").unwrap(), EndpointKind::Cli);
+        assert_eq!(EndpointPolicy::Auto.resolve("ide").unwrap(), EndpointKind::Ide);
+        assert!(EndpointPolicy::Auto.resolve("unknown").is_err());
     }
 
     #[test]
     fn explicit_policy_overrides_credential_endpoint() {
-        assert_eq!(EndpointPolicy::Ide.resolve("cli"), EndpointKind::Ide);
-        assert_eq!(EndpointPolicy::Cli.resolve("ide"), EndpointKind::Cli);
+        assert_eq!(EndpointPolicy::Ide.resolve("cli").unwrap(), EndpointKind::Ide);
+        assert_eq!(EndpointPolicy::Cli.resolve("ide").unwrap(), EndpointKind::Cli);
     }
 }
 

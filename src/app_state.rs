@@ -60,7 +60,7 @@ impl AppState {
 pub fn build_upstream(config: &AppConfig, client: reqwest::Client) -> Arc<UpstreamClient> {
     Arc::new(UpstreamClient::with_policy_and_limit(
         client,
-        EndpointPolicy::parse(&config.endpoint),
+        EndpointPolicy::parse(&config.endpoint).expect("AppConfig validates endpoint before build"),
         config.upstream_url.clone(),
         config.max_upstream_body_bytes,
     ))

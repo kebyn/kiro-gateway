@@ -251,6 +251,25 @@ pub async fn messages(
             }
         }
         if failed { return; }
+        let tail = text_filter.finish();
+        if !tail.is_empty() {
+            if let Some(index) = thinking_index {
+                if closed_blocks.insert(index) {
+                    yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
+                }
+            }
+            let was_none = text_index.is_none();
+            let index = *text_index.get_or_insert_with(|| {
+                let value = next_index;
+                next_index += 1;
+                value
+            });
+            if was_none {
+                block_order.push(index);
+                yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}).to_string()));
+            }
+            yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":tail}}).to_string()));
+        }
         let response = accumulator.finish();
         tracing::debug!(
             protocol = "anthropic",

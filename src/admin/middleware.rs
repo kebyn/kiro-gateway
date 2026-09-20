@@ -20,11 +20,15 @@ pub async fn client_api_key(
     {
         Ok(next.run(request).await)
     } else {
-        let protocol = match request.uri().path() {
-            "/v1/messages" | "/v1/messages/count_tokens" => Some(Protocol::Anthropic),
-            "/v1/chat/completions" => Some(Protocol::ChatCompletions),
-            "/v1/responses" => Some(Protocol::Responses),
-            _ => None,
+        let path = request.uri().path();
+        let protocol = if matches!(path, "/v1/messages" | "/v1/messages/count_tokens") {
+            Some(Protocol::Anthropic)
+        } else if path == "/v1/chat/completions" {
+            Some(Protocol::ChatCompletions)
+        } else if path == "/v1/responses" || path.starts_with("/v1/responses/") {
+            Some(Protocol::Responses)
+        } else {
+            None
         };
         match protocol {
             Some(protocol) => Ok(protocol_error_response(protocol, AppError::Unauthorized)),
