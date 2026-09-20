@@ -137,6 +137,7 @@ mod tests {
         let config = AppConfig {
             client_api_key: "client".into(),
             admin_api_key: "admin".into(),
+            admin: AdminConfig { enabled: true, ..Default::default() },
             response_store_path: directory.path().join("responses.sqlite3").display().to_string(),
             ..Default::default()
         };
@@ -370,6 +371,7 @@ mod tests {
             client_api_key: "client".into(),
             admin_api_key: "admin".into(),
             admin: AdminConfig {
+                enabled: true,
                 login_rate_limit_per_minute: 1,
                 cookie_secure: false,
                 ..Default::default()
