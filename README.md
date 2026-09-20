@@ -18,12 +18,13 @@
 
 ### 使用环境变量凭据
 
+此示例使用运行时默认配置，Admin 默认关闭；只有将 `admin.enabled` 设为 `true` 时才需要 `KIRO_ADMIN_API_KEY`。
+
 ```sh
 cp config.example.json config.json
 chmod 600 config.json
 
 export KIRO_CLIENT_API_KEY='client-key-change-me'
-export KIRO_ADMIN_API_KEY='admin-key-change-me'
 export KIRO_CREDENTIAL_SOURCE='env'
 export KIRO_ACCESS_TOKEN='access-token-from-your-provider'
 
@@ -46,6 +47,26 @@ cargo build --release --locked
 ```
 
 `--config` 也可通过 `KIRO_CONFIG` 指定。`--check-config` 会解析并打印最终配置后退出；敏感字段会显示为 `[REDACTED]`，但仍不要把输出写入共享日志。
+
+### 生成网关配置
+
+`--generate-config [PATH]` 会生成一份完整的 JSON 配置，其中包含两组由操作系统密码学随机源生成的、彼此独立的网关密钥，并默认启用 Admin：
+
+```sh
+cargo run --locked -- --generate-config config.json
+export KIRO_ACCESS_TOKEN='access-token-from-your-provider'
+cargo run --locked -- --config config.json
+```
+
+生成的文件只会填入网关的 `client_api_key` 和 `admin_api_key`，不会也无法替你生成上游 Kiro 凭据。启动前至少设置
+`KIRO_ACCESS_TOKEN`、`KIRO_REFRESH_TOKEN` 或 `KIRO_API_KEY` 其中一种（也可以把配置改为 JSON/SQLite 凭据来源）。生成文件含有敏感密钥，程序会以 `0600` 权限独占创建；目标文件已存在时不会覆盖。省略路径时配置会完整写到 stdout，使用重定向保存时请由调用者自行保护文件权限：
+
+```sh
+cargo run --locked -- --generate-config > config.json
+chmod 600 config.json
+```
+
+运行时的 `AppConfig` 默认值仍为 `admin.enabled=false`。因此不使用生成配置时，只设置客户端密钥和上游凭据即可启动；只有显式启用 Admin（包括使用生成配置）时才需要 `admin_api_key`。`--generate-config` 与 `--check-config` 不能同时使用。
 
 ### Docker
 
@@ -199,7 +220,7 @@ curl -N -i \
 | `port` | `8990` | 监听端口，不能为 `0` |
 | `client_api_key` | 空 | `/v1/*` 客户端密钥，必填 |
 | `admin_api_key` | 空 | Admin 登录密钥；`admin.enabled=true` 时必填 |
-| `admin.enabled` | `true` | 为 `false` 时不注册 `/admin` 页面及 `/admin/*`、`/api/admin/*` 路由 |
+| `admin.enabled` | `false` | 为 `false` 时不注册 `/admin` 页面及 `/admin/*`、`/api/admin/*` 路由；`--generate-config` 生成的配置会显式设为 `true` |
 | `admin.session_ttl_secs` | `28800` | 内存会话有效期，秒 |
 | `admin.cookie_secure` | `true` | 是否为 Admin Cookie 添加 `Secure` |
 | `admin.allowed_origins` | `[]` | 非空时检查带 `Origin` 的 Admin 请求 |

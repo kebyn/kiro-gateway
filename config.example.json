@@ -4,7 +4,7 @@
   "client_api_key": "sk-client-change-me",
   "admin_api_key": "sk-admin-change-me",
   "admin": {
-    "enabled": true,
+    "enabled": false,
     "session_ttl_secs": 28800,
     "cookie_secure": false,
     "allowed_origins": [],
