@@ -252,11 +252,13 @@ pub async fn messages(
         if failed { return; }
         let response = accumulator.finish();
         tracing::debug!(
+            protocol = "anthropic",
             model = %model,
             text_chars = response.text.chars().count(),
             thinking_chars = response.thinking.chars().count(),
             tool_calls = response.tool_calls.len(),
             stop_reason = ?response.stop_reason,
+            stream_end_status = if response.incomplete { "incomplete" } else { "completed" },
             "completed Anthropic SSE response"
         );
         for index in block_order {

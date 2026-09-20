@@ -16,6 +16,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
+use std::time::Instant;
 use std::{collections::HashSet, pin::Pin};
 
 pub type InternalEventStream = Pin<Box<dyn Stream<Item = Result<InternalEvent, AppError>> + Send>>;
@@ -63,6 +64,7 @@ impl UpstreamClient {
         let credential = credential.clone();
         Ok(Box::pin(stream! {
             for attempt in 0..=1_u8 {
+                let started = Instant::now();
                 let endpoint = endpoint_for(
                     endpoint_policy.resolve(&credential.endpoint),
                     upstream_url.as_deref(),
@@ -107,6 +109,13 @@ impl UpstreamClient {
                     }
                     match json_events(&body) {
                         Ok(events) => {
+                            tracing::debug!(
+                                model = %request.model,
+                                events = events.len(),
+                                stream_end_status = "completed",
+                                upstream_ms = started.elapsed().as_millis() as u64,
+                                "upstream JSON response ended"
+                            );
                             for event in events {
                                 yield Ok(event);
                             }
@@ -210,6 +219,8 @@ impl UpstreamClient {
                     model = %request.model,
                     events = event_count,
                     completed = integrity.completed,
+                    stream_end_status = if integrity.completed { "completed" } else { "incomplete" },
+                    upstream_ms = started.elapsed().as_millis() as u64,
                     "upstream event stream ended"
                 );
                 return;

@@ -546,6 +546,12 @@ fn responses_live_stream(
         }
         if failed { return; }
         let response = accumulator.finish();
+        tracing::debug!(
+            protocol = "openai_responses",
+            model = %model,
+            stream_end_status = if response.incomplete { "incomplete" } else { "completed" },
+            "OpenAI Responses stream completed"
+        );
         let payload = responses_payload_with_live_items(&id, &model, &response, &live, created_at);
         // Close every item in the same arrival order used for output_index.
         if live.item_order.is_empty() {

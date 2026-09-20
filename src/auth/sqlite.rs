@@ -133,7 +133,9 @@ fn load_state_tables(conn: &Connection) -> Vec<Credential> {
             if let Ok(rows) = stmt.query_map([], |row| read_text_value(row, 0)) {
                 for raw in rows.flatten().flatten() {
                     if let Some(c) = parse_token(&raw) {
-                        out.push(c);
+                        let mut credential = c;
+                        credential.auth_method = AuthMethod::Oidc;
+                        out.push(credential);
                     }
                 }
             }
