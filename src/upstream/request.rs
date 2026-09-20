@@ -62,11 +62,12 @@ impl UpstreamClient {
         let max_body_bytes = self.max_body_bytes;
         let request = request.clone();
         let credential = credential.clone();
+        let endpoint_kind = endpoint_policy.resolve(&credential.endpoint)?;
         Ok(Box::pin(stream! {
             for attempt in 0..=1_u8 {
                 let started = Instant::now();
                 let endpoint = endpoint_for(
-                    endpoint_policy.resolve(&credential.endpoint),
+                    endpoint_kind,
                     upstream_url.as_deref(),
                 );
                 let response = match send_once(&client, &endpoint, &request, &credential).await {
