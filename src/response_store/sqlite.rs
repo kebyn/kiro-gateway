@@ -71,9 +71,13 @@ impl SqliteStore {
     }
     pub fn put(&self, record: &ResponseRecord) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|_| AppError::Storage("store lock poisoned".into()))?;
+        let status = serde_json::to_string(&record.status)
+            .map_err(|error| AppError::Storage(format!("serialize response status: {error}")))?;
+        let payload = serde_json::to_string(&record.payload)
+            .map_err(|error| AppError::Storage(format!("serialize response payload: {error}")))?;
         conn.execute(
             "INSERT INTO responses(id, object, status, model, payload, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET object=excluded.object, status=excluded.status, model=excluded.model, payload=excluded.payload, created_at=excluded.created_at, updated_at=excluded.updated_at",
-            params![record.id, record.object, serde_json::to_string(&record.status)?, record.model, serde_json::to_string(&record.payload)?, record.created_at.timestamp(), record.updated_at.timestamp()],
+            params![record.id, record.object, status, record.model, payload, record.created_at.timestamp(), record.updated_at.timestamp()],
         )?;
         harden_sidecars(&self.path);
         Ok(())
@@ -108,7 +112,7 @@ impl SqliteStore {
         }
         conn.execute(
             "INSERT INTO response_events(response_id, sequence_number, event_type, payload, created_at) VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![response_id, sequence, event_type, serde_json::to_string(&stored_payload)?, created_at.timestamp()],
+            params![response_id, sequence, event_type, serde_json::to_string(&stored_payload).map_err(|error| AppError::Storage(format!("serialize response event: {error}")))?, created_at.timestamp()],
         )?;
         harden_sidecars(&self.path);
         Ok(ResponseEvent {
