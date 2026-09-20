@@ -166,4 +166,15 @@ mod tests {
             .unwrap();
         assert!(table.is_none());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_store_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("responses.sqlite3");
+        let _store = ResponseStore::open(&path).unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
 }
