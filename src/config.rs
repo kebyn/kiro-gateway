@@ -404,6 +404,13 @@ mod tests {
     }
 
     #[test]
+    fn client_key_only_uses_the_disabled_admin_default() {
+        let config = AppConfig { client_api_key: "client".into(), ..Default::default() };
+        assert!(!config.admin.enabled);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn enabled_admin_requires_an_admin_key() {
         let config = AppConfig {
             client_api_key: "client".into(),
