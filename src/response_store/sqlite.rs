@@ -5,13 +5,20 @@ use crate::{
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
-use std::path::Path;
+use std::{
+    fs::{self, OpenOptions},
+    path::Path,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub struct SqliteStore {
     conn: std::sync::Mutex<Connection>,
 }
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, AppError> {
+        prepare_store_file(path)?;
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(include_str!("../../migrations/001_initial.sql"))?;
@@ -123,4 +130,23 @@ impl SqliteStore {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
     }
+}
+
+fn prepare_store_file(path: &Path) -> Result<(), AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let file = options.open(path).map_err(|error| AppError::Storage(error.to_string()))?;
+            file.sync_all().map_err(|error| AppError::Storage(error.to_string()))?;
+        }
+        Err(error) => return Err(AppError::Storage(error.to_string())),
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| AppError::Storage(error.to_string()))?;
+    Ok(())
 }
