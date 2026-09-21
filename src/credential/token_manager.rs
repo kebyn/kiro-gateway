@@ -30,6 +30,7 @@ pub struct TokenManager {
     timeout: Duration,
     token_endpoint: Option<String>,
     persistence_path: Option<std::path::PathBuf>,
+    model_aliases: std::collections::HashMap<String, String>,
     model_catalog: Arc<ModelCatalog>,
 }
 
@@ -59,6 +60,7 @@ impl TokenManager {
                 .credential_json_path
                 .as_ref()
                 .map(|v| AppConfig::expanded_path(v)),
+            model_aliases: config.model_aliases.clone(),
             model_catalog,
         })
     }
@@ -95,6 +97,28 @@ impl TokenManager {
         } else {
             Err(AppError::BadRequest(format!("model is not available: {model}")))
         }
+    }
+
+    pub async fn resolve_model(&self, requested: &str) -> Result<String, AppError> {
+        let resolved = match self.model_aliases.get(requested).map(String::as_str) {
+            Some("@first") => self
+                .available_models()
+                .await
+                .map_err(|_error| {
+                    tracing::warn!(
+                        error_class = "model_discovery",
+                        "model discovery failed while resolving a model alias"
+                    );
+                    AppError::BadRequest("no models are currently available".into())
+                })?
+                .first()
+                .map(|model| model.model_id.clone())
+                .ok_or_else(|| AppError::BadRequest("no models are currently available".into()))?,
+            Some(target) => target.to_owned(),
+            None => requested.to_owned(),
+        };
+        self.validate_model(&resolved).await?;
+        Ok(resolved)
     }
 
     #[cfg(test)]
@@ -187,6 +211,7 @@ mod tests {
         config::AppConfig,
         model_catalog::ModelInfo,
     };
+    use std::collections::HashMap;
 
     #[test]
     fn replacing_credential_invalidates_cached_models() {
@@ -211,5 +236,41 @@ mod tests {
         manager.replace_credential(Credential::default());
 
         assert!(!manager.model_catalog.has_cached_result());
+    }
+
+    #[tokio::test]
+    async fn resolves_configured_model_aliases_against_catalog() {
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            model_aliases: HashMap::from([
+                ("claude-sonnet-5".into(), "gpt-5.6-sol".into()),
+                ("claude-haiku-4-5".into(), "@first".into()),
+            ]),
+            ..Default::default()
+        };
+        let manager = TokenManager::new(
+            &config,
+            Credential { auth_method: AuthMethod::ApiKey, ..Default::default() },
+        )
+        .unwrap();
+        manager.seed_models_for_tests(vec![
+            ModelInfo {
+                model_id: "gpt-5.6-sol".into(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+            ModelInfo {
+                model_id: "gpt-5.6-terra".into(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+        ]);
+
+        assert_eq!(manager.resolve_model("claude-sonnet-5").await.unwrap(), "gpt-5.6-sol");
+        assert_eq!(manager.resolve_model("claude-haiku-4-5").await.unwrap(), "gpt-5.6-sol");
+        assert_eq!(manager.resolve_model("gpt-5.6-terra").await.unwrap(), "gpt-5.6-terra");
     }
 }

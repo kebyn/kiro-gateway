@@ -50,8 +50,8 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(body): Json<ChatRequest>,
 ) -> Result<Response, AppError> {
-    let request: InternalRequest = body.into();
-    state.token_manager.validate_model(&request.model).await?;
+    let mut request: InternalRequest = body.into();
+    request.model = state.token_manager.resolve_model(&request.model).await?;
     tracing::debug!(
         protocol = "openai_chat",
         model = %request.model,

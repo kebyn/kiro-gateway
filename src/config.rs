@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     str::FromStr,
@@ -54,6 +55,7 @@ pub struct AppConfig {
     pub refresh_early_secs: i64,
     pub refresh_interval_secs: u64,
     pub model_cache_ttl_secs: u64,
+    pub model_aliases: HashMap<String, String>,
     pub response_store_path: String,
     pub max_request_body_bytes: usize,
     pub max_upstream_body_bytes: usize,
@@ -83,6 +85,7 @@ impl Default for AppConfig {
             refresh_early_secs: 120,
             refresh_interval_secs: 30,
             model_cache_ttl_secs: 300,
+            model_aliases: HashMap::new(),
             response_store_path: "kiro-gateway.sqlite3".to_owned(),
             max_request_body_bytes: 8 * 1024 * 1024,
             max_upstream_body_bytes: 16 * 1024 * 1024,
@@ -172,6 +175,9 @@ impl AppConfig {
         if let Some(v) = env_parse("KIRO_MODEL_CACHE_TTL_SECS")? {
             self.model_cache_ttl_secs = v;
         }
+        if let Some(value) = env_string("KIRO_MODEL_ALIASES") {
+            self.model_aliases = parse_model_aliases(&value)?;
+        }
         if let Some(v) = env_parse("KIRO_MAX_REQUEST_BODY_BYTES")? {
             self.max_request_body_bytes = v;
         }
@@ -235,6 +241,13 @@ impl AppConfig {
         if self.model_cache_ttl_secs == 0 {
             return Err(AppError::Config("model_cache_ttl_secs must be positive".into()));
         }
+        for (alias, target) in &self.model_aliases {
+            if alias.trim().is_empty() || target.trim().is_empty() {
+                return Err(AppError::Config(
+                    "model_aliases entries must have non-empty names and targets".into(),
+                ));
+            }
+        }
         if self.refresh_early_secs < 0 {
             return Err(AppError::Config("refresh_early_secs must not be negative".into()));
         }
@@ -296,6 +309,27 @@ fn env_string(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+fn parse_model_aliases(value: &str) -> Result<HashMap<String, String>, AppError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (alias, target) = entry.split_once('=').ok_or_else(|| {
+                AppError::Config("KIRO_MODEL_ALIASES entries must use alias=target".into())
+            })?;
+            let alias = alias.trim();
+            let target = target.trim();
+            if alias.is_empty() || target.is_empty() {
+                return Err(AppError::Config(
+                    "KIRO_MODEL_ALIASES entries must have non-empty names and targets".into(),
+                ));
+            }
+            Ok((alias.to_owned(), target.to_owned()))
+        })
+        .collect()
+}
+
 fn env_parse<T>(name: &str) -> Result<Option<T>, AppError>
 where
     T: FromStr,
@@ -325,7 +359,7 @@ fn env_bool(name: &str) -> Result<Option<bool>, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminConfig, AppConfig};
+    use super::{AdminConfig, AppConfig, parse_model_aliases};
 
     #[test]
     fn runtime_defaults_disable_admin() {
@@ -357,12 +391,21 @@ mod tests {
     #[test]
     fn canonical_fields_are_accepted() {
         let config: AppConfig = serde_json::from_str(
-            r#"{"client_api_key":"client","admin_api_key":"admin","endpoint":"cli"}"#,
+            r#"{"client_api_key":"client","admin_api_key":"admin","endpoint":"cli","model_aliases":{"claude-sonnet-5":"@first"}}"#,
         )
         .unwrap();
         assert_eq!(config.client_api_key, "client");
         assert_eq!(config.endpoint, "cli");
+        assert_eq!(config.model_aliases["claude-sonnet-5"], "@first");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn model_aliases_require_alias_and_target() {
+        assert!(parse_model_aliases("claude-sonnet-5=@first,haiku=gpt-5.6-sol").is_ok());
+        assert!(parse_model_aliases("claude-sonnet-5").is_err());
+        assert!(parse_model_aliases("=gpt-5.6-sol").is_err());
+        assert!(parse_model_aliases("claude-sonnet-5=").is_err());
     }
 
     #[test]

@@ -65,7 +65,7 @@ pub async fn create(
     if internal.tools.is_empty() {
         internal.tools = previous_tools;
     }
-    state.token_manager.validate_model(&internal.model).await?;
+    internal.model = state.token_manager.resolve_model(&internal.model).await?;
     tracing::debug!(
         protocol = "openai_responses",
         model = %internal.model,
