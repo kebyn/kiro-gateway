@@ -184,6 +184,9 @@ impl UpstreamClient {
                         };
                         for event in events {
                             event_count += 1;
+                            if event_marks_completion(&event) {
+                                integrity.completed = true;
+                            }
                             // Empty metadata/context frames are intentionally
                             // not emitted by the decoder. Every yielded event
                             // is therefore observable protocol data.
@@ -279,6 +282,10 @@ async fn send_once(
         return Err(SendOnceError::Application(endpoint.classify_error(status, &body)));
     }
     Ok(response)
+}
+
+fn event_marks_completion(event: &InternalEvent) -> bool {
+    matches!(event, InternalEvent::Stop { .. } | InternalEvent::ToolCallEnd { complete: true, .. })
 }
 
 /// Converts a complete JSON response into the same logical events produced by
@@ -709,8 +716,8 @@ fn is_empty_stream(response: &crate::protocol::internal::InternalResponse) -> bo
 #[cfg(test)]
 mod tests {
     use super::{
-        UpstreamClient, apply_internal_event, finish_stream_response, is_empty_stream, json_events,
-        parse_json_tool_calls,
+        UpstreamClient, apply_internal_event, event_marks_completion, finish_stream_response,
+        is_empty_stream, json_events, parse_json_tool_calls,
     };
     use crate::{
         auth::{AuthMethod, Credential, SecretString},
@@ -1213,6 +1220,20 @@ mod tests {
             assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
             assert!(!response.incomplete);
         }
+    }
+
+    #[test]
+    fn completion_logging_tracks_terminal_internal_events() {
+        assert!(event_marks_completion(&InternalEvent::Stop { reason: "end_turn".into() }));
+        assert!(event_marks_completion(&InternalEvent::ToolCallEnd {
+            id: "call_1".into(),
+            complete: true,
+        }));
+        assert!(!event_marks_completion(&InternalEvent::ToolCallEnd {
+            id: "call_1".into(),
+            complete: false,
+        }));
+        assert!(!event_marks_completion(&InternalEvent::TextDelta { text: "answer".into() }));
     }
 
     #[test]
