@@ -271,9 +271,12 @@ async fn send_once(
         .map_err(|error| SendOnceError::Transport(error.to_string()))?;
     if !response.status().is_success() {
         let status = response.status();
-        // Do not retain or log an upstream error body; the protocol adapters
-        // expose only a classified, sanitized error.
-        return Err(SendOnceError::Application(endpoint.classify_error(status, "")));
+        let body = response
+            .bytes()
+            .await
+            .map(|body| String::from_utf8_lossy(&body[..body.len().min(4096)]).into_owned())
+            .unwrap_or_default();
+        return Err(SendOnceError::Application(endpoint.classify_error(status, &body)));
     }
     Ok(response)
 }
