@@ -5,8 +5,10 @@ use crate::{
     AppState,
     error::{AppError, Protocol, protocol_error_response},
     protocol::{
-        anthropic::{CountTokensRequest, MessagesRequest},
-        internal::{InternalEvent, InternalRequest},
+        anthropic::{
+            AnthropicMessage, CountTokensRequest, MessagesRequest, parse_message, text_value,
+        },
+        internal::{InternalEvent, InternalRequest, content_text},
     },
     transform::converter::{anthropic_response, anthropic_stop_reason},
     upstream::request::InternalEventAccumulator,
@@ -75,6 +77,7 @@ pub async fn messages(
     State(state): State<AppState>,
     Json(body): Json<MessagesRequest>,
 ) -> Result<Response, AppError> {
+    body.validate().map_err(AppError::BadRequest)?;
     let mut request: InternalRequest = body.into();
     request.model = state.token_manager.resolve_model(&request.model).await?;
     tracing::debug!(
@@ -369,18 +372,28 @@ pub async fn count_tokens(
     State(state): State<AppState>,
     Json(body): Json<CountTokensRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    body.validate().map_err(AppError::BadRequest)?;
     state.token_manager.resolve_model(&body._model).await?;
+    let system = body._system.as_ref().map(text_value).unwrap_or_default();
     let text = body
         .messages
         .iter()
-        .map(|message| match &message.content {
-            serde_json::Value::String(v) => v.clone(),
-            v => v.to_string(),
+        .map(|message| -> Result<String, AppError> {
+            let parsed = parse_message(AnthropicMessage {
+                role: message.role.clone(),
+                content: message.content.clone(),
+            });
+            if let Err(error) = parsed.validate_content() {
+                return Err(AppError::BadRequest(error));
+            }
+            Ok(content_text(&parsed))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, _>>()?
         .join(" ");
     let tools = serde_json::to_string(&body.tools).unwrap_or_default();
-    Ok(Json(json!({"input_tokens": (text.chars().count() + tools.chars().count()) as u64 / 4 + 1})))
+    Ok(Json(
+        json!({"input_tokens": (system.chars().count() + text.chars().count() + tools.chars().count()) as u64 / 4 + 1}),
+    ))
 }
 
 #[cfg(test)]

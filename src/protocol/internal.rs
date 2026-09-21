@@ -60,6 +60,23 @@ impl InternalMessage {
             .chain(self.tool_results.iter().cloned().map(InternalContent::ToolResult))
             .collect()
     }
+
+    pub fn validate_content(&self) -> Result<(), String> {
+        if self.content.is_null() {
+            return Ok(());
+        }
+        if self
+            .normalized_content()
+            .into_iter()
+            .any(|content| matches!(content, InternalContent::Unknown(_)))
+        {
+            return Err(format!(
+                "unsupported content in {} message; only text content is supported",
+                self.role
+            ));
+        }
+        Ok(())
+    }
 }
 
 const MAX_CONTENT_DEPTH: usize = 8;
@@ -283,5 +300,12 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, InternalContent::Unknown(_)))
         );
+    }
+
+    #[test]
+    fn rejects_non_text_message_blocks() {
+        let message =
+            InternalMessage::new("user", json!([{"type":"input_image","image_url":"data:..."}]));
+        assert!(message.validate_content().is_err());
     }
 }

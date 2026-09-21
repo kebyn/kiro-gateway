@@ -1,5 +1,6 @@
 use crate::protocol::internal::{
     InternalMessage, InternalRequest, InternalTool, InternalToolCall, InternalToolResult,
+    content_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,6 +42,7 @@ impl ResponsesRequest {
         if self.model.trim().is_empty() {
             return Err("model must not be empty".into());
         }
+        validate_tool_choice(self.tool_choice.as_ref())?;
         let validate_item = |item: &Value| -> Result<(), String> {
             match item.get("type").and_then(Value::as_str) {
                 Some("additional_tools") => {
@@ -66,7 +68,16 @@ impl ResponsesRequest {
                     {
                         return Err("message requires role and content".into());
                     }
+                    let message = InternalMessage::new(
+                        item.get("role").and_then(Value::as_str).unwrap_or_default(),
+                        item.get("content").cloned().unwrap_or(Value::Null),
+                    );
+                    message.validate_content()?;
                 }
+                // Codex resends reasoning items as opaque history. They are
+                // accepted for compatibility but are intentionally not sent
+                // to the upstream model.
+                Some("reasoning") => {}
                 Some(other) => return Err(format!("unsupported Responses input type: {other}")),
                 None => {}
             }
@@ -94,11 +105,18 @@ impl ResponsesRequest {
         let mut messages = previous;
         let previous_len = messages.len();
         let mut tools = self.tools.into_iter().filter_map(parse_tool).collect::<Vec<_>>();
+        let mut instructions = self.instructions;
         match self.input {
             Value::Array(items) => {
                 for item in items {
                     if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
                         tools.extend(parse_additional_tools(&item));
+                        continue;
+                    }
+                    if is_instruction_item(&item) {
+                        if let Some(content) = item.get("content").cloned() {
+                            append_instruction(&mut instructions, content);
+                        }
                         continue;
                     }
                     append_item(&mut messages, &item, previous_len);
@@ -108,6 +126,10 @@ impl ResponsesRequest {
             item @ Value::Object(_) => {
                 if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
                     tools.extend(parse_additional_tools(&item));
+                } else if is_instruction_item(&item) {
+                    if let Some(content) = item.get("content").cloned() {
+                        append_instruction(&mut instructions, content);
+                    }
                 } else if !append_item(&mut messages, &item, previous_len) {
                     messages.push(InternalMessage::new("user", item));
                 }
@@ -124,13 +146,47 @@ impl ResponsesRequest {
             max_tokens: None,
             temperature: None,
             conversation_id: self.conversation.or(self.previous_response_id),
-            instructions: self.instructions,
+            instructions,
         }
+    }
+}
+
+fn validate_tool_choice(choice: Option<&Value>) -> Result<(), String> {
+    let Some(choice) = choice else { return Ok(()) };
+    match choice {
+        Value::String(value) if value == "auto" => Ok(()),
+        Value::String(value) => Err(format!("unsupported Responses tool_choice: {value}")),
+        Value::Object(_) => {
+            Err("named Responses tool_choice is not supported by the Kiro upstream".into())
+        }
+        _ => Err("Responses tool_choice must be a string or function object".into()),
+    }
+}
+
+fn is_instruction_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| matches!(role, "system" | "developer"))
+}
+
+fn append_instruction(instructions: &mut Option<String>, content: Value) {
+    let text = content_text(&InternalMessage::new("developer", content));
+    if text.is_empty() {
+        return;
+    }
+    if let Some(existing) = instructions {
+        existing.push_str("\n\n");
+        existing.push_str(&text);
+    } else {
+        *instructions = Some(text);
     }
 }
 
 fn append_item(messages: &mut Vec<InternalMessage>, item: &Value, previous_len: usize) -> bool {
     match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") => true,
         Some("function_call") => {
             let Some(call) = parse_function_call(item) else {
                 return false;
@@ -388,6 +444,111 @@ mod tests {
         assert_eq!(internal.messages.len(), 1);
         assert_eq!(internal.tools.len(), 1);
         assert_eq!(internal.tools[0].name, "functions_wait");
+    }
+
+    #[test]
+    fn accepts_and_ignores_opaque_codex_reasoning_items() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "input":[
+                {
+                    "type":"reasoning",
+                    "id":"rs_1",
+                    "summary":[{"type":"summary_text","text":"private reasoning"}],
+                    "encrypted_content":"opaque-reasoning"
+                },
+                {"type":"message","role":"user","content":"hello"}
+            ]
+        }))
+        .unwrap();
+
+        request.validate().unwrap();
+        let internal = request.into_internal(Vec::new());
+        assert_eq!(internal.messages.len(), 1);
+        assert_eq!(internal.messages[0].role, "user");
+        assert_eq!(internal.messages[0].content, "hello");
+        assert!(!internal.input_text().contains("private reasoning"));
+        assert!(!internal.input_text().contains("opaque-reasoning"));
+    }
+
+    #[test]
+    fn combines_instructions_and_developer_messages() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "instructions":"Follow the policy.",
+            "input":[
+                {"type":"message","role":"developer","content":[{"type":"input_text","text":"Be concise."}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+            ]
+        }))
+        .unwrap();
+
+        request.validate().unwrap();
+        let internal = request.into_internal(Vec::new());
+        assert_eq!(internal.messages.len(), 1);
+        assert_eq!(internal.messages[0].role, "user");
+        assert_eq!(internal.instructions.as_deref(), Some("Follow the policy.\n\nBe concise."));
+    }
+
+    #[test]
+    fn rejects_non_text_message_content() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:..."}]}
+            ]
+        }))
+        .unwrap();
+
+        assert!(request.validate().unwrap_err().contains("unsupported content"));
+    }
+
+    #[test]
+    fn rejects_forced_tool_choice_instead_of_ignoring_it() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "tool_choice":"required",
+            "input":"hello"
+        }))
+        .unwrap();
+        assert!(request.validate().unwrap_err().contains("tool_choice"));
+    }
+
+    #[test]
+    fn reasoning_input_object_does_not_fall_back_to_a_user_message() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "input":{
+                "type":"reasoning",
+                "id":"rs_1",
+                "encrypted_content":"opaque-reasoning"
+            }
+        }))
+        .unwrap();
+
+        request.validate().unwrap();
+        let internal = request.into_internal(Vec::new());
+        assert!(internal.messages.is_empty());
+    }
+
+    #[test]
+    fn reasoning_items_do_not_break_tool_call_order() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "input":[
+                {"type":"reasoning","id":"rs_1","summary":[]},
+                {"type":"function_call","call_id":"call_a","name":"lookup","arguments":"{}"},
+                {"type":"reasoning","id":"rs_2","summary":[]},
+                {"type":"function_call_output","call_id":"call_a","output":"done"}
+            ]
+        }))
+        .unwrap();
+
+        request.validate().unwrap();
+        let internal = request.into_internal(Vec::new());
+        assert_eq!(internal.messages.len(), 2);
+        assert_eq!(internal.messages[0].tool_calls[0].id, "call_a");
+        assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_a");
     }
 
     #[test]
