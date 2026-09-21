@@ -116,6 +116,9 @@ impl From<ChatRequest> for InternalRequest {
                     name: t.function.name,
                     description: t.function.description,
                     input_schema: t.function.parameters,
+                    custom: false,
+                    original_name: None,
+                    namespace: None,
                 })
                 .collect(),
             tool_choice: value.tool_choice,
