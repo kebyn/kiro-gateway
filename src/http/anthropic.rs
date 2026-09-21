@@ -75,8 +75,8 @@ pub async fn messages(
     State(state): State<AppState>,
     Json(body): Json<MessagesRequest>,
 ) -> Result<Response, AppError> {
-    let request: InternalRequest = body.into();
-    state.token_manager.validate_model(&request.model).await?;
+    let mut request: InternalRequest = body.into();
+    request.model = state.token_manager.resolve_model(&request.model).await?;
     tracing::debug!(
         protocol = "anthropic",
         model = %request.model,
@@ -369,7 +369,7 @@ pub async fn count_tokens(
     State(state): State<AppState>,
     Json(body): Json<CountTokensRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    state.token_manager.validate_model(&body._model).await?;
+    state.token_manager.resolve_model(&body._model).await?;
     let text = body
         .messages
         .iter()
