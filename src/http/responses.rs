@@ -62,6 +62,10 @@ pub async fn create(
     let store = body.store;
     let stream_response = body.stream;
     let mut internal = body.into_internal(previous);
+    internal
+        .messages
+        .iter()
+        .try_for_each(|message| message.validate_content().map_err(AppError::BadRequest))?;
     if internal.tools.is_empty() {
         internal.tools = previous_tools;
     }
@@ -1032,7 +1036,10 @@ mod tests {
             state_with_json_upstream(&directory.path().join("responses.sqlite3")).await;
         let request: ResponsesRequest = serde_json::from_value(json!({
             "model":"kiro",
-            "input":"hello",
+            "input":[
+                {"type":"reasoning","id":"rs_stream","summary":[],"encrypted_content":"opaque-reasoning"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+            ],
             "store":false,
             "stream":true
         }))
@@ -1078,6 +1085,40 @@ mod tests {
         server.await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output_text"], "answer");
+    }
+
+    #[tokio::test]
+    async fn non_stream_accepts_codex_reasoning_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, server) =
+            state_with_json_upstream(&directory.path().join("responses.sqlite3")).await;
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"kiro",
+            "input":[
+                {
+                    "type":"reasoning",
+                    "id":"rs_1",
+                    "summary":[],
+                    "encrypted_content":"opaque-reasoning"
+                },
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":"hello"}]
+                }
+            ],
+            "store":false,
+            "stream":false
+        }))
+        .unwrap();
+
+        let response = create(State(state), Json(request)).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        server.await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["status"], "completed");
         assert_eq!(body["output_text"], "answer");
     }
