@@ -4,6 +4,7 @@ use crate::{
     error::AppError,
     protocol::internal::InternalRequest,
 };
+use serde_json::Value;
 use uuid::Uuid;
 
 pub const CLI_USER_AGENT: &str = "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI";
@@ -78,8 +79,29 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
     }
-    fn classify_error(&self, status: reqwest::StatusCode, _body: &str) -> AppError {
-        AppError::Upstream(format!("CLI endpoint returned {status}"))
+    fn classify_error(&self, status: reqwest::StatusCode, body: &str) -> AppError {
+        let message = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        value
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(ToOwned::to_owned)
+            })
+            .map(|message| message.trim().chars().take(256).collect::<String>())
+            .filter(|message| !message.is_empty());
+        match message {
+            Some(message) => {
+                AppError::Upstream(format!("CLI endpoint returned {status}: {message}"))
+            }
+            None => AppError::Upstream(format!("CLI endpoint returned {status}")),
+        }
     }
 }
 
