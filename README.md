@@ -217,6 +217,77 @@ curl -N -i \
 正文。Anthropic SSE 在上游较慢时会发送 keep-alive 注释；客户端仍应等待最终的
 `message_stop`，而不是把 keep-alive 当作模型内容。
 
+Claude Code 只接受它自身已知的模型别名（例如 `sonnet`），而 Kiro 模型目录通常返回
+不同的模型 ID。可显式配置别名映射；网关仍会校验映射目标必须存在于当前 Kiro 模型
+目录：
+
+```sh
+export KIRO_MODEL_ALIASES='claude-sonnet-5=gpt-5.6-sol'
+# 或使用动态目录中的第一个模型（适合本机冒烟测试）
+export KIRO_MODEL_ALIASES='claude-sonnet-5=@first'
+claude --model sonnet
+```
+
+别名只影响请求转发，响应中的模型字段使用解析后的 Kiro 模型 ID。未配置别名时仍
+保持严格的精确模型校验。
+
+### Codex、Claude Code、Grok Build 本地真实冒烟测试
+
+仓库提供 [`scripts/test-local-clients.sh`](scripts/test-local-clients.sh)，用于在本机
+启动一个隔离的网关实例，并依次检查鉴权、模型发现、三套协议的普通响应和 SSE 终止事件，
+然后调用本机安装的 Codex、Claude Code 和 Grok Build。脚本默认使用 `/v1/models` 返回的
+第一个模型，不把模型 ID 写死；真实上游测试必须显式确认：
+
+```sh
+export KIRO_ALLOW_LIVE_TESTS=1
+```
+
+使用环境变量凭据：
+
+```sh
+export KIRO_CREDENTIAL_SOURCE=env
+export KIRO_ACCESS_TOKEN='access-token-from-your-provider'
+./scripts/test-local-clients.sh
+```
+
+也可以只读本机 Kiro CLI SQLite 凭据：
+
+```sh
+export KIRO_CREDENTIAL_SOURCE=sqlite
+export KIRO_CREDENTIAL_PATH="$HOME/.local/share/kiro-cli/data.sqlite3"
+./scripts/test-local-clients.sh
+```
+
+脚本不会修改用户级 Codex、Claude Code 或 Grok 配置，而是在临时目录生成一次性配置；
+测试结束后会停止自己启动的网关并删除临时目录。网关客户端密钥由脚本随机生成，不会
+写入仓库或输出到测试日志。若要使用已经运行的网关，必须显式提供客户端密钥和网关
+根地址（不要把 `/v1` 重复拼入根地址）：
+
+```sh
+export KIRO_TEST_CLIENT_API_KEY='client-key-for-the-running-gateway'
+KIRO_ALLOW_LIVE_TESTS=1 \
+  ./scripts/test-local-clients.sh --gateway-url http://127.0.0.1:8990
+```
+
+客户端与协议映射如下：
+
+| 客户端 | 本地配置方式 | 验证协议 |
+| --- | --- | --- |
+| Codex CLI | 临时 `CODEX_HOME`，自定义 Responses provider | OpenAI Responses |
+| Claude Code | `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY` | Anthropic Messages |
+| Grok Build | 临时 `GROK_HOME`，`api_backend = "chat_completions"` | OpenAI Chat Completions |
+
+脚本运行 Claude Code 时使用 `--setting-sources ''` 并清空代理环境，避免用户级设置
+把本机请求转发到外部代理。Codex 发送的命名空间工具和 custom grammar 工具会由
+Responses 适配层展开或跳过；Kiro CLI 上游不接受工具名中的点号，因此转发时将
+`functions.wait` 这类名称编码为 `functions_wait`。
+
+可用 `KIRO_TEST_CLIENTS=codex,claude` 或 `--client grok` 缩小范围；可用
+`KIRO_TEST_MODEL=MODEL_ID` 覆盖动态选择的模型。Grok Build 的 Responses 兼容性由脚本
+中的直接 `/v1/responses` 流程检查；当前 Grok 自定义模型配置使用 Chat Completions，
+不要据此假设 Grok CLI 会发送 Responses 请求。客户端冒烟提示只要求返回一句话，禁止
+调用工具或修改文件。
+
 ## 配置
 
 配置文件为 JSON。只接受下表列出的 snake_case 字段；未知字段和历史别名会直接拒绝启动。
@@ -244,6 +315,7 @@ curl -N -i \
 | `refresh_early_secs` | `120` | 到期前提前刷新的秒数 |
 | `refresh_interval_secs` | `30` | 后台检查刷新间隔，必须大于 `0` |
 | `model_cache_ttl_secs` | `300` | Kiro 模型目录缓存时间，秒，必须大于 `0` |
+| `model_aliases` | `{}` | 客户端模型别名到 Kiro 模型 ID 的映射；目标也可为 `@first` |
 | `response_store_path` | `kiro-gateway.sqlite3` | Responses 本地 SQLite 路径；支持 `~/` 展开 |
 | `max_request_body_bytes` | `8388608` | 请求体上限（8 MiB），必须大于 `0` |
 | `max_upstream_body_bytes` | `16777216` | Kiro JSON/EventStream 响应体上限（16 MiB），必须大于 `0` |
@@ -277,6 +349,7 @@ curl -N -i \
 | `KIRO_REFRESH_EARLY_SECS` | 覆盖提前刷新秒数，不得为负 |
 | `KIRO_REFRESH_INTERVAL_SECS` | 覆盖后台刷新间隔，必须大于 `0` |
 | `KIRO_MODEL_CACHE_TTL_SECS` | 覆盖模型目录缓存 TTL，必须大于 `0` |
+| `KIRO_MODEL_ALIASES` | 覆盖模型别名，格式为逗号分隔的 `alias=target`；`@first` 表示当前目录第一个模型 |
 | `KIRO_MAX_REQUEST_BODY_BYTES` | 覆盖请求体上限，必须大于 `0` |
 | `KIRO_MAX_UPSTREAM_BODY_BYTES` | 覆盖上游响应体上限，必须大于 `0` |
 | `KIRO_GRACEFUL_SHUTDOWN_TIMEOUT_SECS` | 覆盖优雅停机等待时间，必须大于 `0` |
@@ -359,7 +432,8 @@ CI 不需要挂载真实 `data.sqlite3`；普通 fixture 测试已经覆盖真�
 `/v1/models` 返回 Kiro 返回的全部模型及可用的名称、描述和 token limits 元数据。远程
 请求失败时仍返回 HTTP 200，但 `data` 为空；不会回退到静态 `kiro`。Messages、
 Chat Completions、Responses 和 `count_tokens` 请求中的 `model` 必须存在于当前模型
-目录，否则返回 `400`，且不会调用 Kiro 上游。请求中的模型 ID 会原样转发。
+目录，否则返回 `400`，且不会调用 Kiro 上游。若配置了 `model_aliases`，先解析别名，
+再校验并转发目标模型；未配置别名时请求中的模型 ID 会原样严格校验。
 
 如需在本机使用真实 SQLite 凭据验证完整远程链路，可执行以下默认忽略的测试；它不会
 输出 token，也不会修改数据库：

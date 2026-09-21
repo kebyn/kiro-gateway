@@ -1,7 +1,7 @@
 SHELL := /bin/sh
 export SOURCE_DATE_EPOCH ?= 0
 
-.PHONY: fmt frontend check test build reproducible release package docker audit deny
+.PHONY: fmt frontend check test client-smoke build reproducible release package docker audit deny
 fmt:
 	cargo fmt --all
 
@@ -17,6 +17,9 @@ check:
 
 test:
 	cargo test --locked --all-features
+
+client-smoke:
+	./scripts/test-local-clients.sh
 
 build:
 	cargo build --release --locked
