@@ -57,9 +57,21 @@ impl ResponsesRequest {
                         }
                     }
                 }
+                Some("custom_tool_call") => {
+                    for field in ["call_id", "name", "input"] {
+                        if item.get(field).and_then(Value::as_str).is_none() {
+                            return Err(format!("custom_tool_call requires string {field}"));
+                        }
+                    }
+                }
                 Some("function_call_output") => {
                     if item.get("call_id").and_then(Value::as_str).is_none() {
                         return Err("function_call_output requires call_id".into());
+                    }
+                }
+                Some("custom_tool_call_output") => {
+                    if item.get("call_id").and_then(Value::as_str).is_none() {
+                        return Err("custom_tool_call_output requires call_id".into());
                     }
                 }
                 Some("message") => {
@@ -78,6 +90,20 @@ impl ResponsesRequest {
                 // accepted for compatibility but are intentionally not sent
                 // to the upstream model.
                 Some("reasoning") => {}
+                Some(
+                    "tool_search_call"
+                    | "tool_search_output"
+                    | "mcp_tool_call"
+                    | "mcp_tool_call_output"
+                    | "local_shell_call"
+                    | "local_shell_call_output"
+                    | "web_search_call"
+                    | "web_search_result"
+                    | "image_generation_call"
+                    | "compaction"
+                    | "context_compaction"
+                    | "configuration_update",
+                ) => {}
                 Some(other) => return Err(format!("unsupported Responses input type: {other}")),
                 None => {}
             }
@@ -203,7 +229,23 @@ fn append_item(messages: &mut Vec<InternalMessage>, item: &Value, previous_len: 
             }
             true
         }
-        Some("function_call_output") => {
+        Some("custom_tool_call") => {
+            let Some(call) = parse_custom_tool_call(item) else {
+                return false;
+            };
+            let can_merge = messages.len() > previous_len;
+            if let Some(message) =
+                messages.last_mut().filter(|message| can_merge && message.role == "assistant")
+            {
+                message.tool_calls.push(call);
+            } else {
+                let mut message = InternalMessage::new("assistant", Value::Null);
+                message.tool_calls.push(call);
+                messages.push(message);
+            }
+            true
+        }
+        Some("function_call_output") | Some("custom_tool_call_output") => {
             let Some(tool_call_id) = item.get("call_id").and_then(Value::as_str) else {
                 return false;
             };
@@ -244,6 +286,20 @@ fn parse_function_call(item: &Value) -> Option<InternalToolCall> {
     Some(InternalToolCall { id, name, arguments, complete: arguments_complete && status_complete })
 }
 
+fn parse_custom_tool_call(item: &Value) -> Option<InternalToolCall> {
+    let id = item.get("call_id")?.as_str()?.to_owned();
+    let name = qualified_custom_tool_name(
+        item.get("namespace").and_then(Value::as_str),
+        item.get("name")?.as_str()?,
+    );
+    let input = item.get("input")?.as_str()?.to_owned();
+    let complete = !matches!(
+        item.get("status").and_then(Value::as_str),
+        Some("incomplete" | "failed" | "cancelled")
+    );
+    Some(InternalToolCall { id, name, arguments: serde_json::json!({"input": input}), complete })
+}
+
 fn parse_arguments(arguments: Value) -> (Value, bool) {
     match arguments {
         Value::String(arguments) if arguments.trim().is_empty() => {
@@ -258,14 +314,30 @@ fn parse_arguments(arguments: Value) -> (Value, bool) {
         value => (value, false),
     }
 }
+
+fn custom_input_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "properties":{"input":{"type":"string"}},
+        "required":["input"],
+        "additionalProperties":false
+    })
+}
+
 fn parse_tool(tool: Value) -> Option<InternalTool> {
+    let custom = tool.get("type").and_then(Value::as_str) == Some("custom");
+    let original_name = tool.get("name")?.as_str()?.to_owned();
     Some(InternalTool {
-        name: kiro_tool_name(tool.get("name")?.as_str()?),
+        name: kiro_tool_name(&original_name),
         description: tool.get("description").and_then(Value::as_str).map(ToOwned::to_owned),
-        input_schema: tool
-            .get("parameters")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"type":"object"})),
+        input_schema: if custom {
+            custom_input_schema()
+        } else {
+            tool.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object"}))
+        },
+        custom,
+        original_name: custom.then_some(original_name),
+        namespace: None,
     })
 }
 
@@ -278,20 +350,21 @@ fn parse_additional_tools(item: &Value) -> Vec<InternalTool> {
             let namespace_name = namespace.get("name").and_then(Value::as_str).unwrap_or_default();
             namespace.get("tools").and_then(Value::as_array).into_iter().flatten().filter_map(
                 move |tool| {
-                    // Kiro accepts JSON-schema function tools, not Codex custom grammars.
-                    if tool.get("type").and_then(Value::as_str) == Some("custom") {
-                        return None;
-                    }
                     let name = tool.get("name").and_then(Value::as_str)?;
                     let qualified_name = if namespace_name.is_empty() {
-                        name.to_owned()
+                        kiro_tool_name(name)
                     } else {
-                        format!("{namespace_name}_{name}")
+                        kiro_tool_name(&format!("{namespace_name}_{name}"))
                     };
-                    let input_schema = tool
-                        .get("parameters")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({"type":"object"}));
+                    let custom = tool.get("type").and_then(Value::as_str) == Some("custom");
+                    let input_schema =
+                        tool.get("parameters").cloned().filter(|_| !custom).unwrap_or_else(|| {
+                            if custom {
+                                custom_input_schema()
+                            } else {
+                                serde_json::json!({"type":"object"})
+                            }
+                        });
                     Some(InternalTool {
                         name: qualified_name,
                         description: tool
@@ -299,6 +372,13 @@ fn parse_additional_tools(item: &Value) -> Vec<InternalTool> {
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned),
                         input_schema,
+                        custom,
+                        original_name: custom.then(|| name.to_owned()),
+                        namespace: custom
+                            .then(|| {
+                                (!namespace_name.is_empty()).then(|| namespace_name.to_owned())
+                            })
+                            .flatten(),
                     })
                 },
             )
@@ -308,6 +388,14 @@ fn parse_additional_tools(item: &Value) -> Vec<InternalTool> {
 
 fn kiro_tool_name(name: &str) -> String {
     name.replace('.', "_")
+}
+
+fn qualified_custom_tool_name(namespace: Option<&str>, name: &str) -> String {
+    namespace
+        .filter(|namespace| !namespace.is_empty())
+        .map(|namespace| format!("{namespace}_{name}"))
+        .map(|name| kiro_tool_name(&name))
+        .unwrap_or_else(|| kiro_tool_name(name))
 }
 
 #[cfg(test)]
@@ -442,8 +530,62 @@ mod tests {
         request.validate().unwrap();
         let internal = request.into_internal(Vec::new());
         assert_eq!(internal.messages.len(), 1);
-        assert_eq!(internal.tools.len(), 1);
+        assert_eq!(internal.tools.len(), 2);
         assert_eq!(internal.tools[0].name, "functions_wait");
+        assert_eq!(internal.tools[1].name, "functions_exec");
+        assert!(internal.tools[1].custom);
+        assert_eq!(internal.tools[1].original_name.as_deref(), Some("exec"));
+        assert_eq!(internal.tools[1].namespace.as_deref(), Some("functions"));
+    }
+
+    #[test]
+    fn converts_custom_tool_calls_and_outputs_without_parsing_freeform_input() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "tools":[
+                {"type":"custom","name":"apply_patch","description":"Apply a patch","format":{"type":"grammar"}}
+            ],
+            "input":[
+                {"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"apply_patch","input":"*** Begin Patch\n+hello\n*** End Patch","status":"completed"},
+                {"type":"custom_tool_call_output","call_id":"call_1","output":"applied"}
+            ]
+        }))
+        .unwrap();
+
+        request.validate().unwrap();
+        let internal = request.into_internal(Vec::new());
+        assert_eq!(internal.tools.len(), 1);
+        assert!(internal.tools[0].custom);
+        assert_eq!(internal.messages[0].tool_calls[0].name, "apply_patch");
+        assert_eq!(
+            internal.messages[0].tool_calls[0].arguments["input"],
+            "*** Begin Patch\n+hello\n*** End Patch"
+        );
+        assert_eq!(internal.messages[1].tool_results[0].content, "applied");
+    }
+
+    #[test]
+    fn accepts_known_opaque_codex_history_items_without_forwarding_them() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "input":[
+                {"type":"tool_search_call","id":"ts_1","arguments":{"query":"calendar"}},
+                {"type":"tool_search_output","id":"tso_1","output":{"tools":[]}},
+                {"type":"mcp_tool_call_output","call_id":"mcp_1","output":"opaque"},
+                {"type":"local_shell_call","id":"shell_1","command":"pwd"},
+                {"type":"web_search_call","id":"web_1","query":"weather"},
+                {"type":"image_generation_call","id":"img_1","status":"completed"},
+                {"type":"compaction","id":"cmp_1"},
+                {"type":"configuration_update","id":"cfg_1"},
+                {"type":"message","role":"user","content":"hello"}
+            ]
+        }))
+        .unwrap();
+
+        request.validate().unwrap();
+        let internal = request.into_internal(Vec::new());
+        assert_eq!(internal.messages.len(), 1);
+        assert_eq!(internal.messages[0].content, "hello");
     }
 
     #[test]

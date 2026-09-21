@@ -104,6 +104,9 @@ impl From<MessagesRequest> for InternalRequest {
                     name: tool.name,
                     description: tool.description,
                     input_schema: tool.input_schema,
+                    custom: false,
+                    original_name: None,
+                    namespace: None,
                 })
                 .collect(),
             tool_choice: value.tool_choice,

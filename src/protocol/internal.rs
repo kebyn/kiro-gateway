@@ -119,6 +119,12 @@ pub struct InternalTool {
     #[serde(default)]
     pub description: Option<String>,
     pub input_schema: Value,
+    #[serde(default)]
+    pub custom: bool,
+    #[serde(default)]
+    pub original_name: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
