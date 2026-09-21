@@ -6,7 +6,7 @@
 
 - Anthropic Messages：普通响应、SSE、Token 估算、Tool Call 与 Tool Result 续传。
 - OpenAI Chat Completions：普通响应、SSE、并行 `tool_calls` 与 `tool` 消息续传。
-- OpenAI Responses：普通响应、SSE、`function_call` / `function_call_output`、本地响应存储和 `previous_response_id`。
+- OpenAI Responses：普通响应、SSE、`function_call` / `function_call_output`、本地响应存储和 `previous_response_id`；兼容 Codex 重放的 opaque `reasoning` 历史项，但不会将其转发给上游模型。
 - Kiro IDE 与 CLI 两种上游端点格式。
 - 环境变量、JSON、只读 SQLite 和 API Key 凭据来源。
 - 凭据自动刷新、Admin 会话与 CSRF 防护。
@@ -194,6 +194,17 @@ Authorization: Bearer client-key-change-me
 三套生成接口均支持 `stream: true`，响应类型为 SSE；流式响应会发送 keep-alive 注释，
 并在完成时发送各自协议要求的终止事件（Anthropic `message_stop`、Chat Completions
 `[DONE]`、Responses `response.completed` 或 `response.incomplete`）。
+
+### 兼容性边界
+
+- Anthropic `system`、OpenAI Chat 的 `system`/`developer` 消息以及 Responses
+  `instructions`/对应消息会被合并到当前 Kiro 提示中，不会作为普通 user 消息发送。
+- 输入消息目前只支持文本、thinking/reasoning 文本和工具调用/结果。图片、文档、
+  `redacted_thinking` 及其他无法表达为文本的块会返回 `400`，不会静默丢失。
+- Kiro 上游没有等价的强制工具选择语义；`tool_choice` 仅支持 `auto`，指定
+  `required`、`any` 或具体工具会返回 `400`，而不是被忽略。
+- `max_tokens`、`temperature` 等生成控制字段会被协议层接受，但当前 Kiro 请求格式没有
+ 可靠的一一映射；不要把它们视为精确生效的上游限制。
 
 ### Claude Code 流式调试
 
