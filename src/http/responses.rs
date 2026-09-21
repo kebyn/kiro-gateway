@@ -2,7 +2,9 @@ use crate::{
     AppState,
     error::{AppError, Protocol, protocol_error_response},
     protocol::{
-        internal::{InternalEvent, InternalMessage, InternalResponse, InternalToolCall, Usage},
+        internal::{
+            InternalEvent, InternalMessage, InternalResponse, InternalTool, InternalToolCall, Usage,
+        },
         openai_responses::ResponsesRequest,
     },
     response_store::{ResponseStatus, ResponseStore},
@@ -148,7 +150,7 @@ pub async fn create(
             return Err(error);
         }
     };
-    let payload = responses_payload(&id, &model, &response);
+    let payload = responses_payload_with_tools(&id, &model, &internal.tools, &response);
     if let Some(record) = record {
         let status = if response.incomplete {
             ResponseStatus::Incomplete
@@ -218,6 +220,15 @@ struct LiveTool {
     output_index: usize,
     ended: bool,
     done_emitted: bool,
+    custom: bool,
+    response_name: String,
+    namespace: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CustomToolInfo {
+    name: String,
+    namespace: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -316,28 +327,105 @@ impl LiveResponseState {
         (id, index, true)
     }
 
-    fn ensure_tool(&mut self, call_id: &str, name: &str) -> (usize, bool) {
+    fn ensure_tool(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        custom: Option<CustomToolInfo>,
+    ) -> (usize, bool) {
         if let Some(index) = self.tool_indices.get(call_id).copied() {
             if !name.is_empty() && self.tools[index].name.is_empty() {
                 self.tools[index].name = name.to_owned();
+            }
+            if let Some(custom) = custom {
+                self.tools[index].custom = true;
+                self.tools[index].response_name = custom.name;
+                self.tools[index].namespace = custom.namespace;
             }
             return (index, false);
         }
         let output_index = self.next_output_index;
         self.next_output_index += 1;
         let index = self.tools.len();
+        let custom_flag = custom.is_some();
+        let response_name =
+            custom.as_ref().map(|tool| tool.name.clone()).unwrap_or_else(|| name.to_owned());
+        let namespace = custom.and_then(|tool| tool.namespace);
         self.tools.push(LiveTool {
             call_id: call_id.to_owned(),
-            item_id: format!("fc_{}", uuid::Uuid::now_v7()),
+            item_id: format!("{}_{}", if custom_flag { "ctc" } else { "fc" }, uuid::Uuid::now_v7()),
             name: name.to_owned(),
             arguments: String::new(),
             output_index,
             ended: false,
             done_emitted: false,
+            custom: custom_flag,
+            response_name,
+            namespace,
         });
         self.tool_indices.insert(call_id.to_owned(), index);
         self.item_order.push(LiveItem::Tool(index));
         (index, true)
+    }
+}
+
+fn custom_tool_info(name: &str, tools: &[InternalTool]) -> Option<CustomToolInfo> {
+    tools.iter().find(|tool| tool.custom && tool.name == name).map(|tool| CustomToolInfo {
+        name: tool.original_name.clone().unwrap_or_else(|| tool.name.clone()),
+        namespace: tool.namespace.clone(),
+    })
+}
+
+fn custom_input(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| value.get("input").and_then(Value::as_str).map(ToOwned::to_owned))
+        .unwrap_or_else(|| arguments.to_owned())
+}
+
+fn custom_item(
+    id: &str,
+    call_id: &str,
+    name: &str,
+    namespace: Option<&str>,
+    input: &str,
+    status: &str,
+) -> Value {
+    let mut item = json!({
+        "type":"custom_tool_call",
+        "id":id,
+        "call_id":call_id,
+        "name":name,
+        "input":input,
+        "status":status,
+    });
+    if let Some(namespace) = namespace {
+        item["namespace"] = json!(namespace);
+    }
+    item
+}
+
+fn tool_item(
+    id: &str,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    status: &str,
+    custom: bool,
+    response_name: &str,
+    namespace: Option<&str>,
+) -> Value {
+    if custom {
+        custom_item(id, call_id, response_name, namespace, &custom_input(arguments), status)
+    } else {
+        json!({
+            "type":"function_call",
+            "id":id,
+            "call_id":call_id,
+            "name":name,
+            "arguments":arguments,
+            "status":status
+        })
     }
 }
 
@@ -474,10 +562,20 @@ fn responses_live_stream(
                 }
                 InternalEvent::ToolCallStart { id: call_id, name } => {
                     let key = if call_id.is_empty() { format!("tool_call_{}", live.tools.len() + 1) } else { call_id };
-                    let (tool_index, added) = live.ensure_tool(&key, &name);
+                    let custom = custom_tool_info(&name, &stored_tools);
+                    let (tool_index, added) = live.ensure_tool(&key, &name, custom);
                     if added {
                         let tool = &live.tools[tool_index];
-                        let item = json!({"type":"function_call","id":tool.item_id,"call_id":tool.call_id,"name":tool.name,"arguments":"","status":"in_progress"});
+                        let item = tool_item(
+                            &tool.item_id,
+                            &tool.call_id,
+                            &tool.name,
+                            "",
+                            "in_progress",
+                            tool.custom,
+                            &tool.response_name,
+                            tool.namespace.as_deref(),
+                        );
                         if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":tool.output_index,"item":item})) {
                             yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
                         }
@@ -485,10 +583,21 @@ fn responses_live_stream(
                 }
                 InternalEvent::ToolCallDelta { id: call_id, arguments, name } => {
                     let key = if call_id.is_empty() { live.tools.last().map(|tool| tool.call_id.clone()).unwrap_or_else(|| format!("tool_call_{}", live.tools.len() + 1)) } else { call_id };
-                    let (tool_index, added) = live.ensure_tool(&key, name.as_deref().unwrap_or_default());
+                    let tool_name = name.as_deref().unwrap_or_default();
+                    let custom = custom_tool_info(tool_name, &stored_tools);
+                    let (tool_index, added) = live.ensure_tool(&key, tool_name, custom);
                     if added {
                         let tool = &live.tools[tool_index];
-                        let item = json!({"type":"function_call","id":tool.item_id,"call_id":tool.call_id,"name":tool.name,"arguments":"","status":"in_progress"});
+                        let item = tool_item(
+                            &tool.item_id,
+                            &tool.call_id,
+                            &tool.name,
+                            "",
+                            "in_progress",
+                            tool.custom,
+                            &tool.response_name,
+                            tool.namespace.as_deref(),
+                        );
                         if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":tool.output_index,"item":item})) {
                             yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
                         }
@@ -496,7 +605,7 @@ fn responses_live_stream(
                     if !arguments.is_empty() {
                         live.tools[tool_index].arguments.push_str(&arguments);
                     }
-                    if !arguments.is_empty() {
+                    if !arguments.is_empty() && !live.tools[tool_index].custom {
                         let tool = &live.tools[tool_index];
                         if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.function_call_arguments.delta", json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"delta":arguments})) {
                             yield Ok(Event::default().event("response.function_call_arguments.delta").data(data.to_string()));
@@ -524,10 +633,36 @@ fn responses_live_stream(
                             } else {
                                 "incomplete"
                             };
-                            if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.function_call_arguments.done", json!({"item_id":item_id,"call_id":call_id,"output_index":output_index,"arguments":arguments})) {
-                                yield Ok(Event::default().event("response.function_call_arguments.done").data(data.to_string()));
+                            let input = custom_input(&arguments);
+                            let (done_event, done_payload) = if tool.custom {
+                                (
+                                    "response.custom_tool_call_input.done",
+                                    json!({"item_id":item_id,"call_id":call_id,"output_index":output_index,"input":input}),
+                                )
+                            } else {
+                                (
+                                    "response.function_call_arguments.done",
+                                    json!({"item_id":item_id,"call_id":call_id,"output_index":output_index,"arguments":arguments}),
+                                )
+                            };
+                            if tool.custom && !input.is_empty() {
+                                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.custom_tool_call_input.delta", json!({"item_id":item_id,"call_id":call_id,"output_index":output_index,"delta":input})) {
+                                    yield Ok(Event::default().event("response.custom_tool_call_input.delta").data(data.to_string()));
+                                }
                             }
-                            let item = json!({"type":"function_call","id":item_id,"call_id":call_id,"name":tool.name,"arguments":tool.arguments,"status":status});
+                            if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, done_event, done_payload) {
+                                yield Ok(Event::default().event(done_event).data(data.to_string()));
+                            }
+                            let item = tool_item(
+                                &item_id,
+                                &call_id,
+                                &tool.name,
+                                &tool.arguments,
+                                status,
+                                tool.custom,
+                                &tool.response_name,
+                                tool.namespace.as_deref(),
+                            );
                             if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.done", json!({"output_index":output_index,"item":item})) {
                                 yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
                             }
@@ -575,7 +710,14 @@ fn responses_live_stream(
             stream_end_status = if response.incomplete { "incomplete" } else { "completed" },
             "OpenAI Responses stream completed"
         );
-        let payload = responses_payload_with_live_items(&id, &model, &response, &live, created_at);
+        let payload = responses_payload_with_live_items_and_tools(
+            &id,
+            &model,
+            &stored_tools,
+            &response,
+            &live,
+            created_at,
+        );
         // Close every item in the same arrival order used for output_index.
         if live.item_order.is_empty() {
             if let Some(item) = payload["output"].as_array().and_then(|items| items.first()) {
@@ -617,8 +759,31 @@ fn responses_live_stream(
                 LiveItem::Tool(tool_index) => {
                     let tool = &live.tools[*tool_index];
                     if !tool.ended {
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.function_call_arguments.done", json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"arguments":response.tool_calls.iter().find(|call| call.id == tool.call_id).map(InternalToolCall::arguments_json).unwrap_or_default()})) {
-                            yield Ok(Event::default().event("response.function_call_arguments.done").data(data.to_string()));
+                        let arguments = response
+                            .tool_calls
+                            .iter()
+                            .find(|call| call.id == tool.call_id)
+                            .map(InternalToolCall::arguments_json)
+                            .unwrap_or_default();
+                        let input = custom_input(&arguments);
+                        let (done_event, done_payload) = if tool.custom {
+                            if !input.is_empty() {
+                                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.custom_tool_call_input.delta", json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"delta":input})) {
+                                    yield Ok(Event::default().event("response.custom_tool_call_input.delta").data(data.to_string()));
+                                }
+                            }
+                            (
+                                "response.custom_tool_call_input.done",
+                                json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"input":input}),
+                            )
+                        } else {
+                            (
+                                "response.function_call_arguments.done",
+                                json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"arguments":arguments}),
+                            )
+                        };
+                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, done_event, done_payload) {
+                            yield Ok(Event::default().event(done_event).data(data.to_string()));
                         }
                     }
                     if !tool.done_emitted {
@@ -653,9 +818,10 @@ fn responses_live_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-fn responses_payload_with_live_items(
+fn responses_payload_with_live_items_and_tools(
     id: &str,
     model: &str,
+    tools: &[InternalTool],
     response: &InternalResponse,
     live: &LiveResponseState,
     created_at: i64,
@@ -675,7 +841,26 @@ fn responses_payload_with_live_items(
                     if let Some(call) =
                         response.tool_calls.iter().find(|call| call.id == tool.call_id)
                     {
-                        output.push(json!({"type":"function_call","id":tool.item_id,"call_id":tool.call_id,"name":call.name,"arguments":call.arguments_json(),"status":if call.complete {"completed"} else {"incomplete"}}));
+                        let custom = tool.custom || custom_tool_info(&call.name, tools).is_some();
+                        let custom_info = custom_tool_info(&call.name, tools);
+                        let response_name = custom_info
+                            .as_ref()
+                            .map(|info| info.name.as_str())
+                            .unwrap_or(&tool.response_name);
+                        let namespace = custom_info
+                            .as_ref()
+                            .and_then(|info| info.namespace.as_deref())
+                            .or(tool.namespace.as_deref());
+                        output.push(tool_item(
+                            &tool.item_id,
+                            &tool.call_id,
+                            &call.name,
+                            &call.arguments_json(),
+                            if call.complete { "completed" } else { "incomplete" },
+                            custom,
+                            response_name,
+                            namespace,
+                        ));
                     }
                 }
             }
@@ -697,14 +882,25 @@ fn refresh_snapshot(
     created_at: i64,
 ) {
     let response = live.snapshot_response();
-    let payload = responses_payload_with_live_items(id, model, &response, live, created_at);
+    let payload =
+        responses_payload_with_live_items_and_tools(id, model, tools, &response, live, created_at);
     let mut state = snapshot.lock();
     state.messages = response_messages(input_messages, &response);
     state.tools = tools.to_vec();
     state.response = payload;
 }
 
+#[cfg(test)]
 fn responses_payload(id: &str, model: &str, response: &InternalResponse) -> Value {
+    responses_payload_with_tools(id, model, &[], response)
+}
+
+fn responses_payload_with_tools(
+    id: &str,
+    model: &str,
+    tools: &[InternalTool],
+    response: &InternalResponse,
+) -> Value {
     let incomplete_reason = responses_incomplete_reason(response);
     let status = if incomplete_reason.is_some() { "incomplete" } else { "completed" };
     let mut output = Vec::new();
@@ -723,14 +919,21 @@ fn responses_payload(id: &str, model: &str, response: &InternalResponse) -> Valu
         }));
     }
     for call in &response.tool_calls {
-        output.push(json!({
-            "type":"function_call",
-            "id":format!("fc_{}", uuid::Uuid::now_v7()),
-            "call_id":call.id,
-            "name":call.name,
-            "arguments":call.arguments_json(),
-            "status":if call.complete { "completed" } else { "incomplete" }
-        }));
+        let custom = custom_tool_info(&call.name, tools);
+        let item_id =
+            format!("{}_{}", if custom.is_some() { "ctc" } else { "fc" }, uuid::Uuid::now_v7());
+        let response_name = custom.as_ref().map(|info| info.name.as_str()).unwrap_or(&call.name);
+        let namespace = custom.as_ref().and_then(|info| info.namespace.as_deref());
+        output.push(tool_item(
+            &item_id,
+            &call.id,
+            &call.name,
+            &call.arguments_json(),
+            if call.complete { "completed" } else { "incomplete" },
+            custom.is_some(),
+            response_name,
+            namespace,
+        ));
     }
     if output.is_empty() {
         output.push(json!({
@@ -875,6 +1078,38 @@ fn responses_stream_events(payload: &Value) -> Vec<(&'static str, Value)> {
                     json!({"output_index":output_index,"item":item}),
                 );
             }
+            Some("custom_tool_call") => {
+                let mut added = item.clone();
+                added["status"] = json!("in_progress");
+                added["input"] = json!("");
+                push_event(
+                    &mut events,
+                    &mut sequence_number,
+                    "response.output_item.added",
+                    json!({"output_index":output_index,"item":added}),
+                );
+                let input = item["input"].as_str().unwrap_or_default();
+                if !input.is_empty() {
+                    push_event(
+                        &mut events,
+                        &mut sequence_number,
+                        "response.custom_tool_call_input.delta",
+                        json!({"item_id":item["id"],"call_id":item["call_id"],"output_index":output_index,"delta":input}),
+                    );
+                }
+                push_event(
+                    &mut events,
+                    &mut sequence_number,
+                    "response.custom_tool_call_input.done",
+                    json!({"item_id":item["id"],"call_id":item["call_id"],"output_index":output_index,"input":input}),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence_number,
+                    "response.output_item.done",
+                    json!({"output_index":output_index,"item":item}),
+                );
+            }
             _ => {}
         }
     }
@@ -920,7 +1155,7 @@ pub async fn delete(
 mod tests {
     use super::{
         create, response_messages, responses_live_stream, responses_payload,
-        responses_stream_events,
+        responses_payload_with_tools, responses_stream_events,
     };
     use crate::{
         AppState,
@@ -929,7 +1164,7 @@ mod tests {
         config::AppConfig,
         credential::TokenManager,
         model_catalog::ModelInfo,
-        protocol::internal::{InternalMessage, InternalResponse, InternalToolCall},
+        protocol::internal::{InternalMessage, InternalResponse, InternalTool, InternalToolCall},
         protocol::openai_responses::ResponsesRequest,
         response_store::{ResponseStatus, ResponseStore},
     };
@@ -1216,6 +1451,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_custom_tool_emits_custom_input_events_and_output_item() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory.path().join("responses.sqlite3"));
+        let internal = crate::protocol::internal::InternalRequest {
+            model: "kiro".into(),
+            messages: vec![InternalMessage::new("user", Value::String("apply patch".into()))],
+            system: None,
+            tools: vec![InternalTool {
+                name: "functions_apply_patch".into(),
+                description: Some("Apply a patch".into()),
+                input_schema: json!({"type":"object"}),
+                custom: true,
+                original_name: Some("apply_patch".into()),
+                namespace: Some("functions".into()),
+            }],
+            tool_choice: None,
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            conversation_id: None,
+            instructions: None,
+        };
+        let upstream: crate::upstream::request::InternalEventStream = Box::pin(stream::iter(vec![
+            Ok(crate::protocol::internal::InternalEvent::ToolCallStart {
+                id: "call_custom".into(),
+                name: "functions_apply_patch".into(),
+            }),
+            Ok(crate::protocol::internal::InternalEvent::ToolCallDelta {
+                id: "call_custom".into(),
+                arguments: "{\"input\":\"*** Begin\\n+hello\\n*** End\"}".into(),
+                name: None,
+            }),
+            Ok(crate::protocol::internal::InternalEvent::ToolCallEnd {
+                id: "call_custom".into(),
+                complete: true,
+            }),
+            Ok(crate::protocol::internal::InternalEvent::Stop { reason: "end_turn".into() }),
+        ]));
+        let response = responses_live_stream(
+            state,
+            upstream,
+            "resp_custom".into(),
+            "kiro".into(),
+            internal,
+            false,
+            None,
+        )
+        .into_response();
+        let body =
+            String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec())
+                .unwrap();
+        assert!(body.contains("response.custom_tool_call_input.delta"));
+        assert!(body.contains("response.custom_tool_call_input.done"));
+        assert!(body.contains("\"type\":\"custom_tool_call\""));
+        assert!(body.contains("\"name\":\"apply_patch\""));
+        assert!(body.contains("\"namespace\":\"functions\""));
+        assert!(body.contains("*** Begin"));
+    }
+
+    #[tokio::test]
     async fn dropping_a_live_stream_marks_an_in_progress_record_incomplete() {
         let directory = tempfile::tempdir().unwrap();
         let state = state(&directory.path().join("responses.sqlite3"));
@@ -1291,6 +1586,39 @@ mod tests {
         assert_eq!(call["call_id"], "call_upstream");
         assert_eq!(call["arguments"], r#"{"id":42}"#);
         assert_eq!(call["status"], "completed");
+    }
+
+    #[test]
+    fn custom_tool_response_restores_name_namespace_and_freeform_input() {
+        let tools = vec![InternalTool {
+            name: "functions_apply_patch".into(),
+            description: Some("Apply a patch".into()),
+            input_schema: json!({"type":"object"}),
+            custom: true,
+            original_name: Some("apply_patch".into()),
+            namespace: Some("functions".into()),
+        }];
+        let response = InternalResponse {
+            tool_calls: vec![InternalToolCall {
+                id: "call_custom".into(),
+                name: "functions_apply_patch".into(),
+                arguments: json!({"input":"*** Begin\n+hello\n*** End"}),
+                complete: true,
+            }],
+            ..Default::default()
+        };
+        let payload = responses_payload_with_tools("resp_test", "kiro", &tools, &response);
+        let call = &payload["output"][0];
+        assert_eq!(call["type"], "custom_tool_call");
+        assert!(call["id"].as_str().unwrap().starts_with("ctc_"));
+        assert_eq!(call["call_id"], "call_custom");
+        assert_eq!(call["name"], "apply_patch");
+        assert_eq!(call["namespace"], "functions");
+        assert_eq!(call["input"], "*** Begin\n+hello\n*** End");
+
+        let events = responses_stream_events(&payload);
+        assert!(events.iter().any(|(kind, _)| *kind == "response.custom_tool_call_input.delta"));
+        assert!(events.iter().any(|(kind, _)| *kind == "response.custom_tool_call_input.done"));
     }
 
     #[test]
@@ -1397,7 +1725,7 @@ mod tests {
                 "kiro",
                 json!({
                     "messages":messages,
-                    "tools":[InternalTool { name:"lookup".into(), description:None, input_schema:json!({"type":"object"}) }]
+                    "tools":[InternalTool { name:"lookup".into(), description:None, input_schema:json!({"type":"object"}), custom:false, original_name:None, namespace:None }]
                 }),
                 ResponseStatus::Completed,
             )
