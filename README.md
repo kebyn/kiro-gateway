@@ -6,7 +6,9 @@
 
 - Anthropic Messages：普通响应、SSE、Token 估算、Tool Call 与 Tool Result 续传。
 - OpenAI Chat Completions：普通响应、SSE、并行 `tool_calls` 与 `tool` 消息续传。
-- OpenAI Responses：普通响应、SSE、`function_call` / `function_call_output`、本地响应存储和 `previous_response_id`；兼容 Codex 重放的 opaque `reasoning` 历史项，但不会将其转发给上游模型。
+- OpenAI Responses：普通响应、SSE、`function_call` / `function_call_output`、Codex
+  `custom_tool_call` / `custom_tool_call_output`、本地响应存储和
+  `previous_response_id`；兼容 Codex 重放的 opaque 历史项，但不会将其转发给上游模型。
 - Kiro IDE 与 CLI 两种上游端点格式。
 - 环境变量、JSON、只读 SQLite 和 API Key 凭据来源。
 - 凭据自动刷新、Admin 会话与 CSRF 防护。
@@ -203,6 +205,12 @@ Authorization: Bearer client-key-change-me
   `redacted_thinking` 及其他无法表达为文本的块会返回 `400`，不会静默丢失。
 - Kiro 上游没有等价的强制工具选择语义；`tool_choice` 仅支持 `auto`，指定
   `required`、`any` 或具体工具会返回 `400`，而不是被忽略。
+- Responses 的 custom grammar 工具会转换为 Kiro 可接受的字符串输入工具；自由格式
+  `input` 会原样保留，并在响应中恢复为 `custom_tool_call`。命名空间工具会在发往
+  Kiro 时将名称中的点号或命名空间分隔符编码为下划线，再在 Responses 输出中恢复
+  原始名称和命名空间。
+- Codex 的搜索、MCP、shell、图片生成、压缩和配置标记等没有 Kiro 等价执行语义的已知
+  历史项会作为 opaque 历史接受并忽略；完全未知的 Responses item type 仍返回 `400`。
 - `max_tokens`、`temperature` 等生成控制字段会被协议层接受，但当前 Kiro 请求格式没有
  可靠的一一映射；不要把它们视为精确生效的上游限制。
 
@@ -290,8 +298,8 @@ KIRO_ALLOW_LIVE_TESTS=1 \
 
 脚本运行 Claude Code 时使用 `--setting-sources ''` 并清空代理环境，避免用户级设置
 把本机请求转发到外部代理。Codex 发送的命名空间工具和 custom grammar 工具会由
-Responses 适配层展开或跳过；Kiro CLI 上游不接受工具名中的点号，因此转发时将
-`functions.wait` 这类名称编码为 `functions_wait`。
+Responses 适配层展开；Kiro CLI 上游不接受工具名中的点号，因此转发时将
+`functions.wait` 这类名称编码为 `functions_wait`，响应返回时恢复原始命名空间。
 
 可用 `KIRO_TEST_CLIENTS=codex,claude` 或 `--client grok` 缩小范围；可用
 `KIRO_TEST_MODEL=MODEL_ID` 覆盖动态选择的模型。Grok Build 的 Responses 兼容性由脚本
@@ -620,7 +628,11 @@ cargo test --locked model_catalog::tests::discovers_models_from_real_kiro_sqlite
 
 `store` 默认为 `true`。存储开启时，工具调用会和消息一起保存，后续 `previous_response_id` 可以恢复调用上下文。`store: false` 不创建 `responses` 或 `response_events` 记录；该响应 ID 不能用于本地读取或可靠续传。带有不存在的 `previous_response_id` 会返回 `404`，不会静默当作空历史。
 
-Responses SSE 生命周期包含 `response.created`、`response.in_progress`，随后为每个调用发送 `response.output_item.added`、`response.function_call_arguments.delta`、`response.function_call_arguments.done`、`response.output_item.done`，最后发送 `response.completed` 或 `response.incomplete`。所有事件包含递增的 `sequence_number`；工具事件包含 `output_index` 和独立的 `item_id`。
+Responses SSE 生命周期包含 `response.created`、`response.in_progress`，随后为每个调用发送 `response.output_item.added`、工具参数增量/完成事件、`response.output_item.done`，最后发送
+`response.completed` 或 `response.incomplete`。普通函数工具使用
+`response.function_call_arguments.*`，custom tool 使用
+`response.custom_tool_call_input.*`。所有事件包含递增的 `sequence_number`；工具事件包含
+`output_index` 和独立的 `item_id`。
 
 ## Admin
 
