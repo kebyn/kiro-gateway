@@ -1,5 +1,6 @@
 use crate::protocol::internal::{
     InternalMessage, InternalRequest, InternalTool, InternalToolCall, InternalToolResult,
+    content_text,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -55,12 +56,58 @@ pub struct ChatFunction {
     pub parameters: Value,
 }
 
+impl ChatRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_tool_choice(self.tool_choice.as_ref())?;
+        for message in &self.messages {
+            let content = message.content.clone().unwrap_or(Value::Null);
+            InternalMessage::new(message.role.as_str(), content).validate_content()?;
+            for call in &message.tool_calls {
+                if call.r#type != "function" {
+                    return Err(format!("unsupported Chat tool call type: {}", call.r#type));
+                }
+            }
+        }
+        for tool in &self.tools {
+            if tool.r#type != "function" {
+                return Err(format!("unsupported Chat tool type: {}", tool.r#type));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_tool_choice(choice: Option<&Value>) -> Result<(), String> {
+    let Some(choice) = choice else { return Ok(()) };
+    match choice {
+        Value::String(value) if value == "auto" => Ok(()),
+        Value::String(value) => Err(format!("unsupported Chat tool_choice: {value}")),
+        Value::Object(_) => {
+            Err("named Chat tool_choice is not supported by the Kiro upstream".into())
+        }
+        _ => Err("Chat tool_choice must be a string or function object".into()),
+    }
+}
+
 impl From<ChatRequest> for InternalRequest {
     fn from(value: ChatRequest) -> Self {
+        let mut system_parts = Vec::new();
+        let mut messages = Vec::new();
+        for message in value.messages {
+            let parsed = parse_message(message);
+            if matches!(parsed.role.as_str(), "system" | "developer") {
+                let text = content_text(&parsed);
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
+            } else {
+                messages.push(parsed);
+            }
+        }
         Self {
             model: value.model,
-            messages: value.messages.into_iter().map(parse_message).collect(),
-            system: None,
+            messages,
+            system: (!system_parts.is_empty()).then(|| system_parts.join("\n\n")),
             tools: value
                 .tools
                 .into_iter()
@@ -142,6 +189,47 @@ mod tests {
         assert_eq!(internal.messages[0].tool_calls[1].arguments["value"], 2);
         assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_a");
         assert_eq!(internal.messages[2].tool_results[0].content[0]["text"], "second");
+    }
+
+    #[test]
+    fn maps_system_and_developer_roles_to_instructions() {
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "messages":[
+                {"role":"system","content":"Follow the policy."},
+                {"role":"developer","content":[{"type":"text","text":"Be concise."}]},
+                {"role":"user","content":"hello"}
+            ]
+        }))
+        .unwrap();
+
+        let internal: InternalRequest = request.into();
+        assert_eq!(internal.messages.len(), 1);
+        assert_eq!(internal.messages[0].role, "user");
+        assert_eq!(internal.system.as_deref(), Some("Follow the policy.\n\nBe concise."));
+    }
+
+    #[test]
+    fn rejects_unsupported_tool_and_content_types() {
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "tools":[{"type":"web_search","function":{"name":"search","parameters":{}}}],
+            "messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image"}}]}]
+        }))
+        .unwrap();
+        let error = request.validate().unwrap_err();
+        assert!(error.contains("unsupported content"));
+    }
+
+    #[test]
+    fn rejects_named_tool_choice_instead_of_ignoring_it() {
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "tool_choice":{"type":"function","function":{"name":"lookup"}},
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        assert!(request.validate().unwrap_err().contains("tool_choice"));
     }
 
     #[test]

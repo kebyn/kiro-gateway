@@ -50,6 +50,7 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(body): Json<ChatRequest>,
 ) -> Result<Response, AppError> {
+    body.validate().map_err(AppError::BadRequest)?;
     let mut request: InternalRequest = body.into();
     request.model = state.token_manager.resolve_model(&request.model).await?;
     tracing::debug!(

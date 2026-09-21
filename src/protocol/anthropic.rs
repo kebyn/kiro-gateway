@@ -50,6 +50,47 @@ pub struct CountTokensResponse {
     pub input_tokens: u64,
 }
 
+impl MessagesRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_tool_choice(self.tool_choice.as_ref())?;
+        if let Some(system) = &self.system {
+            InternalMessage::new("system", system.clone()).validate_content()?;
+        }
+        for message in &self.messages {
+            validate_message_content(message)?;
+        }
+        Ok(())
+    }
+}
+
+impl CountTokensRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(system) = &self._system {
+            InternalMessage::new("system", system.clone()).validate_content()?;
+        }
+        for message in &self.messages {
+            validate_message_content(message)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_tool_choice(choice: Option<&Value>) -> Result<(), String> {
+    let Some(choice) = choice else { return Ok(()) };
+    let kind = choice.get("type").and_then(Value::as_str).unwrap_or_default();
+    if kind == "auto" {
+        Ok(())
+    } else {
+        Err("Anthropic tool_choice values other than auto are not supported by the Kiro upstream"
+            .into())
+    }
+}
+
+fn validate_message_content(message: &AnthropicMessage) -> Result<(), String> {
+    parse_message(AnthropicMessage { role: message.role.clone(), content: message.content.clone() })
+        .validate_content()
+}
+
 impl From<MessagesRequest> for InternalRequest {
     fn from(value: MessagesRequest) -> Self {
         Self {
@@ -75,7 +116,7 @@ impl From<MessagesRequest> for InternalRequest {
     }
 }
 
-fn parse_message(message: AnthropicMessage) -> InternalMessage {
+pub(crate) fn parse_message(message: AnthropicMessage) -> InternalMessage {
     let mut parsed = InternalMessage::new(message.role, Value::Null);
     let mut content = Vec::new();
     match message.content {
@@ -118,15 +159,22 @@ fn parse_content_block(item: Value, content: &mut Vec<Value>, message: &mut Inte
     }
 }
 
-fn text_value(value: &Value) -> String {
+pub(crate) fn text_value(value: &Value) -> String {
     match value {
-        Value::String(v) => v.clone(),
         Value::Array(items) => items
             .iter()
-            .filter_map(|v| v.get("text").and_then(Value::as_str))
+            .map(|item| {
+                crate::protocol::internal::content_text(&InternalMessage::new(
+                    "system",
+                    item.clone(),
+                ))
+            })
+            .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
-        _ => value.to_string(),
+        _ => {
+            crate::protocol::internal::content_text(&InternalMessage::new("system", value.clone()))
+        }
     }
 }
 
@@ -160,6 +208,44 @@ mod tests {
         assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_weather");
         assert!(internal.messages[1].tool_results[1].is_error);
         assert_eq!(crate::protocol::internal::content_text(&internal.messages[0]), "Checking");
+    }
+
+    #[test]
+    fn preserves_system_instruction_text() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "system":[
+                {"type":"text","text":"Follow the policy."},
+                {"type":"text","text":"Be concise."}
+            ],
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+
+        let internal: InternalRequest = request.into();
+        assert_eq!(internal.system.as_deref(), Some("Follow the policy.\nBe concise."));
+    }
+
+    #[test]
+    fn rejects_non_text_system_and_message_blocks() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "system":[{"type":"image","source":{"type":"url","url":"https://example.test/image"}}],
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        assert!(request.validate().unwrap_err().contains("unsupported content"));
+    }
+
+    #[test]
+    fn rejects_forced_tool_choice_instead_of_ignoring_it() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "tool_choice":{"type":"any"},
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        assert!(request.validate().unwrap_err().contains("tool_choice"));
     }
 
     #[test]

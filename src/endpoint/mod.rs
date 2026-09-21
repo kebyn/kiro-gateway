@@ -192,6 +192,11 @@ pub fn conversation_body(
         .join("\n");
     let current_content =
         if current_content.is_empty() { "(empty placeholder)".to_owned() } else { current_content };
+    let current_content = with_instruction_context(
+        request.system.as_deref(),
+        request.instructions.as_deref(),
+        current_content,
+    );
     let mut seen_results = HashSet::new();
     let tool_results: Vec<serde_json::Value> = current_messages
         .iter()
@@ -230,6 +235,26 @@ pub fn conversation_body(
         }
     }
     body
+}
+
+fn with_instruction_context(
+    system: Option<&str>,
+    instructions: Option<&str>,
+    current_content: String,
+) -> String {
+    let mut sections = Vec::new();
+    if let Some(system) = system.filter(|value| !value.is_empty()) {
+        sections.push(format!("[System instructions]\n{system}"));
+    }
+    if let Some(instructions) = instructions.filter(|value| !value.is_empty()) {
+        sections.push(format!("[Developer instructions]\n{instructions}"));
+    }
+    if sections.is_empty() {
+        current_content
+    } else {
+        sections.push(current_content);
+        sections.join("\n\n")
+    }
 }
 
 fn active_tool_round(
@@ -443,6 +468,20 @@ mod tests {
             is_error,
         });
         message
+    }
+
+    #[test]
+    fn preserves_system_and_developer_instructions_in_current_prompt() {
+        let mut request =
+            request(vec![InternalMessage::new("user", Value::String("answer briefly".into()))]);
+        request.system = Some("You are a precise assistant.".into());
+        request.instructions = Some("Use concise wording.".into());
+
+        let body = conversation_body(&request, &Credential::default(), "AI_EDITOR", "kiro");
+        assert_eq!(
+            body["conversationState"]["currentMessage"]["userInputMessage"]["content"],
+            "[System instructions]\nYou are a precise assistant.\n\n[Developer instructions]\nUse concise wording.\n\nanswer briefly"
+        );
     }
 
     #[test]
