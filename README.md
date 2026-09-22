@@ -214,6 +214,23 @@ Authorization: Bearer client-key-change-me
 - `max_tokens`、`temperature` 等生成控制字段会被协议层接受，但当前 Kiro 请求格式没有
  可靠的一一映射；不要把它们视为精确生效的上游限制。
 
+上游 `reasoningContentEvent` 会在三种流式协议中保留：Anthropic 使用 `thinking` 内容块，
+Chat Completions 使用 `reasoning_content`，Responses/Codex 使用原生 `reasoning` 输出项和
+`response.reasoning_summary_*` 事件。只有上游实际返回的可读思考内容会被转发，不会解密或
+伪造 opaque/encrypted reasoning 历史。
+
+### 流式连接、重试与不完整响应
+
+三种 SSE 接口都会发送 keep-alive 注释，避免上游思考时间较长时客户端把连接误判为空闲。
+上游 EventStream 只有在尚未向下游发送任何协议事件前才允许自动重试一次；已经展示文本、
+思考或工具调用后不会整段重放，以免 Codex 收到重复输出。上游在没有终止事件时提前 EOF
+会被标记为不完整，并发送协议对应的终止事件；Responses 使用 `response.incomplete`，
+Anthropic 和 Chat Completions 仍分别发送 `message_stop` 和 `[DONE]`。
+
+客户端主动断开时，网关不会尝试向已关闭的连接写入伪造终止事件；如果 `store=true`，
+Responses 记录会持久化为 `client_disconnect` 原因的不完整响应。日志中的正常 H2
+`GOAWAY(NO_ERROR)` 只表示连接生命周期结束，不等同于上游模型错误。
+
 ### Claude Code 流式调试
 
 Claude Code 使用 Anthropic Messages 接口时，应将 `ANTHROPIC_BASE_URL` 指向网关地址，
