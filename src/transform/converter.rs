@@ -68,6 +68,7 @@ pub fn normalized_stop_reason(reason: Option<&str>) -> Option<&'static str> {
         "refusal" | "content_filter" | "content_filtered" | "guardrail_intervened" => {
             Some("refusal")
         }
+        "stream_incomplete" | "incomplete" | "upstream_disconnect" => Some("stream_incomplete"),
         "stop_sequence" => Some("stop_sequence"),
         "pause_turn" => Some("pause_turn"),
         "end_turn" | "complete" | "completed" | "stop" => Some("end_turn"),
@@ -79,6 +80,7 @@ pub fn responses_incomplete_reason(response: &InternalResponse) -> Option<&'stat
     match normalized_stop_reason(response.stop_reason.as_deref()) {
         Some("max_tokens") | Some("context_window_exceeded") => Some("max_output_tokens"),
         Some("refusal") => Some("content_filter"),
+        Some("stream_incomplete") => Some("error"),
         _ if response.incomplete => Some("max_output_tokens"),
         _ => None,
     }

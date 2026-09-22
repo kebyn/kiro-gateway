@@ -72,7 +72,16 @@ impl UpstreamClient {
                 );
                 let response = match send_once(&client, &endpoint, &request, &credential).await {
                     Ok(response) => response,
-                    Err(SendOnceError::Transport(_)) if attempt == 0 => continue,
+                    Err(SendOnceError::Transport(error)) if attempt == 0 => {
+                        tracing::debug!(
+                            model = %request.model,
+                            attempt,
+                            retry_reason = "request_transport",
+                            error = %error,
+                            "retrying upstream request before emitting events"
+                        );
+                        continue;
+                    }
                     Err(error) => {
                         yield Err(error.into_app_error());
                         return;
@@ -80,6 +89,7 @@ impl UpstreamClient {
                 };
                 tracing::debug!(
                     model = %request.model,
+                    attempt,
                     content_type = ?response.headers().get(reqwest::header::CONTENT_TYPE),
                     "received upstream response"
                 );
@@ -98,7 +108,16 @@ impl UpstreamClient {
                     }
                     let body = match response.bytes().await {
                         Ok(body) => body,
-                        Err(_) if attempt == 0 => continue,
+                        Err(error) if attempt == 0 => {
+                            tracing::debug!(
+                                model = %request.model,
+                                attempt,
+                                retry_reason = "response_body_transport",
+                                error = %error,
+                                "retrying upstream request before emitting events"
+                            );
+                            continue;
+                        }
                         Err(error) => {
                             yield Err(AppError::Upstream(error.to_string()));
                             return;
@@ -141,6 +160,13 @@ impl UpstreamClient {
                         Err(error) => {
                             integrity.incomplete = true;
                             if matches!(integrity.should_retry(), RetryDecision::Retry) {
+                                tracing::debug!(
+                                    model = %request.model,
+                                    attempt,
+                                    retry_reason = "event_stream_transport",
+                                    error = %error,
+                                    "retrying upstream request before emitting events"
+                                );
                                 retry = true;
                                 break;
                             }
@@ -158,6 +184,13 @@ impl UpstreamClient {
                         Err(error) => {
                             integrity.incomplete = true;
                             if matches!(integrity.should_retry(), RetryDecision::Retry) {
+                                tracing::debug!(
+                                    model = %request.model,
+                                    attempt,
+                                    retry_reason = "event_stream_decode",
+                                    error = %error,
+                                    "retrying upstream request before emitting events"
+                                );
                                 retry = true;
                                 break;
                             }
@@ -175,6 +208,13 @@ impl UpstreamClient {
                             Err(error) => {
                                 integrity.incomplete = true;
                                 if matches!(integrity.should_retry(), RetryDecision::Retry) {
+                                    tracing::debug!(
+                                        model = %request.model,
+                                        attempt,
+                                        retry_reason = "event_decode",
+                                        error = %error,
+                                        "retrying upstream request before emitting events"
+                                    );
                                     retry = true;
                                     break;
                                 }
@@ -207,6 +247,13 @@ impl UpstreamClient {
                 if let Err(error) = decoder.finish() {
                     integrity.incomplete = true;
                     if matches!(integrity.should_retry(), RetryDecision::Retry) {
+                        tracing::debug!(
+                            model = %request.model,
+                            attempt,
+                            retry_reason = "truncated_event_stream",
+                            error = %error,
+                            "retrying upstream request before emitting events"
+                        );
                         continue;
                     }
                     yield Err(AppError::Integrity(error.to_string()));
@@ -215,12 +262,25 @@ impl UpstreamClient {
                 if !integrity.emitted_any {
                     integrity.incomplete = true;
                     if matches!(integrity.should_retry(), RetryDecision::Retry) {
+                        tracing::debug!(
+                            model = %request.model,
+                            attempt,
+                            retry_reason = "empty_event_stream",
+                            "retrying upstream request before emitting events"
+                        );
                         continue;
                     }
                     yield Err(AppError::Integrity("upstream stream was empty".into()));
+                    return;
+                }
+                if !integrity.completed {
+                    integrity.incomplete = true;
+                    event_count += 1;
+                    yield Ok(InternalEvent::Stop { reason: "stream_incomplete".into() });
                 }
                 tracing::debug!(
                     model = %request.model,
+                    attempt,
                     events = event_count,
                     completed = integrity.completed,
                     stream_end_status = if integrity.completed { "completed" } else { "incomplete" },
@@ -285,7 +345,14 @@ async fn send_once(
 }
 
 fn event_marks_completion(event: &InternalEvent) -> bool {
-    matches!(event, InternalEvent::Stop { .. } | InternalEvent::ToolCallEnd { complete: true, .. })
+    matches!(
+        event,
+        InternalEvent::Stop { reason }
+            if !matches!(
+                reason.trim().to_ascii_lowercase().as_str(),
+                "incomplete" | "stream_incomplete" | "upstream_disconnect"
+            )
+    ) || matches!(event, InternalEvent::ToolCallEnd { complete: true, .. })
 }
 
 /// Converts a complete JSON response into the same logical events produced by
@@ -621,6 +688,9 @@ fn finish_stream_response(
                 | "content_filter"
                 | "content_filtered"
                 | "guardrail_intervened"
+                | "incomplete"
+                | "stream_incomplete"
+                | "upstream_disconnect"
         )
     });
     output.incomplete = output.tool_calls.iter().any(|call| !call.complete)
@@ -826,6 +896,22 @@ mod tests {
         assert!(
             matches!(&collected[..], [InternalEvent::TextDelta { text }, InternalEvent::Stop { reason }] if text == "ok" && reason == "end_turn")
         );
+    }
+
+    #[test]
+    fn incomplete_terminal_reason_is_not_reported_as_completed() {
+        let response = finish_stream_response(
+            InternalResponse {
+                text: "partial".into(),
+                stop_reason: Some("stream_incomplete".into()),
+                ..Default::default()
+            },
+            &mut ToolCallAccumulator::new(),
+        );
+        assert!(response.incomplete);
+        assert!(!event_marks_completion(&InternalEvent::Stop {
+            reason: "stream_incomplete".into(),
+        }));
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
