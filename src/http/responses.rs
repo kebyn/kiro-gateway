@@ -226,6 +226,14 @@ struct LiveTool {
 }
 
 #[derive(Clone, Debug)]
+struct LiveReasoning {
+    item_id: String,
+    output_index: usize,
+    summary: String,
+    done_emitted: bool,
+}
+
+#[derive(Clone, Debug)]
 struct CustomToolInfo {
     name: String,
     namespace: Option<String>,
@@ -233,6 +241,7 @@ struct CustomToolInfo {
 
 #[derive(Clone, Debug)]
 enum LiveItem {
+    Reasoning(usize),
     Text,
     Tool(usize),
 }
@@ -241,6 +250,8 @@ enum LiveItem {
 struct LiveResponseState {
     text_item_id: Option<String>,
     text_output_index: Option<usize>,
+    reasoning: Vec<LiveReasoning>,
+    active_reasoning: Option<usize>,
     tools: Vec<LiveTool>,
     tool_indices: HashMap<String, usize>,
     item_order: Vec<LiveItem>,
@@ -327,6 +338,24 @@ impl LiveResponseState {
         (id, index, true)
     }
 
+    fn ensure_reasoning(&mut self) -> (usize, bool) {
+        if let Some(index) = self.active_reasoning {
+            return (index, false);
+        }
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let index = self.reasoning.len();
+        self.reasoning.push(LiveReasoning {
+            item_id: format!("rs_{}", uuid::Uuid::now_v7()),
+            output_index,
+            summary: String::new(),
+            done_emitted: false,
+        });
+        self.active_reasoning = Some(index);
+        self.item_order.push(LiveItem::Reasoning(index));
+        (index, true)
+    }
+
     fn ensure_tool(
         &mut self,
         call_id: &str,
@@ -403,6 +432,18 @@ fn custom_item(
         item["namespace"] = json!(namespace);
     }
     item
+}
+
+fn reasoning_item(reasoning: &LiveReasoning, status: &str) -> Value {
+    json!({
+        "type":"reasoning",
+        "id":reasoning.item_id,
+        "status":status,
+        "summary":[{
+            "type":"summary_text",
+            "text":reasoning.summary
+        }]
+    })
 }
 
 struct ToolItemSpec<'a> {
@@ -679,7 +720,58 @@ fn responses_live_stream(
                         }
                     }
                 }
-                InternalEvent::ThinkingDelta { text } => live.thinking.push_str(&text),
+                InternalEvent::ThinkingDelta { text } => {
+                    live.thinking.push_str(&text);
+                    let (reasoning_index, added) = live.ensure_reasoning();
+                    let item_id = live.reasoning[reasoning_index].item_id.clone();
+                    let output_index = live.reasoning[reasoning_index].output_index;
+                    if added {
+                        let item = reasoning_item(&live.reasoning[reasoning_index], "in_progress");
+                        if let Ok(data) = attach_sequence(
+                            &state,
+                            &id,
+                            store,
+                            &mut sequence,
+                            "response.output_item.added",
+                            json!({"output_index":output_index,"item":item}),
+                        ) {
+                            yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
+                        }
+                        if let Ok(data) = attach_sequence(
+                            &state,
+                            &id,
+                            store,
+                            &mut sequence,
+                            "response.reasoning_summary_part.added",
+                            json!({
+                                "item_id":item_id.clone(),
+                                "output_index":output_index,
+                                "summary_index":0,
+                                "part":{"type":"summary_text","text":""}
+                            }),
+                        ) {
+                            yield Ok(Event::default().event("response.reasoning_summary_part.added").data(data.to_string()));
+                        }
+                    }
+                    if !text.is_empty() {
+                        live.reasoning[reasoning_index].summary.push_str(&text);
+                        if let Ok(data) = attach_sequence(
+                            &state,
+                            &id,
+                            store,
+                            &mut sequence,
+                            "response.reasoning_summary_text.delta",
+                            json!({
+                                "item_id":item_id,
+                                "output_index":output_index,
+                                "summary_index":0,
+                                "delta":text
+                            }),
+                        ) {
+                            yield Ok(Event::default().event("response.reasoning_summary_text.delta").data(data.to_string()));
+                        }
+                    }
+                }
                 InternalEvent::Usage { usage } => live.usage = Some(usage),
                 InternalEvent::Stop { reason } => live.stop_reason = Some(reason),
                 InternalEvent::Error { .. } => unreachable!(),
@@ -750,6 +842,60 @@ fn responses_live_stream(
         }
         for item in &live.item_order {
             match item {
+                LiveItem::Reasoning(reasoning_index) => {
+                    let reasoning = &live.reasoning[*reasoning_index];
+                    if !reasoning.done_emitted {
+                        let item_status =
+                            if payload["status"] == "incomplete" { "incomplete" } else { "completed" };
+                        if let Ok(data) = attach_sequence(
+                            &state,
+                            &id,
+                            store,
+                            &mut sequence,
+                            "response.reasoning_summary_text.done",
+                            json!({
+                                "item_id":reasoning.item_id.clone(),
+                                "output_index":reasoning.output_index,
+                                "summary_index":0,
+                                "text":reasoning.summary
+                            }),
+                        ) {
+                            yield Ok(Event::default().event("response.reasoning_summary_text.done").data(data.to_string()));
+                        }
+                        if let Ok(data) = attach_sequence(
+                            &state,
+                            &id,
+                            store,
+                            &mut sequence,
+                            "response.reasoning_summary_part.done",
+                            json!({
+                                "item_id":reasoning.item_id.clone(),
+                                "output_index":reasoning.output_index,
+                                "summary_index":0,
+                                "part":{"type":"summary_text","text":reasoning.summary}
+                            }),
+                        ) {
+                            yield Ok(Event::default().event("response.reasoning_summary_part.done").data(data.to_string()));
+                        }
+                        if let Some(item) = payload["output"]
+                            .as_array()
+                            .and_then(|items| items.iter().find(|item| item["id"] == reasoning.item_id))
+                        {
+                            let mut item = item.clone();
+                            item["status"] = json!(item_status);
+                            if let Ok(data) = attach_sequence(
+                                &state,
+                                &id,
+                                store,
+                                &mut sequence,
+                                "response.output_item.done",
+                                json!({"output_index":reasoning.output_index,"item":item}),
+                            ) {
+                                yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
+                            }
+                        }
+                    }
+                }
                 LiveItem::Text => {
                     if let (Some(item_id), Some(output_index)) = (&live.text_item_id, live.text_output_index) {
                         if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_text.done", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"text":response.text,"logprobs":[]})) {
@@ -840,6 +986,11 @@ fn responses_payload_with_live_items_and_tools(
     let mut output = Vec::new();
     for item in &live.item_order {
         match item {
+            LiveItem::Reasoning(reasoning_index) => {
+                if let Some(reasoning) = live.reasoning.get(*reasoning_index) {
+                    output.push(reasoning_item(reasoning, status));
+                }
+            }
             LiveItem::Text => {
                 if let Some(item_id) = &live.text_item_id {
                     output.push(json!({"type":"message","id":item_id,"status":status,"role":"assistant","content":[{"type":"output_text","text":response.text,"annotations":[],"logprobs":[]}]}));
@@ -914,6 +1065,15 @@ fn responses_payload_with_tools(
     let incomplete_reason = responses_incomplete_reason(response);
     let status = if incomplete_reason.is_some() { "incomplete" } else { "completed" };
     let mut output = Vec::new();
+    if !response.thinking.is_empty() {
+        let reasoning = LiveReasoning {
+            item_id: format!("rs_{}", uuid::Uuid::now_v7()),
+            output_index: 0,
+            summary: response.thinking.clone(),
+            done_emitted: true,
+        };
+        output.push(reasoning_item(&reasoning, status));
+    }
     if !response.text.is_empty() {
         output.push(json!({
             "type":"message",
@@ -974,15 +1134,18 @@ fn response_messages(
     response: &InternalResponse,
 ) -> Vec<InternalMessage> {
     let mut messages = input.to_vec();
-    if !response.text.is_empty() || !response.tool_calls.is_empty() {
-        let mut assistant = InternalMessage::new(
-            "assistant",
-            if response.text.is_empty() {
-                Value::Null
-            } else {
-                Value::String(response.text.clone())
-            },
-        );
+    if !response.text.is_empty() || !response.thinking.is_empty() || !response.tool_calls.is_empty()
+    {
+        let content = match (response.thinking.is_empty(), response.text.is_empty()) {
+            (false, false) => json!([
+                {"type":"thinking","thinking":response.thinking.clone()},
+                {"type":"text","text":response.text.clone()}
+            ]),
+            (false, true) => json!([{"type":"thinking","thinking":response.thinking.clone()}]),
+            (true, false) => Value::String(response.text.clone()),
+            (true, true) => Value::Null,
+        };
+        let mut assistant = InternalMessage::new("assistant", content);
         assistant.tool_calls = response.tool_calls.clone();
         messages.push(assistant);
     }
@@ -1011,6 +1174,75 @@ fn responses_stream_events(payload: &Value) -> Vec<(&'static str, Value)> {
 
     for (output_index, item) in payload["output"].as_array().into_iter().flatten().enumerate() {
         match item["type"].as_str() {
+            Some("reasoning") => {
+                let mut added = item.clone();
+                added["status"] = json!("in_progress");
+                added["summary"] = json!([]);
+                push_event(
+                    &mut events,
+                    &mut sequence_number,
+                    "response.output_item.added",
+                    json!({"output_index":output_index,"item":added}),
+                );
+                let summary = item["summary"]
+                    .as_array()
+                    .and_then(|parts| parts.first())
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type":"summary_text","text":""}));
+                let summary_text = summary["text"].as_str().unwrap_or_default();
+                push_event(
+                    &mut events,
+                    &mut sequence_number,
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "item_id":item["id"],
+                        "output_index":output_index,
+                        "summary_index":0,
+                        "part":{"type":"summary_text","text":""}
+                    }),
+                );
+                if !summary_text.is_empty() {
+                    push_event(
+                        &mut events,
+                        &mut sequence_number,
+                        "response.reasoning_summary_text.delta",
+                        json!({
+                            "item_id":item["id"],
+                            "output_index":output_index,
+                            "summary_index":0,
+                            "delta":summary_text
+                        }),
+                    );
+                }
+                push_event(
+                    &mut events,
+                    &mut sequence_number,
+                    "response.reasoning_summary_text.done",
+                    json!({
+                        "item_id":item["id"],
+                        "output_index":output_index,
+                        "summary_index":0,
+                        "text":summary_text
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence_number,
+                    "response.reasoning_summary_part.done",
+                    json!({
+                        "item_id":item["id"],
+                        "output_index":output_index,
+                        "summary_index":0,
+                        "part":summary
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence_number,
+                    "response.output_item.done",
+                    json!({"output_index":output_index,"item":item}),
+                );
+            }
             Some("message") => {
                 let mut added = item.clone();
                 added["status"] = json!("in_progress");
@@ -1522,6 +1754,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_reasoning_emits_native_responses_summary_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory.path().join("responses.sqlite3"));
+        let internal = crate::protocol::internal::InternalRequest {
+            model: "kiro".into(),
+            messages: vec![InternalMessage::new("user", Value::String("think".into()))],
+            system: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            conversation_id: None,
+            instructions: None,
+        };
+        let upstream: crate::upstream::request::InternalEventStream = Box::pin(stream::iter(vec![
+            Ok(crate::protocol::internal::InternalEvent::ThinkingDelta { text: "plan".into() }),
+            Ok(crate::protocol::internal::InternalEvent::TextDelta { text: "answer".into() }),
+            Ok(crate::protocol::internal::InternalEvent::Stop { reason: "end_turn".into() }),
+        ]));
+        let response = responses_live_stream(
+            state,
+            upstream,
+            "resp_reasoning".into(),
+            "kiro".into(),
+            internal,
+            false,
+            None,
+        )
+        .into_response();
+        let body =
+            String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec())
+                .unwrap();
+        assert!(body.contains("response.reasoning_summary_part.added"));
+        assert!(body.contains("response.reasoning_summary_text.delta"));
+        assert!(body.contains("response.reasoning_summary_text.done"));
+        assert!(body.contains("\"type\":\"reasoning\""));
+        assert!(body.contains("\"text\":\"plan\""));
+        assert!(body.contains("response.completed"));
+    }
+
+    #[tokio::test]
     async fn dropping_a_live_stream_marks_an_in_progress_record_incomplete() {
         let directory = tempfile::tempdir().unwrap();
         let state = state(&directory.path().join("responses.sqlite3"));
@@ -1630,6 +1904,28 @@ mod tests {
         let events = responses_stream_events(&payload);
         assert!(events.iter().any(|(kind, _)| *kind == "response.custom_tool_call_input.delta"));
         assert!(events.iter().any(|(kind, _)| *kind == "response.custom_tool_call_input.done"));
+    }
+
+    #[test]
+    fn reasoning_payload_uses_native_summary_stream_events() {
+        let response = InternalResponse {
+            text: "answer".into(),
+            thinking: "plan".into(),
+            stop_reason: Some("end_turn".into()),
+            ..Default::default()
+        };
+        let payload = responses_payload("resp_reasoning", "kiro", &response);
+        assert_eq!(payload["output"][0]["type"], "reasoning");
+        assert_eq!(payload["output"][0]["summary"][0]["text"], "plan");
+        let events = responses_stream_events(&payload);
+        let types: Vec<_> = events.iter().map(|event| event.0).collect();
+        assert!(types.contains(&"response.reasoning_summary_part.added"));
+        assert!(types.contains(&"response.reasoning_summary_text.delta"));
+        assert!(types.contains(&"response.reasoning_summary_text.done"));
+        assert_eq!(events.last().unwrap().0, "response.completed");
+        for (index, (_, event)) in events.iter().enumerate() {
+            assert_eq!(event["sequence_number"], index as u64);
+        }
     }
 
     #[test]
