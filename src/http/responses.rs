@@ -405,26 +405,35 @@ fn custom_item(
     item
 }
 
-fn tool_item(
-    id: &str,
-    call_id: &str,
-    name: &str,
-    arguments: &str,
-    status: &str,
+struct ToolItemSpec<'a> {
+    id: &'a str,
+    call_id: &'a str,
+    name: &'a str,
+    arguments: &'a str,
+    status: &'a str,
     custom: bool,
-    response_name: &str,
-    namespace: Option<&str>,
-) -> Value {
-    if custom {
-        custom_item(id, call_id, response_name, namespace, &custom_input(arguments), status)
+    response_name: &'a str,
+    namespace: Option<&'a str>,
+}
+
+fn tool_item(spec: ToolItemSpec<'_>) -> Value {
+    if spec.custom {
+        custom_item(
+            spec.id,
+            spec.call_id,
+            spec.response_name,
+            spec.namespace,
+            &custom_input(spec.arguments),
+            spec.status,
+        )
     } else {
         json!({
             "type":"function_call",
-            "id":id,
-            "call_id":call_id,
-            "name":name,
-            "arguments":arguments,
-            "status":status
+            "id":spec.id,
+            "call_id":spec.call_id,
+            "name":spec.name,
+            "arguments":spec.arguments,
+            "status":spec.status
         })
     }
 }
@@ -566,16 +575,16 @@ fn responses_live_stream(
                     let (tool_index, added) = live.ensure_tool(&key, &name, custom);
                     if added {
                         let tool = &live.tools[tool_index];
-                        let item = tool_item(
-                            &tool.item_id,
-                            &tool.call_id,
-                            &tool.name,
-                            "",
-                            "in_progress",
-                            tool.custom,
-                            &tool.response_name,
-                            tool.namespace.as_deref(),
-                        );
+                        let item = tool_item(ToolItemSpec {
+                            id: &tool.item_id,
+                            call_id: &tool.call_id,
+                            name: &tool.name,
+                            arguments: "",
+                            status: "in_progress",
+                            custom: tool.custom,
+                            response_name: &tool.response_name,
+                            namespace: tool.namespace.as_deref(),
+                        });
                         if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":tool.output_index,"item":item})) {
                             yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
                         }
@@ -588,16 +597,16 @@ fn responses_live_stream(
                     let (tool_index, added) = live.ensure_tool(&key, tool_name, custom);
                     if added {
                         let tool = &live.tools[tool_index];
-                        let item = tool_item(
-                            &tool.item_id,
-                            &tool.call_id,
-                            &tool.name,
-                            "",
-                            "in_progress",
-                            tool.custom,
-                            &tool.response_name,
-                            tool.namespace.as_deref(),
-                        );
+                        let item = tool_item(ToolItemSpec {
+                            id: &tool.item_id,
+                            call_id: &tool.call_id,
+                            name: &tool.name,
+                            arguments: "",
+                            status: "in_progress",
+                            custom: tool.custom,
+                            response_name: &tool.response_name,
+                            namespace: tool.namespace.as_deref(),
+                        });
                         if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":tool.output_index,"item":item})) {
                             yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
                         }
@@ -653,16 +662,16 @@ fn responses_live_stream(
                             if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, done_event, done_payload) {
                                 yield Ok(Event::default().event(done_event).data(data.to_string()));
                             }
-                            let item = tool_item(
-                                &item_id,
-                                &call_id,
-                                &tool.name,
-                                &tool.arguments,
+                            let item = tool_item(ToolItemSpec {
+                                id: &item_id,
+                                call_id: &call_id,
+                                name: &tool.name,
+                                arguments: &tool.arguments,
                                 status,
-                                tool.custom,
-                                &tool.response_name,
-                                tool.namespace.as_deref(),
-                            );
+                                custom: tool.custom,
+                                response_name: &tool.response_name,
+                                namespace: tool.namespace.as_deref(),
+                            });
                             if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.done", json!({"output_index":output_index,"item":item})) {
                                 yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
                             }
@@ -851,16 +860,17 @@ fn responses_payload_with_live_items_and_tools(
                             .as_ref()
                             .and_then(|info| info.namespace.as_deref())
                             .or(tool.namespace.as_deref());
-                        output.push(tool_item(
-                            &tool.item_id,
-                            &tool.call_id,
-                            &call.name,
-                            &call.arguments_json(),
-                            if call.complete { "completed" } else { "incomplete" },
+                        let arguments = call.arguments_json();
+                        output.push(tool_item(ToolItemSpec {
+                            id: &tool.item_id,
+                            call_id: &tool.call_id,
+                            name: &call.name,
+                            arguments: &arguments,
+                            status: if call.complete { "completed" } else { "incomplete" },
                             custom,
                             response_name,
                             namespace,
-                        ));
+                        }));
                     }
                 }
             }
@@ -924,16 +934,17 @@ fn responses_payload_with_tools(
             format!("{}_{}", if custom.is_some() { "ctc" } else { "fc" }, uuid::Uuid::now_v7());
         let response_name = custom.as_ref().map(|info| info.name.as_str()).unwrap_or(&call.name);
         let namespace = custom.as_ref().and_then(|info| info.namespace.as_deref());
-        output.push(tool_item(
-            &item_id,
-            &call.id,
-            &call.name,
-            &call.arguments_json(),
-            if call.complete { "completed" } else { "incomplete" },
-            custom.is_some(),
+        let arguments = call.arguments_json();
+        output.push(tool_item(ToolItemSpec {
+            id: &item_id,
+            call_id: &call.id,
+            name: &call.name,
+            arguments: &arguments,
+            status: if call.complete { "completed" } else { "incomplete" },
+            custom: custom.is_some(),
             response_name,
             namespace,
-        ));
+        }));
     }
     if output.is_empty() {
         output.push(json!({
