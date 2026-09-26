@@ -1,7 +1,7 @@
 SHELL := /bin/sh
 export SOURCE_DATE_EPOCH ?= 0
 
-.PHONY: fmt frontend check test client-smoke build reproducible release package docker audit deny
+.PHONY: fmt frontend secrets check test client-smoke build reproducible release package docker audit deny
 fmt:
 	cargo fmt --all
 
@@ -10,8 +10,13 @@ frontend:
 	corepack pnpm@9.15.4 --dir admin-ui install --frozen-lockfile
 	corepack pnpm@9.15.4 --dir admin-ui build
 
+secrets:
+	./scripts/check-no-secrets.sh
+	./tests/check-no-secrets.sh
+
 check:
 	$(MAKE) frontend
+	$(MAKE) secrets
 	cargo fmt --all -- --check
 	cargo clippy --locked --all-targets --all-features -- -D warnings
 

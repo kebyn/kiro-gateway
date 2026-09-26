@@ -15,7 +15,9 @@ build "$TMP1/target"
 build "$TMP2/target"
 sha256sum "$TMP1/target/release/kiro-gateway" "$TMP2/target/release/kiro-gateway"
 test "$(sha256sum "$TMP1/target/release/kiro-gateway" | awk '{print $1}')" = "$(sha256sum "$TMP2/target/release/kiro-gateway" | awk '{print $1}')"
-if strings "$TMP1/target/release/kiro-gateway" | grep -E "$ROOT|/data/|/tmp/" >/dev/null; then
-  echo "absolute workspace path found in binary" >&2
-  exit 1
-fi
+for BUILD_PATH in "$ROOT" "$TMP1" "$TMP2"; do
+  if strings "$TMP1/target/release/kiro-gateway" | grep -F "$BUILD_PATH" >/dev/null; then
+    echo "absolute build path found in binary: $BUILD_PATH" >&2
+    exit 1
+  fi
+done
