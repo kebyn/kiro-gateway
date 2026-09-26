@@ -42,7 +42,7 @@ struct ListAvailableModelsResponse {
 
 struct CacheEntry {
     fetched_at: Instant,
-    result: Result<Vec<ModelInfo>, String>,
+    result: Result<Vec<ModelInfo>, AppError>,
 }
 
 #[derive(Clone)]
@@ -83,10 +83,7 @@ impl ModelCatalog {
         }
 
         let result = self.fetch(credential).await;
-        let cached = match &result {
-            Ok(models) => Ok(models.clone()),
-            Err(error) => Err(error.to_string()),
-        };
+        let cached = result.clone();
         *self.cache.write() = Some(CacheEntry { fetched_at: Instant::now(), result: cached });
         result
     }
@@ -198,7 +195,7 @@ impl ModelCatalog {
         if entry.fetched_at.elapsed() >= self.ttl {
             return None;
         }
-        Some(entry.result.clone().map_err(AppError::Upstream))
+        Some(entry.result.clone())
     }
 
     pub(crate) fn invalidate(&self) {

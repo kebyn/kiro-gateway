@@ -61,6 +61,57 @@ fn custom_item(
     item
 }
 
+/// Builds the only terminal event we can truthfully send after a lifecycle
+/// event could not be persisted.  The stream stops immediately after this
+/// event; callers must not continue emitting events with a sequence that may
+/// not exist in the local store.
+#[allow(clippy::too_many_arguments)]
+fn storage_failure_payload(
+    state: &AppState,
+    record: Option<&ResponseRecord>,
+    store: bool,
+    snapshot: &Arc<Mutex<ResponseSnapshot>>,
+    id: &str,
+    model: &str,
+    sequence: u64,
+    error: &crate::error::AppError,
+) -> Value {
+    let message = error.to_string();
+    let mut payload = response_error_payload(id, model, &message);
+    payload["error"] = json!({"code":"storage_error","message":message});
+    payload["incomplete_details"] = json!({"reason":"storage_error"});
+    payload["sequence_number"] = json!(sequence);
+    set_snapshot_status(snapshot, ResponseStatus::Incomplete, payload.clone());
+
+    if store {
+        if let Some(record) = record {
+            let record_payload = {
+                let current = snapshot.lock();
+                json!({
+                    "messages": current.messages,
+                    "tools": current.tools,
+                    "opaque_history": current.opaque_history,
+                    "response": payload.clone()
+                })
+            };
+            let event_payload = json!({"response":payload.clone()});
+            if let Err(mark_error) = state.responses.mark_incomplete_on_disconnect(
+                record.id.clone(),
+                record_payload,
+                event_payload,
+            ) {
+                tracing::error!(
+                    response_id = %id,
+                    error = %mark_error,
+                    original_error = %error,
+                    "failed to queue storage failure transition"
+                );
+            }
+        }
+    }
+    payload
+}
+
 pub(super) fn reasoning_item(reasoning: &LiveReasoning, status: &str) -> Value {
     json!({
         "type":"reasoning",
@@ -202,19 +253,100 @@ pub(super) fn responses_live_stream(
         let mut accumulator = GenerationAccumulator::new();
         let mut text_filter = XmlLeakFilter::new();
         let mut failed = false;
+
+        // Every downstream event is persisted before it is yielded when
+        // `store=true`.  A failed append is terminal for this stream: sending
+        // later events would make the client observe a history that cannot be
+        // replayed from the local store.
+        macro_rules! emit_event {
+            ($event_type:expr, $event_payload:expr) => {{
+                let event_type: &'static str = $event_type;
+                match attach_sequence(
+                    &state,
+                    &id,
+                    store,
+                    &mut sequence,
+                    event_type,
+                    $event_payload,
+                )
+                .await
+                {
+                    Ok(data) => {
+                        yield Ok::<Event, Infallible>(
+                            Event::default().event(event_type).data(data.to_string()),
+                        );
+                    }
+                    Err(error) => {
+                        let payload = storage_failure_payload(
+                            &state,
+                            record.as_ref(),
+                            store,
+                            &snapshot,
+                            &id,
+                            &model,
+                            sequence,
+                            &error,
+                        );
+                        yield Ok::<Event, Infallible>(
+                            Event::default()
+                                .event("response.incomplete")
+                                .data(payload.to_string()),
+                        );
+                        return;
+                    }
+                }
+            }};
+        }
+        macro_rules! emit_failed {
+            ($message:expr) => {{
+                let message: String = ($message).to_string();
+                let payload = response_failed_payload(&id, &model, &message);
+                match persist_failure(
+                    &state,
+                    record.as_ref(),
+                    store,
+                    &mut sequence,
+                    &payload,
+                    &message,
+                    &stored_messages,
+                    &stored_tools,
+                    &stored_opaque,
+                )
+                .await
+                {
+                    Ok(data) => {
+                        set_snapshot_status(&snapshot, ResponseStatus::Failed, payload);
+                        yield Ok::<Event, Infallible>(
+                            Event::default().event("response.failed").data(data.to_string()),
+                        );
+                    }
+                    Err(error) => {
+                        let incomplete = storage_failure_payload(
+                            &state,
+                            record.as_ref(),
+                            store,
+                            &snapshot,
+                            &id,
+                            &model,
+                            sequence,
+                            &error,
+                        );
+                        yield Ok::<Event, Infallible>(
+                            Event::default()
+                                .event("response.incomplete")
+                                .data(incomplete.to_string()),
+                        );
+                        return;
+                    }
+                }
+            }};
+        }
         let initial = response_in_progress_payload_at(&id, &model, created_at);
         for (event_type, data) in [
             ("response.created", json!({"response":initial.clone()})),
             ("response.in_progress", json!({"response":initial})),
         ] {
-            match attach_sequence(&state, &id, store, &mut sequence, event_type, data).await {
-                Ok(data) => yield Ok::<Event, Infallible>(Event::default().event(event_type).data(data.to_string())),
-                Err(error) => {
-                    yield Ok(Event::default().event("response.incomplete").data(response_error_payload(&id, &model, &error.to_string()).to_string()));
-                    failed = true;
-                    break;
-                }
-            }
+            emit_event!(event_type, data);
         }
         if failed { return; }
 
@@ -222,60 +354,18 @@ pub(super) fn responses_live_stream(
             let event = match item {
                 Ok(event) => event,
                 Err(error) => {
-                    let payload = response_failed_payload(&id, &model, &error.to_string());
-                    if let Ok(data) = persist_failure(
-                        &state,
-                        record.as_ref(),
-                        store,
-                        &mut sequence,
-                        &payload,
-                        &error.to_string(),
-                        &stored_messages,
-                        &stored_tools,
-                        &stored_opaque,
-                    ).await {
-                        set_snapshot_status(&snapshot, ResponseStatus::Failed, payload);
-                        yield Ok(Event::default().event("response.failed").data(data.to_string()));
-                    }
+                    emit_failed!(error);
                     failed = true;
                     break;
                 }
             };
             if let GenerationEvent::Error { message } = &event {
-                let payload = response_failed_payload(&id, &model, message);
-                if let Ok(data) = persist_failure(
-                    &state,
-                    record.as_ref(),
-                    store,
-                    &mut sequence,
-                    &payload,
-                    message,
-                    &stored_messages,
-                    &stored_tools,
-                    &stored_opaque,
-                ).await {
-                    set_snapshot_status(&snapshot, ResponseStatus::Failed, payload);
-                    yield Ok(Event::default().event("response.failed").data(data.to_string()));
-                }
+                emit_failed!(message);
                 failed = true;
                 break;
             }
             if let Err(error) = accumulator.push(event.clone()) {
-                let payload = response_failed_payload(&id, &model, &error.to_string());
-                if let Ok(data) = persist_failure(
-                    &state,
-                    record.as_ref(),
-                    store,
-                    &mut sequence,
-                    &payload,
-                    &error.to_string(),
-                    &stored_messages,
-                    &stored_tools,
-                    &stored_opaque,
-                ).await {
-                    set_snapshot_status(&snapshot, ResponseStatus::Failed, payload);
-                    yield Ok(Event::default().event("response.failed").data(data.to_string()));
-                }
+                emit_failed!(error);
                 failed = true;
                 break;
             }
@@ -286,17 +376,11 @@ pub(super) fn responses_live_stream(
                     let (item_id, output_index, added) = live.ensure_text();
                     if added {
                         let item = json!({"type":"message","id":item_id,"status":"in_progress","role":"assistant","content":[]});
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":output_index,"item":item})).await {
-                            yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
-                        }
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.content_part.added", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}})).await {
-                            yield Ok(Event::default().event("response.content_part.added").data(data.to_string()));
-                        }
+                        emit_event!("response.output_item.added", json!({"output_index":output_index,"item":item}));
+                        emit_event!("response.content_part.added", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}));
                     }
                     if !text.is_empty() {
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_text.delta", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"delta":text,"logprobs":[]})).await {
-                            yield Ok(Event::default().event("response.output_text.delta").data(data.to_string()));
-                        }
+                        emit_event!("response.output_text.delta", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"delta":text,"logprobs":[]}));
                     }
                 }
                 GenerationEvent::ToolCallStart { id: call_id, name } => {
@@ -315,9 +399,7 @@ pub(super) fn responses_live_stream(
                             response_name: &tool.response_name,
                             namespace: tool.namespace.as_deref(),
                         });
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":tool.output_index,"item":item})).await {
-                            yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
-                        }
+                        emit_event!("response.output_item.added", json!({"output_index":tool.output_index,"item":item}));
                     }
                 }
                 GenerationEvent::ToolCallDelta { id: call_id, arguments, name } => {
@@ -337,18 +419,14 @@ pub(super) fn responses_live_stream(
                             response_name: &tool.response_name,
                             namespace: tool.namespace.as_deref(),
                         });
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":tool.output_index,"item":item})).await {
-                            yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
-                        }
+                        emit_event!("response.output_item.added", json!({"output_index":tool.output_index,"item":item}));
                     }
                     if !arguments.is_empty() {
                         live.tools[tool_index].arguments.push_str(&arguments);
                     }
                     if !arguments.is_empty() && !live.tools[tool_index].custom {
                         let tool = &live.tools[tool_index];
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.function_call_arguments.delta", json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"delta":arguments})).await {
-                            yield Ok(Event::default().event("response.function_call_arguments.delta").data(data.to_string()));
-                        }
+                        emit_event!("response.function_call_arguments.delta", json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"delta":arguments}));
                     }
                 }
                 GenerationEvent::ToolCallEnd { id: call_id, complete } => {
@@ -385,13 +463,9 @@ pub(super) fn responses_live_stream(
                                 )
                             };
                             if tool.custom && !input.is_empty() {
-                                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.custom_tool_call_input.delta", json!({"item_id":item_id,"call_id":call_id,"output_index":output_index,"delta":input})).await {
-                                    yield Ok(Event::default().event("response.custom_tool_call_input.delta").data(data.to_string()));
-                                }
+                                emit_event!("response.custom_tool_call_input.delta", json!({"item_id":item_id,"call_id":call_id,"output_index":output_index,"delta":input}));
                             }
-                            if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, done_event, done_payload).await {
-                                yield Ok(Event::default().event(done_event).data(data.to_string()));
-                            }
+                            emit_event!(done_event, done_payload);
                             let item = tool_item(ToolItemSpec {
                                 id: &item_id,
                                 call_id: &call_id,
@@ -402,9 +476,7 @@ pub(super) fn responses_live_stream(
                                 response_name: &tool.response_name,
                                 namespace: tool.namespace.as_deref(),
                             });
-                            if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.done", json!({"output_index":output_index,"item":item})).await {
-                                yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
-                            }
+                            emit_event!("response.output_item.done", json!({"output_index":output_index,"item":item}));
                             tool.done_emitted = true;
                         }
                     }
@@ -416,49 +488,22 @@ pub(super) fn responses_live_stream(
                     let output_index = live.reasoning[reasoning_index].output_index;
                     if added {
                         let item = reasoning_item(&live.reasoning[reasoning_index], "in_progress");
-                        if let Ok(data) = attach_sequence(
-                            &state,
-                            &id,
-                            store,
-                            &mut sequence,
-                            "response.output_item.added",
-                            json!({"output_index":output_index,"item":item}),
-                        ).await {
-                            yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
-                        }
-                        if let Ok(data) = attach_sequence(
-                            &state,
-                            &id,
-                            store,
-                            &mut sequence,
-                            "response.reasoning_summary_part.added",
-                            json!({
-                                "item_id":item_id.clone(),
-                                "output_index":output_index,
-                                "summary_index":0,
-                                "part":{"type":"summary_text","text":""}
-                            }),
-                        ).await {
-                            yield Ok(Event::default().event("response.reasoning_summary_part.added").data(data.to_string()));
-                        }
+                        emit_event!("response.output_item.added", json!({"output_index":output_index,"item":item}));
+                        emit_event!("response.reasoning_summary_part.added", json!({
+                            "item_id":item_id.clone(),
+                            "output_index":output_index,
+                            "summary_index":0,
+                            "part":{"type":"summary_text","text":""}
+                        }));
                     }
                     if !text.is_empty() {
                         live.reasoning[reasoning_index].summary.push_str(&text);
-                        if let Ok(data) = attach_sequence(
-                            &state,
-                            &id,
-                            store,
-                            &mut sequence,
-                            "response.reasoning_summary_text.delta",
-                            json!({
-                                "item_id":item_id,
-                                "output_index":output_index,
-                                "summary_index":0,
-                                "delta":text
-                            }),
-                        ).await {
-                            yield Ok(Event::default().event("response.reasoning_summary_text.delta").data(data.to_string()));
-                        }
+                        emit_event!("response.reasoning_summary_text.delta", json!({
+                            "item_id":item_id,
+                            "output_index":output_index,
+                            "summary_index":0,
+                            "delta":text
+                        }));
                     }
                 }
                 GenerationEvent::Usage { usage } => live.usage = Some(usage),
@@ -481,17 +526,11 @@ pub(super) fn responses_live_stream(
             let (item_id, output_index, added) = live.ensure_text();
             if added {
                 let item = json!({"type":"message","id":item_id,"status":"in_progress","role":"assistant","content":[]});
-                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":output_index,"item":item})).await {
-                    yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
-                }
-                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.content_part.added", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}})).await {
-                    yield Ok(Event::default().event("response.content_part.added").data(data.to_string()));
-                }
+                emit_event!("response.output_item.added", json!({"output_index":output_index,"item":item}));
+                emit_event!("response.content_part.added", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}));
             }
             live.text.push_str(&tail);
-            if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_text.delta", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"delta":tail,"logprobs":[]})).await {
-                yield Ok(Event::default().event("response.output_text.delta").data(data.to_string()));
-            }
+            emit_event!("response.output_text.delta", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"delta":tail,"logprobs":[]}));
         }
         let response = accumulator.finish();
         tracing::debug!(
@@ -512,21 +551,11 @@ pub(super) fn responses_live_stream(
         if live.item_order.is_empty() {
             if let Some(item) = payload["output"].as_array().and_then(|items| items.first()) {
                 let item_id = item["id"].as_str().unwrap_or_default();
-                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.added", json!({"output_index":0,"item":item})).await {
-                    yield Ok(Event::default().event("response.output_item.added").data(data.to_string()));
-                }
-                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.content_part.added", json!({"item_id":item_id,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}})).await {
-                    yield Ok(Event::default().event("response.content_part.added").data(data.to_string()));
-                }
-                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_text.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"text":"","logprobs":[]})).await {
-                    yield Ok(Event::default().event("response.output_text.done").data(data.to_string()));
-                }
-                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.content_part.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}})).await {
-                    yield Ok(Event::default().event("response.content_part.done").data(data.to_string()));
-                }
-                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.done", json!({"output_index":0,"item":item})).await {
-                    yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
-                }
+                emit_event!("response.output_item.added", json!({"output_index":0,"item":item}));
+                emit_event!("response.content_part.added", json!({"item_id":item_id,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}));
+                emit_event!("response.output_text.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"text":"","logprobs":[]}));
+                emit_event!("response.content_part.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}));
+                emit_event!("response.output_item.done", json!({"output_index":0,"item":item}));
             }
         }
         for item in &live.item_order {
@@ -536,67 +565,34 @@ pub(super) fn responses_live_stream(
                     if !reasoning.done_emitted {
                         let item_status =
                             if payload["status"] == "incomplete" { "incomplete" } else { "completed" };
-                        if let Ok(data) = attach_sequence(
-                            &state,
-                            &id,
-                            store,
-                            &mut sequence,
-                            "response.reasoning_summary_text.done",
-                            json!({
-                                "item_id":reasoning.item_id.clone(),
-                                "output_index":reasoning.output_index,
-                                "summary_index":0,
-                                "text":reasoning.summary
-                            }),
-                        ).await {
-                            yield Ok(Event::default().event("response.reasoning_summary_text.done").data(data.to_string()));
-                        }
-                        if let Ok(data) = attach_sequence(
-                            &state,
-                            &id,
-                            store,
-                            &mut sequence,
-                            "response.reasoning_summary_part.done",
-                            json!({
-                                "item_id":reasoning.item_id.clone(),
-                                "output_index":reasoning.output_index,
-                                "summary_index":0,
-                                "part":{"type":"summary_text","text":reasoning.summary}
-                            }),
-                        ).await {
-                            yield Ok(Event::default().event("response.reasoning_summary_part.done").data(data.to_string()));
-                        }
+                        emit_event!("response.reasoning_summary_text.done", json!({
+                            "item_id":reasoning.item_id.clone(),
+                            "output_index":reasoning.output_index,
+                            "summary_index":0,
+                            "text":reasoning.summary
+                        }));
+                        emit_event!("response.reasoning_summary_part.done", json!({
+                            "item_id":reasoning.item_id.clone(),
+                            "output_index":reasoning.output_index,
+                            "summary_index":0,
+                            "part":{"type":"summary_text","text":reasoning.summary}
+                        }));
                         if let Some(item) = payload["output"]
                             .as_array()
                             .and_then(|items| items.iter().find(|item| item["id"] == reasoning.item_id))
                         {
                             let mut item = item.clone();
                             item["status"] = json!(item_status);
-                            if let Ok(data) = attach_sequence(
-                                &state,
-                                &id,
-                                store,
-                                &mut sequence,
-                                "response.output_item.done",
-                                json!({"output_index":reasoning.output_index,"item":item}),
-                            ).await {
-                                yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
-                            }
+                            emit_event!("response.output_item.done", json!({"output_index":reasoning.output_index,"item":item}));
                         }
                     }
                 }
                 LiveItem::Text => {
                     if let (Some(item_id), Some(output_index)) = (&live.text_item_id, live.text_output_index) {
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_text.done", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"text":response.text,"logprobs":[]})).await {
-                            yield Ok(Event::default().event("response.output_text.done").data(data.to_string()));
-                        }
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.content_part.done", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":response.text,"annotations":[],"logprobs":[]}})).await {
-                            yield Ok(Event::default().event("response.content_part.done").data(data.to_string()));
-                        }
+                        emit_event!("response.output_text.done", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"text":response.text,"logprobs":[]}));
+                        emit_event!("response.content_part.done", json!({"item_id":item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":response.text,"annotations":[],"logprobs":[]}}));
                         if let Some(item) = payload["output"].as_array().and_then(|items| items.iter().find(|item| item["id"] == *item_id)) {
-                            if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.done", json!({"output_index":output_index,"item":item})).await {
-                                yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
-                            }
+                            emit_event!("response.output_item.done", json!({"output_index":output_index,"item":item}));
                         }
                     }
                 }
@@ -612,9 +608,7 @@ pub(super) fn responses_live_stream(
                         let input = custom_input(&arguments);
                         let (done_event, done_payload) = if tool.custom {
                             if !input.is_empty() {
-                                if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.custom_tool_call_input.delta", json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"delta":input})).await {
-                                    yield Ok(Event::default().event("response.custom_tool_call_input.delta").data(data.to_string()));
-                                }
+                                emit_event!("response.custom_tool_call_input.delta", json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"delta":input}));
                             }
                             (
                                 "response.custom_tool_call_input.done",
@@ -626,15 +620,11 @@ pub(super) fn responses_live_stream(
                                 json!({"item_id":tool.item_id,"call_id":tool.call_id,"output_index":tool.output_index,"arguments":arguments}),
                             )
                         };
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, done_event, done_payload).await {
-                            yield Ok(Event::default().event(done_event).data(data.to_string()));
-                        }
+                        emit_event!(done_event, done_payload);
                     }
                     if !tool.done_emitted {
                         if let Some(item) = payload["output"].as_array().and_then(|items| items.iter().find(|item| item["id"] == tool.item_id)) {
-                        if let Ok(data) = attach_sequence(&state, &id, store, &mut sequence, "response.output_item.done", json!({"output_index":tool.output_index,"item":item})).await {
-                            yield Ok(Event::default().event("response.output_item.done").data(data.to_string()));
-                        }
+                            emit_event!("response.output_item.done", json!({"output_index":tool.output_index,"item":item}));
                         }
                     }
                 }
@@ -663,9 +653,24 @@ pub(super) fn responses_live_stream(
             json!({"response":payload.clone()}),
         )
         .await;
-        if let Ok(data) = terminal_result {
-            set_snapshot_status(&snapshot, status, payload.clone());
-            yield Ok(Event::default().event(terminal).data(data.to_string()));
+        match terminal_result {
+            Ok(data) => {
+                set_snapshot_status(&snapshot, status, payload.clone());
+                yield Ok(Event::default().event(terminal).data(data.to_string()));
+            }
+            Err(error) => {
+                let incomplete = storage_failure_payload(
+                    &state,
+                    record.as_ref(),
+                    store,
+                    &snapshot,
+                    &id,
+                    &model,
+                    sequence,
+                    &error,
+                );
+                yield Ok(Event::default().event("response.incomplete").data(incomplete.to_string()));
+            }
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())

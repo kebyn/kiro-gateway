@@ -106,7 +106,7 @@ pub async fn create(
                 if let Some(record) = record {
                     let failed = response_failed_payload(&id, &model, &error.to_string());
                     let initial = response_in_progress_payload(&id, &model);
-                    let _ = state
+                    if let Err(storage_error) = state
                         .responses
                         .transition(
                             record,
@@ -123,7 +123,15 @@ pub async fn create(
                                 ("response.failed".into(), json!({"response":failed})),
                             ],
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::error!(
+                            response_id = %id,
+                            error = %storage_error,
+                            original_error = %error,
+                            "failed to persist Responses upstream setup failure"
+                        );
+                    }
                 }
                 return Err(error);
             }
@@ -137,7 +145,7 @@ pub async fn create(
             if let Some(record) = record {
                 let failed = response_failed_payload(&id, &model, &error.to_string());
                 let initial = response_in_progress_payload(&id, &model);
-                let _ = state
+                if let Err(storage_error) = state
                     .responses
                     .transition(
                         record,
@@ -154,7 +162,15 @@ pub async fn create(
                             ("response.failed".into(), json!({"response":failed})),
                         ],
                     )
-                    .await;
+                    .await
+                {
+                    tracing::error!(
+                        response_id = %id,
+                        error = %storage_error,
+                        original_error = %error,
+                        "failed to persist Responses completion failure"
+                    );
+                }
             }
             return Err(error);
         }

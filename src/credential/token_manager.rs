@@ -85,12 +85,17 @@ impl TokenManager {
     }
 
     pub async fn validate_model(&self, model: &str) -> Result<(), AppError> {
-        let models = self.available_models().await.map_err(|_error| {
+        let models = self.available_models().await.map_err(|error| {
             tracing::warn!(
-                error_class = "model_discovery",
+                error_class = match &error {
+                    AppError::Credential(_) => "credential",
+                    AppError::Upstream(_) => "upstream",
+                    _ => "model_discovery",
+                },
+                error = %error,
                 "model discovery failed while validating request"
             );
-            AppError::BadRequest("no models are currently available".into())
+            error
         })?;
         if models.iter().any(|candidate| candidate.model_id == model) {
             Ok(())
@@ -104,12 +109,17 @@ impl TokenManager {
             Some("@first") => self
                 .available_models()
                 .await
-                .map_err(|_error| {
+                .map_err(|error| {
                     tracing::warn!(
-                        error_class = "model_discovery",
+                        error_class = match &error {
+                            AppError::Credential(_) => "credential",
+                            AppError::Upstream(_) => "upstream",
+                            _ => "model_discovery",
+                        },
+                        error = %error,
                         "model discovery failed while resolving a model alias"
                     );
-                    AppError::BadRequest("no models are currently available".into())
+                    error
                 })?
                 .first()
                 .map(|model| model.model_id.clone())
