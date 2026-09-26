@@ -16,7 +16,10 @@ build "$TMP2/target"
 sha256sum "$TMP1/target/release/kiro-gateway" "$TMP2/target/release/kiro-gateway"
 test "$(sha256sum "$TMP1/target/release/kiro-gateway" | awk '{print $1}')" = "$(sha256sum "$TMP2/target/release/kiro-gateway" | awk '{print $1}')"
 for BUILD_PATH in "$ROOT" "$TMP1" "$TMP2"; do
-  if strings "$TMP1/target/release/kiro-gateway" | grep -F "$BUILD_PATH" >/dev/null; then
+  # These are directory roots. Match the path separator as well so a root
+  # such as `/data` does not falsely match an unrelated value like
+  # `/somewhere/data.sqlite3` or the suffix of a normal filename.
+  if strings "$TMP1/target/release/kiro-gateway" | grep -F "${BUILD_PATH}/" >/dev/null; then
     echo "absolute build path found in binary: $BUILD_PATH" >&2
     exit 1
   fi
