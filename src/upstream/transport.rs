@@ -14,6 +14,33 @@ pub(crate) enum SendError {
     Application(AppError),
 }
 
+pub(crate) enum BodyReadError {
+    TooLarge,
+    Transport(String),
+}
+
+/// Reads a successful upstream body without relying on `Content-Length`.
+/// Chunked responses and HTTP/2 data frames are bounded by the same limit as
+/// responses that advertise a length up front.
+pub(crate) async fn read_body_limited(
+    response: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, BodyReadError> {
+    if response.content_length().is_some_and(|length| length > max_body_bytes as u64) {
+        return Err(BodyReadError::TooLarge);
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| BodyReadError::Transport(error.to_string()))?;
+        if body.len().saturating_add(chunk.len()) > max_body_bytes {
+            return Err(BodyReadError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 impl SendError {
     pub(crate) fn into_app_error(self) -> AppError {
         match self {

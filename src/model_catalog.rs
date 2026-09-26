@@ -1,6 +1,7 @@
 use crate::{
     auth::{AuthMethod, Credential},
     error::AppError,
+    upstream::transport::{BodyReadError, read_body_limited},
 };
 use parking_lot::RwLock;
 use reqwest::Client;
@@ -153,22 +154,17 @@ impl ModelCatalog {
             })?;
             let status = response.status();
             if status.is_success() {
-                if response
-                    .content_length()
-                    .is_some_and(|length| length > self.max_body_bytes as u64)
-                {
-                    return Err(AppError::Upstream(
-                        "model discovery response exceeds configured body limit".into(),
-                    ));
-                }
-                let body = response.bytes().await.map_err(|error| {
-                    AppError::Upstream(format!("model discovery response failed: {error}"))
-                })?;
-                if body.len() > self.max_body_bytes {
-                    return Err(AppError::Upstream(
-                        "model discovery response exceeds configured body limit".into(),
-                    ));
-                }
+                let body =
+                    read_body_limited(response, self.max_body_bytes).await.map_err(|error| {
+                        match error {
+                            BodyReadError::TooLarge => AppError::Upstream(
+                                "model discovery response exceeds configured body limit".into(),
+                            ),
+                            BodyReadError::Transport(error) => AppError::Upstream(format!(
+                                "model discovery response failed: {error}"
+                            )),
+                        }
+                    })?;
                 let parsed = serde_json::from_slice::<ListAvailableModelsResponse>(&body).map_err(
                     |error| {
                         AppError::Upstream(format!("invalid model discovery response: {error}"))
@@ -214,10 +210,20 @@ impl ModelCatalog {
 
     #[cfg(test)]
     fn with_base_url(client: Client, ttl: Duration, base_url: String) -> Self {
+        Self::with_base_url_and_limit(client, ttl, base_url, 16 * 1024 * 1024)
+    }
+
+    #[cfg(test)]
+    fn with_base_url_and_limit(
+        client: Client,
+        ttl: Duration,
+        base_url: String,
+        max_body_bytes: usize,
+    ) -> Self {
         Self {
             client,
             ttl,
-            max_body_bytes: 16 * 1024 * 1024,
+            max_body_bytes,
             base_url: Some(base_url),
             cache: Arc::new(RwLock::new(None)),
             refresh_lock: Arc::new(Mutex::new(())),
@@ -456,6 +462,98 @@ mod tests {
 
         assert!(catalog.get(&credential).await.unwrap().is_empty());
         assert!(catalog.get(&credential).await.unwrap().is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_chunked_model_response_over_limit() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.write_all(b"8\r\n12345678\r\n8\r\nabcdefgh\r\n0\r\n\r\n").await.unwrap();
+        });
+        let catalog = ModelCatalog::with_base_url_and_limit(
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+            format!("http://{address}"),
+            12,
+        );
+        let credential = Credential {
+            auth_method: AuthMethod::Oidc,
+            access_token: Some(SecretString::new("token")),
+            ..Default::default()
+        };
+        let error = catalog.get(&credential).await.unwrap_err();
+        assert!(error.to_string().contains("exceeds configured body limit"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_model_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let catalog = ModelCatalog::with_base_url(
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+            format!("http://{address}"),
+        );
+        let credential = Credential {
+            auth_method: AuthMethod::Oidc,
+            access_token: Some(SecretString::new("token")),
+            ..Default::default()
+        };
+        let error = catalog.get(&credential).await.unwrap_err();
+        assert!(error.to_string().contains("invalid model discovery response"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_model_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 32\r\nconnection: close\r\n\r\n{\"models\":",
+                )
+                .await
+                .unwrap();
+        });
+        let catalog = ModelCatalog::with_base_url(
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+            format!("http://{address}"),
+        );
+        let credential = Credential {
+            auth_method: AuthMethod::Oidc,
+            access_token: Some(SecretString::new("token")),
+            ..Default::default()
+        };
+        let error = catalog.get(&credential).await.unwrap_err();
+        assert!(error.to_string().contains("model discovery response failed"));
         server.await.unwrap();
     }
 

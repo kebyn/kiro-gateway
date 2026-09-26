@@ -8,7 +8,7 @@ use crate::{
         event_stream::{EventStreamDecoder, decode_generation_events},
         integrity::{RetryDecision, StreamIntegrity},
         json::decode_events,
-        transport::{SendError, send_once},
+        transport::{BodyReadError, SendError, read_body_limited, send_once},
     },
 };
 use async_stream::stream;
@@ -107,16 +107,9 @@ impl UpstreamClient {
                     .and_then(|value| value.to_str().ok())
                     .is_some_and(|value| value.contains("json"));
                 if is_json {
-                    if response
-                        .content_length()
-                        .is_some_and(|length| length > max_body_bytes as u64)
-                    {
-                        yield Err(AppError::Upstream("upstream response exceeds configured body limit".into()));
-                        return;
-                    }
-                    let body = match response.bytes().await {
+                    let body = match read_body_limited(response, max_body_bytes).await {
                         Ok(body) => body,
-                        Err(error) if attempt == 0 => {
+                        Err(BodyReadError::Transport(error)) if attempt == 0 => {
                             tracing::debug!(
                                 model = %request.model,
                                 attempt,
@@ -126,15 +119,15 @@ impl UpstreamClient {
                             );
                             continue;
                         }
-                        Err(error) => {
-                            yield Err(AppError::Upstream(error.to_string()));
+                        Err(BodyReadError::TooLarge) => {
+                            yield Err(AppError::Upstream("upstream response exceeds configured body limit".into()));
+                            return;
+                        }
+                        Err(BodyReadError::Transport(error)) => {
+                            yield Err(AppError::Upstream(error));
                             return;
                         }
                     };
-                    if body.len() > max_body_bytes {
-                        yield Err(AppError::Upstream("upstream response exceeds configured body limit".into()));
-                        return;
-                    }
                     match decode_events(&body) {
                         Ok(events) => {
                             tracing::debug!(

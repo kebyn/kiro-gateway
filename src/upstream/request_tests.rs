@@ -155,6 +155,142 @@ async fn limits_non_success_error_body_preview() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn limits_chunked_success_json_without_content_length() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        socket.write_all(b"8\r\n12345678\r\n8\r\nabcdefgh\r\n0\r\n\r\n").await.unwrap();
+    });
+    let client = UpstreamClient::with_policy_and_limit(
+        reqwest::Client::new(),
+        EndpointPolicy::Cli,
+        Some(format!("http://{address}")),
+        12,
+    );
+    let credential = Credential {
+        auth_method: AuthMethod::ApiKey,
+        access_token: Some(SecretString::new("token")),
+        endpoint: "cli".into(),
+        ..Default::default()
+    };
+    let request = GenerationRequest {
+        model: "kiro".into(),
+        messages: vec![crate::generation::Message::text(crate::generation::Role::User, "hello")],
+        system: None,
+        tools: Vec::new(),
+        stream: true,
+        max_tokens: None,
+        temperature: None,
+        conversation_id: None,
+        instructions: None,
+        opaque_history: Vec::new(),
+    };
+    let mut events = client.event_stream(&request, &credential).await.unwrap();
+    let error = events.next().await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("exceeds configured body limit"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn rejects_empty_success_json_response() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let client = UpstreamClient::with_policy(
+        reqwest::Client::new(),
+        EndpointPolicy::Cli,
+        Some(format!("http://{address}")),
+    );
+    let credential = Credential {
+        auth_method: AuthMethod::ApiKey,
+        access_token: Some(SecretString::new("token")),
+        endpoint: "cli".into(),
+        ..Default::default()
+    };
+    let request = GenerationRequest {
+        model: "kiro".into(),
+        messages: vec![crate::generation::Message::text(crate::generation::Role::User, "hello")],
+        system: None,
+        tools: Vec::new(),
+        stream: true,
+        max_tokens: None,
+        temperature: None,
+        conversation_id: None,
+        instructions: None,
+        opaque_history: Vec::new(),
+    };
+    let mut events = client.event_stream(&request, &credential).await.unwrap();
+    let error = events.next().await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("empty") || error.to_string().contains("JSON"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn retries_then_reports_interrupted_success_json_body() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 32\r\nconnection: close\r\n\r\n{\"models\":",
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let client = UpstreamClient::with_policy(
+        reqwest::Client::new(),
+        EndpointPolicy::Cli,
+        Some(format!("http://{address}")),
+    );
+    let credential = Credential {
+        auth_method: AuthMethod::ApiKey,
+        access_token: Some(SecretString::new("token")),
+        endpoint: "cli".into(),
+        ..Default::default()
+    };
+    let request = GenerationRequest {
+        model: "kiro".into(),
+        messages: vec![crate::generation::Message::text(crate::generation::Role::User, "hello")],
+        system: None,
+        tools: Vec::new(),
+        stream: true,
+        max_tokens: None,
+        temperature: None,
+        conversation_id: None,
+        instructions: None,
+        opaque_history: Vec::new(),
+    };
+    let mut events = client.event_stream(&request, &credential).await.unwrap();
+    let error = events.next().await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("incomplete") || error.to_string().contains("body"));
+    server.await.unwrap();
+}
+
 #[test]
 fn incomplete_terminal_reason_is_not_reported_as_completed() {
     let response = finish_result(
