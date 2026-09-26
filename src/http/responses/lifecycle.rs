@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use crate::{
-    generation::{Message, ToolDefinition},
+    generation::{Message, OpaqueHistory, ToolDefinition},
     response_store::{ResponseStatus, ResponseStore},
 };
 
@@ -12,6 +12,7 @@ use crate::{
 pub(super) struct ResponseSnapshot {
     pub(super) messages: Vec<Message>,
     pub(super) tools: Vec<ToolDefinition>,
+    pub(super) opaque_history: Vec<OpaqueHistory>,
     pub(super) response: Value,
     pub(super) status: ResponseStatus,
 }
@@ -22,13 +23,19 @@ pub(super) struct IncompleteRecordGuard {
     pub(super) snapshot: Arc<Mutex<ResponseSnapshot>>,
 }
 
+pub(super) fn set_snapshot_status(
+    snapshot: &Arc<Mutex<ResponseSnapshot>>,
+    status: ResponseStatus,
+    response: Value,
+) {
+    let mut snapshot = snapshot.lock();
+    snapshot.status = status;
+    snapshot.response = response;
+}
+
 impl Drop for IncompleteRecordGuard {
     fn drop(&mut self) {
         let Some(store) = self.store.as_ref() else { return };
-        let Ok(Some(record)) = store.get(&self.record_id) else { return };
-        if record.status != ResponseStatus::InProgress {
-            return;
-        }
         let snapshot = self.snapshot.lock().clone();
         if snapshot.status != ResponseStatus::InProgress {
             return;
@@ -37,11 +44,16 @@ impl Drop for IncompleteRecordGuard {
         payload["status"] = json!("incomplete");
         payload["error"] = json!({"code":"client_disconnected","message":"client disconnected before response completion"});
         payload["incomplete_details"] = json!({"reason":"client_disconnect"});
-        let _ = store.update(
-            record,
-            ResponseStatus::Incomplete,
-            json!({"messages":snapshot.messages,"tools":snapshot.tools,"response":payload}),
+        let event_payload = json!({"response":payload.clone()});
+        let _ = store.mark_incomplete_on_disconnect(
+            self.record_id.clone(),
+            json!({
+                "messages":snapshot.messages,
+                "tools":snapshot.tools,
+                "opaque_history":snapshot.opaque_history,
+                "response":payload
+            }),
+            event_payload,
         );
-        let _ = store.append_event(&self.record_id, "response.incomplete", &payload);
     }
 }

@@ -103,23 +103,32 @@ pub async fn response(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    state.responses.get(&id)?.map(|record| Json(record).into_response()).ok_or(AppError::NotFound)
+    state
+        .responses
+        .get(&id)
+        .await?
+        .map(|record| Json(record).into_response())
+        .ok_or(AppError::NotFound)
 }
 pub async fn delete_response(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    if state.responses.delete(&id)? { Ok(StatusCode::NO_CONTENT) } else { Err(AppError::NotFound) }
+    if state.responses.delete(&id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
 }
 
 pub async fn response_events(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    if state.responses.get(&id)?.is_none() {
+    if state.responses.get(&id).await?.is_none() {
         return Err(AppError::NotFound);
     }
-    Ok(Json(state.responses.events(&id)?))
+    Ok(Json(state.responses.events(&id).await?))
 }
 
 fn login_rate_limit_key(headers: &HeaderMap, trust_forwarded_headers: bool) -> String {

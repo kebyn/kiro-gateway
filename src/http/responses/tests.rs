@@ -141,7 +141,7 @@ async fn live_stream_emits_incremental_events_and_store_false_leaves_no_record()
         .and_then(|line| serde_json::from_str::<Value>(line.trim_start_matches("data: ")).ok())
         .and_then(|value| value["response"]["id"].as_str().map(ToOwned::to_owned))
         .unwrap();
-    assert!(state.responses.get(&id).unwrap().is_none());
+    assert!(state.responses.get(&id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -222,16 +222,16 @@ async fn stored_live_stream_persists_ordered_events_and_final_response() {
         .and_then(|line| serde_json::from_str::<Value>(line.trim_start_matches("data: ")).ok())
         .and_then(|value| value["response"]["id"].as_str().map(ToOwned::to_owned))
         .unwrap();
-    let events = state.responses.events(&id).unwrap();
+    let events = state.responses.events(&id).await.unwrap();
     assert!(events.len() >= 5);
     assert_eq!(events.first().unwrap().event_type, "response.created");
     assert!(events.iter().any(|event| event.event_type == "response.output_text.delta"));
     assert!(events.last().unwrap().event_type == "response.completed");
     assert!(events.windows(2).all(|pair| pair[0].sequence_number < pair[1].sequence_number));
-    let stored = state.responses.get(&id).unwrap().unwrap();
+    let stored = state.responses.get(&id).await.unwrap().unwrap();
     assert_eq!(stored.status, ResponseStatus::Completed);
-    assert!(state.responses.delete(&id).unwrap());
-    assert!(state.responses.events(&id).unwrap().is_empty());
+    assert!(state.responses.delete(&id).await.unwrap());
+    assert!(state.responses.events(&id).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -400,6 +400,7 @@ async fn dropping_a_live_stream_marks_an_in_progress_record_incomplete() {
             json!({"messages":[],"tools":[],"response":{}}),
             ResponseStatus::InProgress,
         )
+        .await
         .unwrap();
     let internal = crate::generation::GenerationRequest {
         model: "kiro".into(),
@@ -426,13 +427,14 @@ async fn dropping_a_live_stream_marks_an_in_progress_record_incomplete() {
     .into_response();
     drop(response);
     assert_eq!(
-        state.responses.get("resp_disconnect").unwrap().unwrap().status,
+        state.responses.get("resp_disconnect").await.unwrap().unwrap().status,
         ResponseStatus::Incomplete
     );
     assert!(
         state
             .responses
             .events("resp_disconnect")
+            .await
             .unwrap()
             .iter()
             .any(|event| event.event_type == "response.incomplete")
@@ -581,15 +583,17 @@ fn empty_response_has_a_message_output_item() {
     assert_eq!(payload["output"][0]["content"][0]["text"], "");
 }
 
-#[test]
-fn stored_response_replays_tool_call_for_previous_response_id() {
+#[tokio::test]
+async fn stored_response_replays_tool_call_for_previous_response_id() {
     let input = vec![Message::text(crate::generation::Role::User, "question")];
     let messages = response_messages(&input, &response(""));
     let directory = tempfile::tempdir().unwrap();
     let store = ResponseStore::open(directory.path().join("responses.sqlite3")).unwrap();
-    let record =
-        store.create("kiro", json!({"messages":messages}), ResponseStatus::Completed).unwrap();
-    let replayed = ResponseStore::extract_messages(&store.get(&record.id).unwrap().unwrap());
+    let record = store
+        .create("kiro", json!({"messages":messages}), ResponseStatus::Completed)
+        .await
+        .unwrap();
+    let replayed = ResponseStore::extract_messages(&store.get(&record.id).await.unwrap().unwrap());
     let continuation: ResponsesRequest = serde_json::from_value(json!({
         "model":"kiro",
         "input":[{
@@ -608,8 +612,8 @@ fn stored_response_replays_tool_call_for_previous_response_id() {
     assert_eq!(internal.messages[2].tool_results[0].content, "found");
 }
 
-#[test]
-fn stored_response_replays_tool_definitions_for_continuation() {
+#[tokio::test]
+async fn stored_response_replays_tool_definitions_for_continuation() {
     use crate::generation::ToolDefinition;
     let input = vec![Message::text(crate::generation::Role::User, "question")];
     let messages = response_messages(&input, &response(""));
@@ -624,8 +628,9 @@ fn stored_response_replays_tool_definitions_for_continuation() {
                 }),
                 ResponseStatus::Completed,
             )
+            .await
             .unwrap();
-    let recovered = ResponseStore::extract_tools(&store.get(&record.id).unwrap().unwrap());
+    let recovered = ResponseStore::extract_tools(&store.get(&record.id).await.unwrap().unwrap());
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].name, "lookup");
 }

@@ -1,7 +1,7 @@
 use crate::{AppState, error::AppError};
 use serde_json::{Value, json};
 
-pub(super) fn attach_sequence(
+pub(super) async fn attach_sequence(
     state: &AppState,
     response_id: &str,
     store: bool,
@@ -11,7 +11,7 @@ pub(super) fn attach_sequence(
 ) -> Result<Value, AppError> {
     payload["type"] = Value::String(event_type.to_owned());
     let assigned = if store {
-        state.responses.append_event(response_id, event_type, &payload)?.sequence_number
+        state.responses.append_event(response_id, event_type, &payload).await?.sequence_number
     } else {
         *sequence
     };
