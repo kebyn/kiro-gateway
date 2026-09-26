@@ -1,30 +1,54 @@
 {
-  "host": "127.0.0.1",
-  "port": 8990,
-  "client_api_key": "sk-client-change-me",
-  "admin_api_key": "sk-admin-change-me",
+  "version": 2,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8990,
+    "max_request_body_bytes": 8388608,
+    "graceful_shutdown_timeout_secs": 30
+  },
+  "access": {
+    "client_api_key": "sk-client-change-me"
+  },
   "admin": {
     "enabled": false,
+    "api_key": "sk-admin-change-me",
     "session_ttl_secs": 28800,
     "cookie_secure": false,
     "allowed_origins": [],
-    "login_rate_limit_per_minute": 10
+    "login_rate_limit_per_minute": 10,
+    "trust_forwarded_headers": false
   },
-  "credential_source": "auto",
-  "credential_path": "~/.local/share/kiro-cli/data.sqlite3",
-  "credential_json_path": "~/.aws/sso/cache/kiro.json",
-  "endpoint": "auto",
-  "api_region": "us-east-1",
-  "upstream_timeout_secs": 60,
-  "refresh_early_secs": 120,
-  "refresh_interval_secs": 30,
-  "model_cache_ttl_secs": 300,
-  "model_aliases": {},
-  "response_store_path": "kiro-gateway.sqlite3",
-  "upstream_url": null,
-  "proxy_url": null,
-  "token_endpoint": null,
-  "max_request_body_bytes": 8388608,
-  "max_upstream_body_bytes": 16777216,
-  "graceful_shutdown_timeout_secs": 30
+  "credential": {
+    "source": "auto",
+    "path": "~/.local/share/kiro-cli/data.sqlite3",
+    "json_path": "~/.aws/sso/cache/kiro.json",
+    "access_token": null,
+    "refresh_token": null,
+    "api_key": null,
+    "client_id": null,
+    "client_secret": null,
+    "machine_id": null
+  },
+  "upstream": {
+    "endpoint": "auto",
+    "api_region": "us-east-1",
+    "url": null,
+    "proxy_url": null,
+    "token_endpoint": null,
+    "timeout_secs": 60,
+    "max_body_bytes": 16777216,
+    "refresh_early_secs": 120,
+    "refresh_interval_secs": 30,
+    "mcp_region": null
+  },
+  "models": {
+    "cache_ttl_secs": 300,
+    "aliases": {}
+  },
+  "storage": {
+    "response_store_path": "kiro-gateway.sqlite3"
+  },
+  "logging": {
+    "format": "text"
+  }
 }

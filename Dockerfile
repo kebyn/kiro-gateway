@@ -13,5 +13,5 @@ USER kiro
 WORKDIR /home/kiro
 EXPOSE 8990
 ENV RUST_LOG=info
-ENV KIRO_HOST=0.0.0.0
+ENV KIRO__SERVER__HOST=0.0.0.0
 ENTRYPOINT ["/usr/local/bin/kiro-gateway"]

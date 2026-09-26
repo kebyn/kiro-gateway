@@ -20,15 +20,15 @@
 
 ### 使用环境变量凭据
 
-此示例使用运行时默认配置，Admin 默认关闭；只有将 `admin.enabled` 设为 `true` 时才需要 `KIRO_ADMIN_API_KEY`。
+此示例使用 v2 配置和运行时默认值，Admin 默认关闭；只有将 `admin.enabled` 设为 `true` 时才需要 `KIRO__ADMIN__API_KEY`。
 
 ```sh
 cp config.example.json config.json
 chmod 600 config.json
 
-export KIRO_CLIENT_API_KEY='client-key-change-me'
-export KIRO_CREDENTIAL_SOURCE='env'
-export KIRO_ACCESS_TOKEN='access-token-from-your-provider'
+export KIRO__ACCESS__CLIENT_API_KEY='client-key-change-me'
+export KIRO__CREDENTIAL__SOURCE='env'
+export KIRO__CREDENTIAL__ACCESS_TOKEN='access-token-from-your-provider'
 
 cargo run --locked -- --config config.json
 ```
@@ -56,12 +56,12 @@ cargo build --release --locked
 
 ```sh
 cargo run --locked -- --generate-config config.json
-export KIRO_ACCESS_TOKEN='access-token-from-your-provider'
+export KIRO__CREDENTIAL__ACCESS_TOKEN='access-token-from-your-provider'
 cargo run --locked -- --config config.json
 ```
 
-生成的文件只会填入网关的 `client_api_key` 和 `admin_api_key`，不会也无法替你生成上游 Kiro 凭据。启动前至少设置
-`KIRO_ACCESS_TOKEN`、`KIRO_REFRESH_TOKEN` 或 `KIRO_API_KEY` 其中一种（也可以把配置改为 JSON/SQLite 凭据来源）。生成文件含有敏感密钥，程序会以 `0600` 权限独占创建；目标文件已存在时不会覆盖。省略路径时配置会完整写到 stdout，使用重定向保存时请由调用者自行保护文件权限：
+生成的 v2 文件只会填入网关的 `access.client_api_key` 和 `admin.api_key`，不会也无法替你生成上游 Kiro 凭据。启动前至少设置
+`KIRO__CREDENTIAL__ACCESS_TOKEN`、`KIRO__CREDENTIAL__REFRESH_TOKEN` 或 `KIRO__CREDENTIAL__API_KEY` 其中一种（也可以把配置改为 JSON/SQLite 凭据来源）。生成文件含有敏感密钥，程序会以 `0600` 权限独占创建；目标文件已存在时不会覆盖。省略路径时配置会完整写到 stdout，使用重定向保存时请由调用者自行保护文件权限：
 
 ```sh
 cargo run --locked -- --generate-config > config.json
@@ -75,26 +75,26 @@ chmod 600 config.json
 ```sh
 docker build -t kiro-gateway .
 docker run --rm -p 8990:8990 \
-  -e KIRO_CLIENT_API_KEY='client-key-change-me' \
-  -e KIRO_ADMIN_API_KEY='admin-key-change-me' \
-  -e KIRO_ADMIN_ENABLED='true' \
-  -e KIRO_CREDENTIAL_SOURCE='env' \
-  -e KIRO_ACCESS_TOKEN='access-token-from-your-provider' \
+  -e KIRO__ACCESS__CLIENT_API_KEY='client-key-change-me' \
+  -e KIRO__ADMIN__API_KEY='admin-key-change-me' \
+  -e KIRO__ADMIN__ENABLED='true' \
+  -e KIRO__CREDENTIAL__SOURCE='env' \
+  -e KIRO__CREDENTIAL__ACCESS_TOKEN='access-token-from-your-provider' \
   kiro-gateway
 ```
 
-镜像以 UID `10001` 的非 root 用户运行，并设置 `KIRO_HOST=0.0.0.0`。如使用 JSON/SQLite 凭据或需要保留 Responses 数据库，请挂载对应文件或目录，并确保该用户具有所需的读写权限。
+镜像以 UID `10001` 的非 root 用户运行，并设置 `KIRO__SERVER__HOST=0.0.0.0`。如使用 JSON/SQLite 凭据或需要保留 Responses 数据库，请挂载对应文件或目录，并确保该用户具有所需的读写权限。
 
 CI 会将镜像发布到 GitHub Container Registry：
 
 ```sh
 docker pull ghcr.io/kebyn/kiro-gateway:latest
 docker run --rm -p 8990:8990 \
-  -e KIRO_CLIENT_API_KEY='client-key-change-me' \
-  -e KIRO_ADMIN_API_KEY='admin-key-change-me' \
-  -e KIRO_ADMIN_ENABLED='true' \
-  -e KIRO_CREDENTIAL_SOURCE='env' \
-  -e KIRO_ACCESS_TOKEN='access-token-from-your-provider' \
+  -e KIRO__ACCESS__CLIENT_API_KEY='client-key-change-me' \
+  -e KIRO__ADMIN__API_KEY='admin-key-change-me' \
+  -e KIRO__ADMIN__ENABLED='true' \
+  -e KIRO__CREDENTIAL__SOURCE='env' \
+  -e KIRO__CREDENTIAL__ACCESS_TOKEN='access-token-from-your-provider' \
   ghcr.io/kebyn/kiro-gateway:latest
 ```
 
@@ -117,12 +117,12 @@ mkdir -p data
 ```
 
 编辑 `.env`，替换客户端密钥、Admin 密钥和上游凭据占位符。`.env.example` 默认设置
-`KIRO_CREDENTIAL_SOURCE=env`；`KIRO_API_KEY` 不能与 `KIRO_ACCESS_TOKEN` 或
-`KIRO_REFRESH_TOKEN` 同时填写，后两者可按上游要求一起配置。镜像以 UID `10001` 的
+`KIRO__CREDENTIAL__SOURCE=env`；`KIRO__CREDENTIAL__API_KEY` 不能与 `KIRO__CREDENTIAL__ACCESS_TOKEN` 或
+`KIRO__CREDENTIAL__REFRESH_TOKEN` 同时填写，后两者可按上游要求一起配置。镜像以 UID `10001` 的
 非 root 用户运行，启动前请确保该 UID 能读取 `config.json` 并写入 `data/`。
 
 `config.example.json` 默认关闭 Admin；如需在 Compose 中启用 Admin，请在 `.env` 中同时设置
-`KIRO_ADMIN_ENABLED=true` 和 `KIRO_ADMIN_API_KEY`，或直接把 `config.json` 的
+`KIRO__ADMIN__ENABLED=true` 和 `KIRO__ADMIN__API_KEY`，或直接把 `config.json` 的
 `admin.enabled` 改为 `true`。
 
 例如在 Linux 上可以使用：
@@ -150,7 +150,7 @@ docker compose down
 
 由于服务只监听宿主机回环地址，需要对外提供访问时，应在同一宿主机上终止 TLS 的
 反向代理，并将请求转发到 `http://127.0.0.1:8990`。不要在 Compose 中添加 `ports`
-映射或把 `KIRO_HOST` 改为 `0.0.0.0`，除非确实要改变这个本机访问边界。
+映射或把 `KIRO__SERVER__HOST` 改为 `0.0.0.0`，除非确实要改变这个本机访问边界。
 
 默认凭据来自 `.env`。如果使用 JSON 或 Kiro CLI SQLite 凭据，需要在 `compose.yaml`
 的 `volumes` 中额外挂载文件，并把 `config.json` 中的来源和容器内路径改为对应值，
@@ -162,11 +162,17 @@ volumes:
   - ${HOME}/.local/share/kiro-cli/data.sqlite3:/var/lib/kiro-gateway/kiro-cli.sqlite3:ro
 ```
 
-JSON 凭据使用 `credential_source: "json"` 和 `/etc/kiro-gateway/kiro.json`，SQLite
-凭据使用 `credential_source: "sqlite"` 和 `/var/lib/kiro-gateway/kiro-cli.sqlite3`。
+JSON 凭据使用 `credential.source: "json"` 和 `/etc/kiro-gateway/kiro.json`，SQLite
+凭据使用 `credential.source: "sqlite"` 和 `/var/lib/kiro-gateway/kiro-cli.sqlite3`。
 只读挂载适合读取现有凭据；如果需要把刷新后的 JSON 原子写回文件，应改用受控的可写
 挂载，并确保 UID `10001` 具有文件权限。`data/` 中的 Responses SQLite 会保存请求、
 输出和工具数据明文，请限制目录权限并按保留策略备份或删除。
+
+Responses 存储使用独立的 v2 schema（`schema_meta.version=2`），将请求、最新响应快照和
+生命周期事件分开保存；`(response_id, sequence_number)` 具有唯一约束，删除 Response
+会级联删除事件。数据库写入由单连接 actor 串行执行，快照和同一状态转换的事件在一个事务中
+提交。启动时发现没有 v2 标记的旧数据库会直接拒绝，并提示改用新的存储路径；网关不会迁移、
+覆盖或修改旧库。请在切换前自行备份旧文件，并通过 `storage.response_store_path` 指定新路径。
 
 ## 接口与鉴权
 
@@ -258,9 +264,9 @@ Claude Code 只接受它自身已知的模型别名（例如 `sonnet`），而 K
 目录：
 
 ```sh
-export KIRO_MODEL_ALIASES='claude-sonnet-5=gpt-5.6-sol'
+export KIRO__MODELS__ALIASES='claude-sonnet-5=gpt-5.6-sol'
 # 或使用动态目录中的第一个模型（适合本机冒烟测试）
-export KIRO_MODEL_ALIASES='claude-sonnet-5=@first'
+export KIRO__MODELS__ALIASES='claude-sonnet-5=@first'
 claude --model sonnet
 ```
 
@@ -281,16 +287,16 @@ export KIRO_ALLOW_LIVE_TESTS=1
 使用环境变量凭据：
 
 ```sh
-export KIRO_CREDENTIAL_SOURCE=env
-export KIRO_ACCESS_TOKEN='access-token-from-your-provider'
+export KIRO__CREDENTIAL__SOURCE=env
+export KIRO__CREDENTIAL__ACCESS_TOKEN='access-token-from-your-provider'
 ./scripts/test-local-clients.sh
 ```
 
 也可以只读本机 Kiro CLI SQLite 凭据：
 
 ```sh
-export KIRO_CREDENTIAL_SOURCE=sqlite
-export KIRO_CREDENTIAL_PATH="$HOME/.local/share/kiro-cli/data.sqlite3"
+export KIRO__CREDENTIAL__SOURCE=sqlite
+export KIRO__CREDENTIAL__PATH="$HOME/.local/share/kiro-cli/data.sqlite3"
 ./scripts/test-local-clients.sh
 ```
 
@@ -326,106 +332,96 @@ Responses 适配层展开；Kiro CLI 上游不接受工具名中的点号，因�
 
 ## 配置
 
-配置文件为 JSON。只接受下表列出的 snake_case 字段；未知字段和历史别名会直接拒绝启动。
+配置文件为 JSON，顶层必须包含 `version: 2`。字段按 `server`、`access`、`admin`、
+`credential`、`upstream`、`models`、`storage`、`logging` 分组；只接受下表列出的
+snake_case 字段，未知字段、旧平铺字段和其他版本会直接拒绝启动。省略非必填字段时使用默认值，
+显式写入 `0` 的限制值不会被静默替换为默认值，而会在校验阶段拒绝。
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `host` | `127.0.0.1` | 监听地址 |
-| `port` | `8990` | 监听端口，不能为 `0` |
-| `client_api_key` | 空 | `/v1/*` 客户端密钥，必填 |
-| `admin_api_key` | 空 | Admin 登录密钥；`admin.enabled=true` 时必填 |
+| `version` | — | 必须为 `2` |
+| `server.host` | `127.0.0.1` | 监听地址 |
+| `server.port` | `8990` | 监听端口，不能为 `0` |
+| `server.max_request_body_bytes` | `8388608` | 请求体上限（8 MiB），必须大于 `0` |
+| `server.graceful_shutdown_timeout_secs` | `30` | SIGTERM/CTRL-C 后等待活动流的最长时间 |
+| `access.client_api_key` | 空 | `/v1/*` 客户端密钥，必填 |
 | `admin.enabled` | `false` | 为 `false` 时不注册 `/admin` 页面及 `/admin/*`、`/api/admin/*` 路由；`--generate-config` 生成的配置会显式设为 `true` |
+| `admin.api_key` | 空 | Admin 登录密钥；`admin.enabled=true` 时必填 |
 | `admin.session_ttl_secs` | `28800` | 内存会话有效期，秒 |
 | `admin.cookie_secure` | `true` | 是否为 Admin Cookie 添加 `Secure` |
 | `admin.allowed_origins` | `[]` | 非空时检查带 `Origin` 的 Admin 请求 |
 | `admin.login_rate_limit_per_minute` | `10` | 每个登录键每分钟允许的尝试数 |
-| `credential_source` | `auto` | `auto`、`env`、`json`、`sqlite`、`api_key` 之一 |
-| `credential_path` | 空 | SQLite 凭据路径；支持 `~/` 展开 |
-| `credential_json_path` | 空 | JSON 凭据路径及刷新后的原子写回路径；支持 `~/` 展开 |
-| `endpoint` | `auto` | 上游格式；`auto` 按凭据选择，或显式指定 `ide` / `cli` |
-| `api_region` | `us-east-1` | API Key 来源使用的默认区域 |
-| `upstream_url` | 空 | 覆盖模型生成上游 URL，主要用于受控代理或测试 |
-| `proxy_url` | 空 | Token 刷新 HTTP 客户端的代理 URL |
-| `token_endpoint` | 空 | 覆盖 Token 刷新 URL，只能使用 `http`/`https` |
-| `upstream_timeout_secs` | `60` | 模型上游请求超时，必须大于 `0` |
-| `refresh_early_secs` | `120` | 到期前提前刷新的秒数 |
-| `refresh_interval_secs` | `30` | 后台检查刷新间隔，必须大于 `0` |
-| `model_cache_ttl_secs` | `300` | Kiro 模型目录缓存时间，秒，必须大于 `0` |
-| `model_aliases` | `{}` | 客户端模型别名到 Kiro 模型 ID 的映射；目标也可为 `@first` |
-| `response_store_path` | `kiro-gateway.sqlite3` | Responses 本地 SQLite 路径；支持 `~/` 展开 |
-| `max_request_body_bytes` | `8388608` | 请求体上限（8 MiB），必须大于 `0` |
-| `max_upstream_body_bytes` | `16777216` | Kiro JSON/EventStream 响应体上限（16 MiB），必须大于 `0` |
-| `graceful_shutdown_timeout_secs` | `30` | SIGTERM/CTRL-C 后等待活动流的最长时间 |
-| `mcp_region` | 空 | 保留字段，当前未参与运行时行为 |
-| `log_json` | `false` | 使用 JSON 格式输出 tracing 日志 |
-| `trust_forwarded_headers` | `false` | 为 `true` 时使用 `X-Forwarded-For` 作为 Admin 登录限流键；仅应在可信反向代理后启用 |
+| `admin.trust_forwarded_headers` | `false` | 为 `true` 时使用 `X-Forwarded-For` 作为 Admin 登录限流键；仅应在可信反向代理后启用 |
+| `credential.source` | `auto` | `auto`、`env`、`json`、`sqlite`、`api_key` 之一 |
+| `credential.path` | 空 | SQLite 凭据路径；支持 `~/` 展开 |
+| `credential.json_path` | 空 | JSON 凭据路径及刷新后的原子写回路径；支持 `~/` 展开 |
+| `credential.access_token` / `refresh_token` | 空 | 环境/配置凭据 Token；可同时填写 |
+| `credential.api_key` | 空 | 上游 API Key，不能与 Token 同时填写 |
+| `credential.client_id` / `client_secret` | 空 | OIDC 客户端元数据 |
+| `credential.machine_id` | 空 | 上游机器 ID；未设置时生成随机 UUID |
+| `upstream.endpoint` | `auto` | 上游格式；`auto` 按凭据选择，或显式指定 `ide` / `cli` |
+| `upstream.api_region` | `us-east-1` | API Key/环境凭据使用的默认区域 |
+| `upstream.url` | 空 | 覆盖模型生成上游 URL，主要用于受控代理或测试 |
+| `upstream.proxy_url` | 空 | Token 刷新 HTTP 客户端的代理 URL |
+| `upstream.token_endpoint` | 空 | 覆盖 Token 刷新 URL，只能使用 `http`/`https` |
+| `upstream.timeout_secs` | `60` | 模型上游请求超时，必须大于 `0` |
+| `upstream.max_body_bytes` | `16777216` | Kiro JSON/EventStream 响应体上限（16 MiB），必须大于 `0` |
+| `upstream.refresh_early_secs` | `120` | 到期前提前刷新的秒数，不得为负 |
+| `upstream.refresh_interval_secs` | `30` | 后台检查刷新间隔，必须大于 `0` |
+| `upstream.mcp_region` | 空 | 保留字段，当前未参与运行时行为 |
+| `models.cache_ttl_secs` | `300` | Kiro 模型目录缓存时间，秒，必须大于 `0` |
+| `models.aliases` | `{}` | 客户端模型别名到 Kiro 模型 ID 的映射；目标也可为 `@first` |
+| `storage.response_store_path` | `kiro-gateway.sqlite3` | Responses 本地 SQLite 路径；支持 `~/` 展开 |
+| `logging.format` | `text` | `text` 或 `json` |
 
 `config.example.json` 适合本机 HTTP 调试，因此将 `admin.cookie_secure` 设为 `false`。生产环境通过 HTTPS 使用时应设为 `true`。
 
 ### 环境变量
 
-下列变量会覆盖对应配置或控制进程：
+除用于选择配置文件的 `KIRO_CONFIG` 外，配置环境变量统一使用大写分组和双下划线
+（`KIRO__GROUP__FIELD`）。旧的平铺 `KIRO_*` 配置变量不会再被读取，设置后会直接拒绝启动；
+未定义的 `KIRO__...` 变量也会拒绝启动。
 
 | 环境变量 | 用途 |
 | --- | --- |
 | `KIRO_CONFIG` | 配置文件路径，等价于 `--config` |
-| `KIRO_CLIENT_API_KEY` | 覆盖 `client_api_key` |
-| `KIRO_ADMIN_API_KEY` | 覆盖 `admin_api_key` |
-| `KIRO_HOST` | 覆盖 `host` |
-| `KIRO_PORT` | 覆盖 `port` |
-| `KIRO_ENDPOINT` | 覆盖 `endpoint`；支持 `auto`、`ide`、`cli` |
-| `KIRO_API_REGION` | 覆盖 `api_region`，也用于环境变量凭据 |
-| `KIRO_CREDENTIAL_SOURCE` | 覆盖 `credential_source` |
-| `KIRO_CREDENTIAL_PATH` | 覆盖 SQLite `credential_path` |
-| `KIRO_CREDENTIAL_JSON_PATH` | 覆盖 JSON `credential_json_path` |
-| `KIRO_UPSTREAM_URL` | 覆盖模型上游 URL |
-| `KIRO_PROXY_URL` | 覆盖刷新客户端代理 URL |
-| `KIRO_TOKEN_ENDPOINT` | 覆盖 `token_endpoint`，只接受 `http`/`https` |
-| `KIRO_UPSTREAM_TIMEOUT_SECS` | 覆盖上游请求和刷新超时，必须大于 `0` |
-| `KIRO_REFRESH_EARLY_SECS` | 覆盖提前刷新秒数，不得为负 |
-| `KIRO_REFRESH_INTERVAL_SECS` | 覆盖后台刷新间隔，必须大于 `0` |
-| `KIRO_MODEL_CACHE_TTL_SECS` | 覆盖模型目录缓存 TTL，必须大于 `0` |
-| `KIRO_MODEL_ALIASES` | 覆盖模型别名，格式为逗号分隔的 `alias=target`；`@first` 表示当前目录第一个模型 |
-| `KIRO_MAX_REQUEST_BODY_BYTES` | 覆盖请求体上限，必须大于 `0` |
-| `KIRO_MAX_UPSTREAM_BODY_BYTES` | 覆盖上游响应体上限，必须大于 `0` |
-| `KIRO_GRACEFUL_SHUTDOWN_TIMEOUT_SECS` | 覆盖优雅停机等待时间，必须大于 `0` |
-| `KIRO_ADMIN_ENABLED` | 启用或禁用 Admin 页面和 API |
-| `KIRO_ADMIN_SESSION_TTL_SECS` | 覆盖 Admin 会话 TTL，必须大于 `0` |
-| `KIRO_ADMIN_COOKIE_SECURE` | 是否设置 Admin Cookie 的 `Secure` 属性 |
-| `KIRO_ADMIN_LOGIN_RATE_LIMIT_PER_MINUTE` | 覆盖登录限流值，必须大于 `0` |
-| `KIRO_MCP_REGION` | 覆盖保留的 MCP 区域字段 |
-| `KIRO_LOG_JSON` | 覆盖保留的 JSON 日志字段 |
-| `KIRO_TRUST_FORWARDED_HEADERS` | 覆盖转发头信任字段 |
-| `KIRO_RESPONSE_STORE_PATH` | 覆盖 `response_store_path` |
+| `KIRO__ACCESS__CLIENT_API_KEY` | 覆盖 `access.client_api_key` |
+| `KIRO__ADMIN__API_KEY` / `ENABLED` | 覆盖 Admin 密钥和启用状态 |
+| `KIRO__ADMIN__SESSION_TTL_SECS` / `COOKIE_SECURE` | 覆盖会话 TTL 和 Cookie 属性 |
+| `KIRO__ADMIN__ALLOWED_ORIGINS` | 逗号分隔的 Admin Origin 列表 |
+| `KIRO__ADMIN__LOGIN_RATE_LIMIT_PER_MINUTE` | 覆盖登录限流值，必须大于 `0` |
+| `KIRO__ADMIN__TRUST_FORWARDED_HEADERS` | 是否信任 `X-Forwarded-For` |
+| `KIRO__SERVER__HOST` / `PORT` | 覆盖监听地址和端口 |
+| `KIRO__SERVER__MAX_REQUEST_BODY_BYTES` | 覆盖请求体上限，必须大于 `0` |
+| `KIRO__SERVER__GRACEFUL_SHUTDOWN_TIMEOUT_SECS` | 覆盖优雅停机等待时间，必须大于 `0` |
+| `KIRO__CREDENTIAL__SOURCE` / `PATH` / `JSON_PATH` | 覆盖凭据来源及路径 |
+| `KIRO__CREDENTIAL__ACCESS_TOKEN` / `REFRESH_TOKEN` / `API_KEY` | 覆盖环境凭据；API Key 不能与 Token 同时填写 |
+| `KIRO__CREDENTIAL__CLIENT_ID` / `CLIENT_SECRET` / `MACHINE_ID` | 覆盖 OIDC 元数据 |
+| `KIRO__UPSTREAM__ENDPOINT` / `API_REGION` | 覆盖端点策略和区域 |
+| `KIRO__UPSTREAM__URL` / `PROXY_URL` / `TOKEN_ENDPOINT` | 覆盖上游、代理和刷新端点 |
+| `KIRO__UPSTREAM__TIMEOUT_SECS` / `MAX_BODY_BYTES` | 覆盖超时和响应体上限 |
+| `KIRO__UPSTREAM__REFRESH_EARLY_SECS` / `REFRESH_INTERVAL_SECS` | 覆盖刷新窗口和周期 |
+| `KIRO__UPSTREAM__MCP_REGION` | 覆盖保留的 MCP 区域字段 |
+| `KIRO__MODELS__CACHE_TTL_SECS` / `ALIASES` | 覆盖模型缓存 TTL 和别名（别名格式 `alias=target`） |
+| `KIRO__STORAGE__RESPONSE_STORE_PATH` | 覆盖 Responses SQLite 路径 |
+| `KIRO__LOGGING__FORMAT` | `text` 或 `json` |
 | `RUST_LOG` | tracing 过滤器，默认 `info` |
 
-凭据环境变量：
-
-| 环境变量 | 用途 |
-| --- | --- |
-| `KIRO_ACCESS_TOKEN` | 上游访问 Token |
-| `KIRO_REFRESH_TOKEN` | 上游刷新 Token |
-| `KIRO_API_KEY` | 上游 API Key |
-| `KIRO_CLIENT_ID` | OIDC 客户端 ID |
-| `KIRO_CLIENT_SECRET` | OIDC 客户端 Secret |
-| `KIRO_MACHINE_ID` | 上游机器 ID；未设置时生成随机 UUID |
-| `KIRO_TOKEN_ENDPOINT` | 覆盖 Token 刷新 URL |
-
-`KIRO_CLIENT_API_KEY` 与上游 `KIRO_API_KEY` 必须分别配置；上游密钥不会自动成为网关客户端密钥。
+`KIRO__ACCESS__CLIENT_API_KEY` 与上游 `KIRO__CREDENTIAL__API_KEY` 必须分别配置；上游密钥不会自动成为网关客户端密钥。
 
 ## 凭据来源与刷新
 
-`credential_source` 的行为：
+`credential.source` 的行为：
 
-- `env`：从 `KIRO_ACCESS_TOKEN`、`KIRO_REFRESH_TOKEN` 或 `KIRO_API_KEY` 构造一个凭据。
-- `api_key`：只读取 `KIRO_API_KEY`，并使用配置中的区域和端点。
-- `json`：读取 `credential_json_path`。只接受单个凭据对象和规范 snake_case 字段：`auth_method`、`access_token`、`refresh_token`、`api_key`、`client_id`、`client_secret` 及其他文档字段；数组、camelCase、`token` 等未定义字段会拒绝。
-- `sqlite`：以只读模式打开 `credential_path`，读取受支持的 Kiro Token、设备注册和 profile 元数据。
-- `auto`：依次检查环境变量、已配置且存在的 JSON、已配置或默认位置的 SQLite。没有候选或发现多个候选都会拒绝启动，必须明确选择来源。
+- `env`：从 `credential.access_token`、`credential.refresh_token` 或 `credential.api_key`（包括对应的 v2 环境变量）构造一个凭据。
+- `api_key`：只读取 `credential.api_key`，并使用 `upstream` 中的区域和端点策略。
+- `json`：读取 `credential.json_path`。只接受单个凭据对象和规范 snake_case 字段：`auth_method`、`access_token`、`refresh_token`、`api_key`、`client_id`、`client_secret` 及其他文档字段；数组、camelCase、`token` 等未定义字段会拒绝。
+- `sqlite`：以只读模式打开 `credential.path`，读取受支持的 Kiro Token、设备注册和 profile 元数据。
+- `auto`：依次检查 v2 环境凭据、已配置且存在的 JSON、已配置或默认位置的 SQLite。没有候选或发现多个候选都会拒绝启动，必须明确选择来源。
 
 默认 SQLite 探测路径为 `~/.local/share/kiro-cli/data.sqlite3`。SQLite 始终只读，不会被网关修改。
 
-`endpoint=auto` 是默认策略：SQLite/Kiro CLI 凭据使用 CLI 上游协议
+`upstream.endpoint=auto` 是默认策略：SQLite/Kiro CLI 凭据使用 CLI 上游协议
 (`runtime.{region}.kiro.dev/generateAssistantResponse`，请求目标为
 `KiroRuntimeService.GenerateAssistantResponse`)，IDE/桌面凭据使用 IDE 上游协议
 (`q.{region}.amazonaws.com`)。显式设置 `endpoint=cli` 或 `endpoint=ide` 会覆盖凭据元数据。这样可以避免
@@ -433,7 +429,7 @@ Responses 适配层展开；Kiro CLI 上游不接受工具名中的点号，因�
 `Your subscription does not support this application`。网关不会因为 IDE 返回 403 而隐式
 切换到另一个端点；如果需要固定协议，请显式配置端点。
 
-非 API Key 凭据会在启动、每次模型请求以及后台定时任务中检查是否需要刷新。刷新使用单飞锁，成功后更新内存凭据。只要配置了 `credential_json_path`，刷新后的完整凭据就会以临时文件加重命名的方式原子写回该路径；不希望落盘时不要配置该字段。应将凭据 JSON 权限限制为仅服务用户可读写。
+非 API Key 凭据会在启动、每次模型请求以及后台定时任务中检查是否需要刷新。刷新使用单飞锁，成功后更新内存凭据。只要配置了 `credential.json_path`，刷新后的完整凭据就会以临时文件加重命名的方式原子写回该路径；不希望落盘时不要配置该字段。应将凭据 JSON 权限限制为仅服务用户可读写。
 
 规范 `auth_method` 值为 `api_key`、`social`、`oidc` 和 `refresh_token`；`unknown` 只用于内部解析状态，不能出现在外部凭据文件中。SQLite 中 Kiro CLI 历史 key 名（包括 `odic`）仅作为表 schema 读取，加载后的凭据统一为 `oidc`。
 
@@ -703,13 +699,13 @@ Admin 路由：
 ## 数据与安全边界
 
 - 默认只监听回环地址。对外提供服务时应在可信反向代理后终止 TLS，并限制网络访问。
-- `client_api_key` 与 `admin_api_key` 作用不同，应使用独立的高熵值。
+- `access.client_api_key` 与 `admin.api_key` 作用不同，应使用独立的高熵值。
 - 凭据 Token 的 Debug 和普通序列化会显示为 `[REDACTED]`；健康接口和凭据状态接口只返回元数据和布尔状态。
-- SQLite 凭据源只读。只有显式配置的 `credential_json_path` 会在刷新成功后写入完整凭据。
-- `response_store_path` 会以明文保存请求消息、模型输出、工具参数和工具结果。应限制数据库文件权限，并按数据保留要求删除记录。
+- SQLite 凭据源只读。只有显式配置的 `credential.json_path` 会在刷新成功后写入完整凭据。
+- `storage.response_store_path` 会以明文保存请求消息、模型输出、工具参数和工具结果。应限制数据库文件权限，并按数据保留要求删除记录。
 - Admin 的 `/responses/{id}` 会返回完整存储内容，只应向受信任管理员开放。
 - 删除 Response 会通过外键级联删除对应的 `response_events`；事件和 Response 内容均以明文保存在本地 SQLite。
-- `upstream_url` 和 `KIRO_TOKEN_ENDPOINT` 会改变凭据或内容发送目标，只能配置为受信任地址。
+- `upstream.url` 和 `upstream.token_endpoint` 会改变凭据或内容发送目标，只能配置为受信任地址。
 - 本服务不提供 TLS、跨进程会话共享或静态凭据加密。
 
 ## 构建与验证

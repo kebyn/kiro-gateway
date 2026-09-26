@@ -7,9 +7,9 @@ services:
     env_file:
       - .env
     environment:
-      KIRO_HOST: "127.0.0.1"
-      KIRO_PORT: "8990"
-      KIRO_RESPONSE_STORE_PATH: /var/lib/kiro-gateway/kiro-gateway.sqlite3
+      KIRO__SERVER__HOST: "127.0.0.1"
+      KIRO__SERVER__PORT: "8990"
+      KIRO__STORAGE__RESPONSE_STORE_PATH: /var/lib/kiro-gateway/kiro-gateway.sqlite3
     volumes:
       - ./config.json:/etc/kiro-gateway/config.json:ro
       - ./data:/var/lib/kiro-gateway

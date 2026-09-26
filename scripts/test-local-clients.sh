@@ -33,11 +33,12 @@ Options:
   -h, --help          show this help
 
 Environment:
-  KIRO_CREDENTIAL_SOURCE / KIRO_CREDENTIAL_PATH / KIRO_CREDENTIAL_JSON_PATH
+  KIRO__CREDENTIAL__SOURCE / KIRO__CREDENTIAL__PATH / KIRO__CREDENTIAL__JSON_PATH
                       select the upstream credential source
-  KIRO_MODEL_ALIASES   comma-separated client-model mappings, for example
+  KIRO__MODELS__ALIASES comma-separated client-model mappings, for example
                       claude-sonnet-5=@first
-  KIRO_ACCESS_TOKEN, KIRO_REFRESH_TOKEN, KIRO_API_KEY
+  KIRO__CREDENTIAL__ACCESS_TOKEN, KIRO__CREDENTIAL__REFRESH_TOKEN,
+  KIRO__CREDENTIAL__API_KEY
                       provide environment credentials when the source is env
   KIRO_GATEWAY_BIN    optional built gateway binary
   CODEX_BIN, CLAUDE_BIN, GROK_BIN
@@ -161,10 +162,10 @@ if [[ "$MANAGE_GATEWAY" == "0" && -z "$CLIENT_API_KEY" ]]; then
     die "KIRO_TEST_CLIENT_API_KEY is required with --gateway-url"
 fi
 
-CREDENTIAL_SOURCE=${KIRO_TEST_CREDENTIAL_SOURCE:-${KIRO_CREDENTIAL_SOURCE:-auto}}
+CREDENTIAL_SOURCE=${KIRO_TEST_CREDENTIAL_SOURCE:-${KIRO__CREDENTIAL__SOURCE:-auto}}
 if [[ "$CREDENTIAL_SOURCE" == "env" ]] &&
-    [[ -z "${KIRO_ACCESS_TOKEN:-}" && -z "${KIRO_REFRESH_TOKEN:-}" && -z "${KIRO_API_KEY:-}" ]]; then
-    die "KIRO_CREDENTIAL_SOURCE=env requires KIRO_ACCESS_TOKEN, KIRO_REFRESH_TOKEN, or KIRO_API_KEY"
+    [[ -z "${KIRO__CREDENTIAL__ACCESS_TOKEN:-}" && -z "${KIRO__CREDENTIAL__REFRESH_TOKEN:-}" && -z "${KIRO__CREDENTIAL__API_KEY:-}" ]]; then
+    die "KIRO__CREDENTIAL__SOURCE=env requires KIRO__CREDENTIAL__ACCESS_TOKEN, KIRO__CREDENTIAL__REFRESH_TOKEN, or KIRO__CREDENTIAL__API_KEY"
 fi
 
 for client in codex claude grok; do
@@ -192,23 +193,23 @@ if [[ "$MANAGE_GATEWAY" == "1" ]]; then
     fi
 
     GATEWAY_ENV=(
-        "KIRO_HOST=127.0.0.1"
-        "KIRO_PORT=$PORT"
-        "KIRO_CLIENT_API_KEY=$CLIENT_API_KEY"
-        "KIRO_CREDENTIAL_SOURCE=$CREDENTIAL_SOURCE"
-        "KIRO_RESPONSE_STORE_PATH=$TMP_DIR/responses.sqlite3"
+        "KIRO__SERVER__HOST=127.0.0.1"
+        "KIRO__SERVER__PORT=$PORT"
+        "KIRO__ACCESS__CLIENT_API_KEY=$CLIENT_API_KEY"
+        "KIRO__CREDENTIAL__SOURCE=$CREDENTIAL_SOURCE"
+        "KIRO__STORAGE__RESPONSE_STORE_PATH=$TMP_DIR/responses.sqlite3"
         "RUST_LOG=${RUST_LOG:-warn}"
     )
-    if [[ -n "${KIRO_CREDENTIAL_PATH:-}" ]]; then
-        GATEWAY_ENV+=("KIRO_CREDENTIAL_PATH=$KIRO_CREDENTIAL_PATH")
+    if [[ -n "${KIRO__CREDENTIAL__PATH:-}" ]]; then
+        GATEWAY_ENV+=("KIRO__CREDENTIAL__PATH=$KIRO__CREDENTIAL__PATH")
     fi
-    if [[ -n "${KIRO_CREDENTIAL_JSON_PATH:-}" ]]; then
-        GATEWAY_ENV+=("KIRO_CREDENTIAL_JSON_PATH=$KIRO_CREDENTIAL_JSON_PATH")
+    if [[ -n "${KIRO__CREDENTIAL__JSON_PATH:-}" ]]; then
+        GATEWAY_ENV+=("KIRO__CREDENTIAL__JSON_PATH=$KIRO__CREDENTIAL__JSON_PATH")
     fi
-    if [[ -n "${KIRO_MODEL_ALIASES:-}" ]]; then
-        GATEWAY_ENV+=("KIRO_MODEL_ALIASES=$KIRO_MODEL_ALIASES")
+    if [[ -n "${KIRO__MODELS__ALIASES:-}" ]]; then
+        GATEWAY_ENV+=("KIRO__MODELS__ALIASES=$KIRO__MODELS__ALIASES")
     elif selected claude; then
-        GATEWAY_ENV+=("KIRO_MODEL_ALIASES=claude-sonnet-5=@first")
+        GATEWAY_ENV+=("KIRO__MODELS__ALIASES=claude-sonnet-5=@first")
     fi
 
     if [[ -n "${KIRO_GATEWAY_BIN:-}" ]]; then
