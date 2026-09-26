@@ -94,14 +94,20 @@ fn validate_message_content(message: &AnthropicMessage) -> Result<(), String> {
 
 impl MessagesRequest {
     pub fn into_generation(self) -> Result<GenerationRequest, String> {
+        let mut system = self.system.map(|value| text_value(&value));
+        let mut messages = Vec::with_capacity(self.messages.len());
+        for message in self.messages {
+            let parsed = parse_message(message)?;
+            if parsed.role == Role::System {
+                append_instruction(&mut system, content_text(&parsed));
+            } else {
+                messages.push(parsed);
+            }
+        }
         Ok(GenerationRequest {
             model: self.model,
-            messages: self
-                .messages
-                .into_iter()
-                .map(parse_message)
-                .collect::<Result<Vec<_>, _>>()?,
-            system: self.system.map(|value| text_value(&value)),
+            messages,
+            system: system.filter(|value| !value.is_empty()),
             tools: self
                 .tools
                 .into_iter()
@@ -126,7 +132,7 @@ impl MessagesRequest {
 
 pub(crate) fn parse_message(message: AnthropicMessage) -> Result<Message, String> {
     let role = Role::parse(&message.role)?;
-    if !matches!(role, Role::User | Role::Assistant) {
+    if !matches!(role, Role::User | Role::Assistant | Role::System) {
         return Err(format!("unsupported Anthropic message role: {role}"));
     }
     let mut parsed = Message::empty(role);
@@ -138,7 +144,24 @@ pub(crate) fn parse_message(message: AnthropicMessage) -> Result<Message, String
         }
         value => parsed.content = parse_text_parts(&value)?,
     }
+    if role == Role::System && (!parsed.tool_calls.is_empty() || !parsed.tool_results.is_empty()) {
+        return Err("Anthropic system messages may only contain text or thinking blocks".into());
+    }
     Ok(parsed)
+}
+
+fn append_instruction(instructions: &mut Option<String>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(existing) = instructions {
+        if !existing.is_empty() {
+            existing.push_str("\n\n");
+        }
+        existing.push_str(&text);
+    } else {
+        *instructions = Some(text);
+    }
 }
 
 fn parse_content_block(item: Value, message: &mut Message) -> Result<(), String> {
@@ -265,6 +288,25 @@ mod tests {
 
         let internal: GenerationRequest = request.into_generation().unwrap();
         assert_eq!(internal.system.as_deref(), Some("Follow the policy.\nBe concise."));
+    }
+
+    #[test]
+    fn merges_system_role_messages_into_instructions() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"kiro",
+            "system":"Top-level policy.",
+            "messages":[
+                {"role":"system","content":[{"type":"text","text":"Client policy."}]},
+                {"role":"user","content":"hello"}
+            ]
+        }))
+        .unwrap();
+
+        request.validate().unwrap();
+        let internal = request.into_generation().unwrap();
+        assert_eq!(internal.messages.len(), 1);
+        assert_eq!(internal.messages[0].role, "user");
+        assert_eq!(internal.system.as_deref(), Some("Top-level policy.\n\nClient policy."));
     }
 
     #[test]
