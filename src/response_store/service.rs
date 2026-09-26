@@ -170,28 +170,16 @@ impl ResponseStore {
         receive_reply(receive).await
     }
 
-    pub fn extract_messages(record: &ResponseRecord) -> Vec<Message> {
-        record
-            .payload
-            .get("messages")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default()
+    pub fn extract_messages(record: &ResponseRecord) -> Result<Vec<Message>, AppError> {
+        extract_history_field(record, "messages")
     }
 
-    pub fn extract_tools(record: &ResponseRecord) -> Vec<ToolDefinition> {
-        record
-            .payload
-            .get("tools")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default()
+    pub fn extract_tools(record: &ResponseRecord) -> Result<Vec<ToolDefinition>, AppError> {
+        extract_history_field(record, "tools")
     }
 
-    pub fn extract_opaque_history(record: &ResponseRecord) -> Vec<OpaqueHistory> {
-        record
-            .payload
-            .get("opaque_history")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default()
+    pub fn extract_opaque_history(record: &ResponseRecord) -> Result<Vec<OpaqueHistory>, AppError> {
+        extract_history_field(record, "opaque_history")
     }
 
     fn send(&self, command: Command) -> Result<(), AppError> {
@@ -199,6 +187,18 @@ impl ResponseStore {
             .send(command)
             .map_err(|_| AppError::Storage("response store actor is unavailable".into()))
     }
+}
+
+fn extract_history_field<T>(record: &ResponseRecord, field: &str) -> Result<Vec<T>, AppError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let value = record.payload.get(field).ok_or_else(|| {
+        AppError::Storage(format!("stored response is missing required history field {field}"))
+    })?;
+    serde_json::from_value(value.clone()).map_err(|error| {
+        AppError::Storage(format!("invalid stored response history field {field}: {error}"))
+    })
 }
 
 async fn receive_reply<T>(receive: oneshot::Receiver<Result<T, AppError>>) -> Result<T, AppError> {
@@ -332,6 +332,69 @@ mod tests {
     }
 
     #[test]
+    fn rejects_v2_database_with_missing_column_without_modifying_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("responses.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE schema_meta(version INTEGER NOT NULL CHECK(version = 2));
+                     INSERT INTO schema_meta(version) VALUES (2);
+                     CREATE TABLE responses(id TEXT PRIMARY KEY, object TEXT NOT NULL,
+                         status TEXT NOT NULL, model TEXT NOT NULL, created_at INTEGER NOT NULL);
+                     CREATE TABLE response_requests(response_id TEXT PRIMARY KEY, payload TEXT NOT NULL,
+                         FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE);
+                     CREATE TABLE response_snapshots(response_id TEXT PRIMARY KEY, payload TEXT NOT NULL,
+                         FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE);
+                     CREATE TABLE response_events(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         response_id TEXT NOT NULL, sequence_number INTEGER NOT NULL,
+                         event_type TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL,
+                         FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE,
+                         UNIQUE(response_id, sequence_number));",
+                )
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let error = ResponseStore::open(&path).err().expect("malformed v2 schema must be rejected");
+        assert!(error.to_string().contains("invalid columns"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn corrupted_history_is_reported_instead_of_becoming_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResponseStore::open(directory.path().join("responses.sqlite3")).unwrap();
+        let record = store
+            .create(
+                "kiro",
+                serde_json::json!({
+                    "messages": "not-an-array",
+                    "tools": [],
+                    "opaque_history": []
+                }),
+                ResponseStatus::Completed,
+            )
+            .await
+            .unwrap();
+        let record = store.get(&record.id).await.unwrap().unwrap();
+        let error = ResponseStore::extract_messages(&record).unwrap_err();
+        assert!(error.to_string().contains("messages"));
+
+        let missing = store
+            .create(
+                "kiro",
+                serde_json::json!({"messages": [], "tools": []}),
+                ResponseStatus::Completed,
+            )
+            .await
+            .unwrap();
+        let missing = store.get(&missing.id).await.unwrap().unwrap();
+        let error = ResponseStore::extract_opaque_history(&missing).unwrap_err();
+        assert!(error.to_string().contains("opaque_history"));
+    }
+
+    #[test]
     fn schema_v2_separates_requests_snapshots_and_events() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("responses.sqlite3");
@@ -370,6 +433,30 @@ mod tests {
         let path = directory.path().join("responses.sqlite3");
         let _store = ResponseStore::open(&path).unwrap();
         assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_sidecars_are_owner_only_when_present() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("responses.sqlite3");
+        let store = ResponseStore::open(&path).unwrap();
+        let _ = store
+            .create(
+                "kiro",
+                serde_json::json!({"messages": [], "tools": [], "opaque_history": []}),
+                ResponseStatus::InProgress,
+            )
+            .await
+            .unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+            if sidecar.exists() {
+                assert_eq!(std::fs::metadata(sidecar).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
     }
 
     #[test]

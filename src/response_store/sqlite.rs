@@ -28,12 +28,12 @@ impl SqliteStore {
         prepare_store_file(path)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         initialize_or_validate_schema(&conn)?;
         harden_store_file(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        harden_sidecars(path);
+        harden_sidecars(path)?;
         Ok(Self { conn, path: path.to_owned() })
     }
 
@@ -42,7 +42,7 @@ impl SqliteStore {
         insert_record(&transaction, record)?;
         write_payload_parts(&transaction, &record.id, &record.payload)?;
         transaction.commit()?;
-        harden_sidecars(&self.path);
+        harden_sidecars(&self.path)?;
         Ok(())
     }
 
@@ -56,7 +56,7 @@ impl SqliteStore {
         write_payload_parts(&transaction, &record.id, &record.payload)?;
         let stored_events = append_events(&transaction, &record.id, events)?;
         transaction.commit()?;
-        harden_sidecars(&self.path);
+        harden_sidecars(&self.path)?;
         Ok(stored_events)
     }
 
@@ -86,7 +86,7 @@ impl SqliteStore {
         write_payload_parts(&transaction, response_id, payload)?;
         append_events(&transaction, response_id, events)?;
         transaction.commit()?;
-        harden_sidecars(&self.path);
+        harden_sidecars(&self.path)?;
         Ok(true)
     }
 
@@ -135,7 +135,7 @@ impl SqliteStore {
     pub fn delete(&mut self, id: &str) -> Result<bool, AppError> {
         let changed = self.conn.execute("DELETE FROM responses WHERE id = ?1", [id])? > 0;
         if changed {
-            harden_sidecars(&self.path);
+            harden_sidecars(&self.path)?;
         }
         Ok(changed)
     }
@@ -150,7 +150,7 @@ impl SqliteStore {
         let mut events =
             append_events(&transaction, response_id, &[(event_type.to_owned(), payload.clone())])?;
         transaction.commit()?;
-        harden_sidecars(&self.path);
+        harden_sidecars(&self.path)?;
         events.pop().ok_or_else(|| AppError::Storage("response event was not stored".into()))
     }
 
@@ -210,14 +210,202 @@ fn initialize_or_validate_schema(conn: &Connection) -> Result<(), AppError> {
             "unsupported Responses database schema version; expected {SCHEMA_VERSION}"
         )));
     }
-    for required in ["responses", "response_requests", "response_snapshots", "response_events"] {
-        if !tables.iter().any(|table| table == required) {
-            return Err(AppError::Storage(format!(
-                "Responses database schema v2 is missing required table {required}"
-            )));
-        }
+    validate_schema_shape(conn, &tables)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColumnShape {
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    primary_key: i64,
+    default_value: Option<String>,
+}
+
+fn validate_schema_shape(conn: &Connection, tables: &[String]) -> Result<(), AppError> {
+    let mut actual = tables.to_vec();
+    actual.sort();
+    let mut expected = vec![
+        "response_events".to_owned(),
+        "response_requests".to_owned(),
+        "response_snapshots".to_owned(),
+        "responses".to_owned(),
+        "schema_meta".to_owned(),
+    ];
+    expected.sort();
+    if actual != expected {
+        return Err(AppError::Storage(format!(
+            "unexpected tables in Responses database schema v2: {actual:?}"
+        )));
+    }
+
+    let schema_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'",
+        [],
+        |row| row.get(0),
+    )?;
+    let compact_sql = schema_sql
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if !compact_sql.contains("check(version=2)") {
+        return Err(AppError::Storage(
+            "Responses database schema v2 has an invalid schema_meta check constraint".into(),
+        ));
+    }
+
+    validate_columns(
+        conn,
+        "schema_meta",
+        &[ColumnShape {
+            name: "version".into(),
+            declared_type: "INTEGER".into(),
+            not_null: true,
+            primary_key: 0,
+            default_value: None,
+        }],
+    )?;
+    validate_columns(
+        conn,
+        "responses",
+        &[
+            column("id", "TEXT", false, 1),
+            column("object", "TEXT", true, 0),
+            column("status", "TEXT", true, 0),
+            column("model", "TEXT", true, 0),
+            column("created_at", "INTEGER", true, 0),
+            column("updated_at", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_columns(
+        conn,
+        "response_requests",
+        &[column("response_id", "TEXT", false, 1), column("payload", "TEXT", true, 0)],
+    )?;
+    validate_columns(
+        conn,
+        "response_snapshots",
+        &[column("response_id", "TEXT", false, 1), column("payload", "TEXT", true, 0)],
+    )?;
+    validate_columns(
+        conn,
+        "response_events",
+        &[
+            column("id", "INTEGER", false, 1),
+            column("response_id", "TEXT", true, 0),
+            column("sequence_number", "INTEGER", true, 0),
+            column("event_type", "TEXT", true, 0),
+            column("payload", "TEXT", true, 0),
+            column("created_at", "INTEGER", true, 0),
+        ],
+    )?;
+
+    for table in ["response_requests", "response_snapshots", "response_events"] {
+        validate_response_foreign_key(conn, table)?;
+    }
+    validate_event_sequence_constraint(conn)?;
+    let meta_rows: i64 =
+        conn.query_row("SELECT COUNT(*) FROM schema_meta", [], |row| row.get(0))?;
+    if meta_rows != 1 {
+        return Err(AppError::Storage(
+            "Responses database schema_meta must contain exactly one version row".into(),
+        ));
     }
     Ok(())
+}
+
+fn column(name: &str, declared_type: &str, not_null: bool, primary_key: i64) -> ColumnShape {
+    ColumnShape {
+        name: name.into(),
+        declared_type: declared_type.into(),
+        not_null,
+        primary_key,
+        default_value: None,
+    }
+}
+
+fn validate_columns(
+    conn: &Connection,
+    table: &str,
+    expected: &[ColumnShape],
+) -> Result<(), AppError> {
+    let sql = format!("PRAGMA table_info('{table}')");
+    let mut statement = conn.prepare(&sql)?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok(ColumnShape {
+                name: row.get(1)?,
+                declared_type: row.get::<_, String>(2)?.to_ascii_uppercase(),
+                not_null: row.get::<_, i64>(3)? != 0,
+                primary_key: row.get(5)?,
+                default_value: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = expected.to_vec();
+    for shape in &mut expected {
+        shape.declared_type = shape.declared_type.to_ascii_uppercase();
+    }
+    if actual != expected {
+        return Err(AppError::Storage(format!(
+            "invalid columns or constraints for Responses table {table}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_response_foreign_key(conn: &Connection, table: &str) -> Result<(), AppError> {
+    let sql = format!("PRAGMA foreign_key_list('{table}')");
+    let mut statement = conn.prepare(&sql)?;
+    let foreign_keys = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if foreign_keys
+        != [(
+            "responses".into(),
+            "response_id".into(),
+            "id".into(),
+            "NO ACTION".into(),
+            "CASCADE".into(),
+        )]
+    {
+        return Err(AppError::Storage(format!(
+            "invalid foreign key constraint for Responses table {table}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_event_sequence_constraint(conn: &Connection) -> Result<(), AppError> {
+    let mut statement = conn.prepare("PRAGMA index_list('response_events')")?;
+    let indexes = statement
+        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, unique) in indexes {
+        if !unique {
+            continue;
+        }
+        let sql = format!("PRAGMA index_info('{name}')");
+        let mut info = conn.prepare(&sql)?;
+        let columns =
+            info.query_map([], |row| row.get::<_, String>(2))?.collect::<Result<Vec<_>, _>>()?;
+        if columns == ["response_id", "sequence_number"] {
+            return Ok(());
+        }
+    }
+    Err(AppError::Storage(
+        "Responses database schema v2 is missing UNIQUE(response_id, sequence_number)".into(),
+    ))
 }
 
 fn insert_record(transaction: &Transaction<'_>, record: &ResponseRecord) -> Result<(), AppError> {
@@ -395,14 +583,39 @@ fn harden_store_file(path: &Path) -> Result<(), AppError> {
 }
 
 #[cfg(unix)]
-fn harden_sidecars(path: &Path) {
+fn harden_sidecars(path: &Path) -> Result<(), AppError> {
     for suffix in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
-        if sidecar.exists() {
-            let _ = fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600));
+        match fs::symlink_metadata(&sidecar) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(AppError::Storage(format!(
+                        "refusing to harden SQLite sidecar symlink {}",
+                        sidecar.display()
+                    )));
+                }
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).map_err(
+                    |error| {
+                        AppError::Storage(format!(
+                            "harden SQLite sidecar {}: {error}",
+                            sidecar.display()
+                        ))
+                    },
+                )?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Storage(format!(
+                    "inspect SQLite sidecar {}: {error}",
+                    sidecar.display()
+                )));
+            }
         }
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn harden_sidecars(_path: &Path) {}
+fn harden_sidecars(_path: &Path) -> Result<(), AppError> {
+    Ok(())
+}

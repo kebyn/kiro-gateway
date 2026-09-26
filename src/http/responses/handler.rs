@@ -54,12 +54,18 @@ pub async fn create(
         Some(id) => Some(state.responses.get(id).await?.ok_or(AppError::NotFound)?),
         None => None,
     };
-    let previous =
-        previous_record.as_ref().map(ResponseStore::extract_messages).unwrap_or_default();
-    let previous_tools =
-        previous_record.as_ref().map(ResponseStore::extract_tools).unwrap_or_default();
-    let mut previous_opaque =
-        previous_record.as_ref().map(ResponseStore::extract_opaque_history).unwrap_or_default();
+    let previous = match previous_record.as_ref() {
+        Some(record) => ResponseStore::extract_messages(record)?,
+        None => Vec::new(),
+    };
+    let previous_tools = match previous_record.as_ref() {
+        Some(record) => ResponseStore::extract_tools(record)?,
+        None => Vec::new(),
+    };
+    let mut previous_opaque = match previous_record.as_ref() {
+        Some(record) => ResponseStore::extract_opaque_history(record)?,
+        None => Vec::new(),
+    };
     let store = body.store;
     let stream_response = body.stream;
     let mut internal = body.into_generation(previous).map_err(AppError::BadRequest)?;

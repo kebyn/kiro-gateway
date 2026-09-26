@@ -593,7 +593,8 @@ async fn stored_response_replays_tool_call_for_previous_response_id() {
         .create("kiro", json!({"messages":messages}), ResponseStatus::Completed)
         .await
         .unwrap();
-    let replayed = ResponseStore::extract_messages(&store.get(&record.id).await.unwrap().unwrap());
+    let replayed =
+        ResponseStore::extract_messages(&store.get(&record.id).await.unwrap().unwrap()).unwrap();
     let continuation: ResponsesRequest = serde_json::from_value(json!({
         "model":"kiro",
         "input":[{
@@ -630,7 +631,8 @@ async fn stored_response_replays_tool_definitions_for_continuation() {
             )
             .await
             .unwrap();
-    let recovered = ResponseStore::extract_tools(&store.get(&record.id).await.unwrap().unwrap());
+    let recovered =
+        ResponseStore::extract_tools(&store.get(&record.id).await.unwrap().unwrap()).unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].name, "lookup");
 }
