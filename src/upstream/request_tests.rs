@@ -107,6 +107,54 @@ async fn retries_truncated_attempt_before_emitting_any_event() {
     );
 }
 
+#[tokio::test]
+async fn limits_non_success_error_body_preview() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        let body = format!("{{\"message\":\"{}\"}}", "x".repeat(16 * 1024));
+        let response = format!(
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(body.as_bytes()).await.unwrap();
+    });
+    let client = UpstreamClient::with_policy_and_limit(
+        reqwest::Client::new(),
+        EndpointPolicy::Cli,
+        Some(format!("http://{address}")),
+        128,
+    );
+    let credential = Credential {
+        auth_method: AuthMethod::ApiKey,
+        access_token: Some(SecretString::new("token")),
+        endpoint: "cli".into(),
+        ..Default::default()
+    };
+    let request = GenerationRequest {
+        model: "kiro".into(),
+        messages: vec![crate::generation::Message::text(crate::generation::Role::User, "hello")],
+        system: None,
+        tools: Vec::new(),
+        stream: true,
+        max_tokens: None,
+        temperature: None,
+        conversation_id: None,
+        instructions: None,
+        opaque_history: Vec::new(),
+    };
+    let mut events = client.event_stream(&request, &credential).await.unwrap();
+    let error = events.next().await.unwrap().unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("CLI endpoint returned 500"));
+    assert!(message.len() < 512);
+    server.await.unwrap();
+}
+
 #[test]
 fn incomplete_terminal_reason_is_not_reported_as_completed() {
     let response = finish_result(

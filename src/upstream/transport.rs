@@ -4,7 +4,10 @@ use crate::{
     error::AppError,
     generation::GenerationRequest,
 };
+use futures_util::StreamExt;
 use reqwest::Client;
+
+const ERROR_BODY_PREVIEW_BYTES: usize = 4096;
 
 pub(crate) enum SendError {
     Transport(String),
@@ -25,6 +28,7 @@ pub(crate) async fn send_once(
     endpoint: &EndpointAdapter,
     request: &GenerationRequest,
     credential: &Credential,
+    max_body_bytes: usize,
 ) -> Result<reqwest::Response, SendError> {
     let body = endpoint.transform_api_body(request, credential);
     tracing::debug!(model = %request.model, "sending upstream request");
@@ -47,12 +51,24 @@ pub(crate) async fn send_once(
         .map_err(|error| SendError::Transport(error.to_string()))?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map(|body| String::from_utf8_lossy(&body[..body.len().min(4096)]).into_owned())
-            .unwrap_or_default();
+        let body = read_error_preview(response, max_body_bytes).await;
         return Err(SendError::Application(endpoint.classify_error(status, &body)));
     }
     Ok(response)
+}
+
+async fn read_error_preview(response: reqwest::Response, max_body_bytes: usize) -> String {
+    let limit = max_body_bytes.min(ERROR_BODY_PREVIEW_BYTES);
+    if limit == 0 {
+        return String::new();
+    }
+    let mut body = Vec::with_capacity(limit);
+    let mut stream = response.bytes_stream();
+    while body.len() < limit {
+        let Some(chunk) = stream.next().await else { break };
+        let Ok(chunk) = chunk else { break };
+        let remaining = limit - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }

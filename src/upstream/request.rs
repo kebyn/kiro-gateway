@@ -70,7 +70,15 @@ impl UpstreamClient {
                     endpoint_kind,
                     upstream_url.as_deref(),
                 );
-                let response = match send_once(&client, &endpoint, &request, &credential).await {
+                let response = match send_once(
+                    &client,
+                    &endpoint,
+                    &request,
+                    &credential,
+                    max_body_bytes,
+                )
+                .await
+                {
                     Ok(response) => response,
                     Err(SendError::Transport(error)) if attempt == 0 => {
                         tracing::debug!(
