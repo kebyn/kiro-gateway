@@ -9,7 +9,7 @@ use crate::{
     response_store::{ResponseStatus, ResponseStore},
     transform::converter::responses_incomplete_reason,
     transform::truncation::XmlLeakFilter,
-    upstream::request::GenerationAccumulator,
+    upstream::GenerationAccumulator,
 };
 use axum::{
     Json,
@@ -495,7 +495,7 @@ fn attach_sequence(
 
 fn responses_live_stream(
     state: AppState,
-    mut upstream: crate::upstream::request::GenerationEventStream,
+    mut upstream: crate::upstream::GenerationEventStream,
     id: String,
     model: String,
     internal: crate::generation::GenerationRequest,
@@ -1641,28 +1641,27 @@ mod tests {
             instructions: None,
             opaque_history: Vec::new(),
         };
-        let upstream: crate::upstream::request::GenerationEventStream =
-            Box::pin(stream::iter(vec![
-                Ok(crate::generation::GenerationEvent::ToolCallStart {
-                    id: "call_1".into(),
-                    name: "lookup".into(),
-                }),
-                Ok(crate::generation::GenerationEvent::ToolCallDelta {
-                    id: "call_1".into(),
-                    arguments: "{\"x\":".into(),
-                    name: None,
-                }),
-                Ok(crate::generation::GenerationEvent::ToolCallDelta {
-                    id: "call_1".into(),
-                    arguments: "1}".into(),
-                    name: None,
-                }),
-                Ok(crate::generation::GenerationEvent::ToolCallEnd {
-                    id: "call_1".into(),
-                    complete: true,
-                }),
-                Ok(crate::generation::GenerationEvent::Stop { reason: "end_turn".into() }),
-            ]));
+        let upstream: crate::upstream::GenerationEventStream = Box::pin(stream::iter(vec![
+            Ok(crate::generation::GenerationEvent::ToolCallStart {
+                id: "call_1".into(),
+                name: "lookup".into(),
+            }),
+            Ok(crate::generation::GenerationEvent::ToolCallDelta {
+                id: "call_1".into(),
+                arguments: "{\"x\":".into(),
+                name: None,
+            }),
+            Ok(crate::generation::GenerationEvent::ToolCallDelta {
+                id: "call_1".into(),
+                arguments: "1}".into(),
+                name: None,
+            }),
+            Ok(crate::generation::GenerationEvent::ToolCallEnd {
+                id: "call_1".into(),
+                complete: true,
+            }),
+            Ok(crate::generation::GenerationEvent::Stop { reason: "end_turn".into() }),
+        ]));
         let response = responses_live_stream(
             state,
             upstream,
@@ -1707,23 +1706,22 @@ mod tests {
             instructions: None,
             opaque_history: Vec::new(),
         };
-        let upstream: crate::upstream::request::GenerationEventStream =
-            Box::pin(stream::iter(vec![
-                Ok(crate::generation::GenerationEvent::ToolCallStart {
-                    id: "call_custom".into(),
-                    name: "functions_apply_patch".into(),
-                }),
-                Ok(crate::generation::GenerationEvent::ToolCallDelta {
-                    id: "call_custom".into(),
-                    arguments: "{\"input\":\"*** Begin\\n+hello\\n*** End\"}".into(),
-                    name: None,
-                }),
-                Ok(crate::generation::GenerationEvent::ToolCallEnd {
-                    id: "call_custom".into(),
-                    complete: true,
-                }),
-                Ok(crate::generation::GenerationEvent::Stop { reason: "end_turn".into() }),
-            ]));
+        let upstream: crate::upstream::GenerationEventStream = Box::pin(stream::iter(vec![
+            Ok(crate::generation::GenerationEvent::ToolCallStart {
+                id: "call_custom".into(),
+                name: "functions_apply_patch".into(),
+            }),
+            Ok(crate::generation::GenerationEvent::ToolCallDelta {
+                id: "call_custom".into(),
+                arguments: "{\"input\":\"*** Begin\\n+hello\\n*** End\"}".into(),
+                name: None,
+            }),
+            Ok(crate::generation::GenerationEvent::ToolCallEnd {
+                id: "call_custom".into(),
+                complete: true,
+            }),
+            Ok(crate::generation::GenerationEvent::Stop { reason: "end_turn".into() }),
+        ]));
         let response = responses_live_stream(
             state,
             upstream,
@@ -1761,12 +1759,11 @@ mod tests {
             instructions: None,
             opaque_history: Vec::new(),
         };
-        let upstream: crate::upstream::request::GenerationEventStream =
-            Box::pin(stream::iter(vec![
-                Ok(crate::generation::GenerationEvent::ThinkingDelta { text: "plan".into() }),
-                Ok(crate::generation::GenerationEvent::TextDelta { text: "answer".into() }),
-                Ok(crate::generation::GenerationEvent::Stop { reason: "end_turn".into() }),
-            ]));
+        let upstream: crate::upstream::GenerationEventStream = Box::pin(stream::iter(vec![
+            Ok(crate::generation::GenerationEvent::ThinkingDelta { text: "plan".into() }),
+            Ok(crate::generation::GenerationEvent::TextDelta { text: "answer".into() }),
+            Ok(crate::generation::GenerationEvent::Stop { reason: "end_turn".into() }),
+        ]));
         let response = responses_live_stream(
             state,
             upstream,
@@ -1813,7 +1810,7 @@ mod tests {
             instructions: None,
             opaque_history: Vec::new(),
         };
-        let upstream: crate::upstream::request::GenerationEventStream = Box::pin(stream::pending());
+        let upstream: crate::upstream::GenerationEventStream = Box::pin(stream::pending());
         let response = responses_live_stream(
             state.clone(),
             upstream,

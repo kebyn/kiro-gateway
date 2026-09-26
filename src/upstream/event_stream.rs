@@ -112,7 +112,7 @@ fn parse_headers(mut bytes: &[u8]) -> Result<Vec<(String, String)>, UpstreamStre
     Ok(headers)
 }
 
-pub fn decode_internal_events(
+pub fn decode_generation_events(
     message: &EventMessage,
 ) -> Result<Vec<GenerationEvent>, UpstreamStreamError> {
     let parsed = if message.payload.is_empty() {
@@ -211,10 +211,10 @@ pub fn decode_internal_events(
 }
 
 /// Compatibility entry point for consumers that decode one logical event at a
-/// time. New code should use `decode_internal_events`, because one tool frame
+/// time. New code should use `decode_generation_events`, because one tool frame
 /// can carry a name, input, and stop marker simultaneously.
 #[cfg(test)]
-pub fn decode_internal_event(
+pub fn decode_generation_event(
     message: &EventMessage,
 ) -> Result<GenerationEvent, UpstreamStreamError> {
     let header_kind = header(message, ":event-type");
@@ -235,7 +235,7 @@ pub fn decode_internal_event(
             name: string_field(&value, &["name", "toolName", "tool_name"]).map(ToOwned::to_owned),
         });
     }
-    decode_internal_events(message)?.into_iter().next().ok_or_else(|| {
+    decode_generation_events(message)?.into_iter().next().ok_or_else(|| {
         UpstreamStreamError::Event("event did not contain a decodable internal value".into())
     })
 }
@@ -275,7 +275,7 @@ fn number_field(value: &Value, names: &[&str]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CRC32, EventStreamDecoder, decode_internal_event, decode_internal_events};
+    use super::{CRC32, EventStreamDecoder, decode_generation_event, decode_generation_events};
     use crate::generation::GenerationEvent;
 
     fn frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
@@ -334,8 +334,10 @@ mod tests {
         .concat();
         let mut decoder = EventStreamDecoder::new();
         let messages = decoder.push(&input).unwrap();
-        let events: Vec<_> =
-            messages.iter().flat_map(|message| decode_internal_events(message).unwrap()).collect();
+        let events: Vec<_> = messages
+            .iter()
+            .flat_map(|message| decode_generation_events(message).unwrap())
+            .collect();
         assert_eq!(
             events,
             [
@@ -354,7 +356,7 @@ mod tests {
         );
         let mut decoder = EventStreamDecoder::new();
         let message = decoder.push(&input).unwrap().pop().unwrap();
-        let error = decode_internal_events(&message).unwrap_err();
+        let error = decode_generation_events(&message).unwrap_err();
         assert_eq!(error.to_string(), "upstream exception: upstream denied request");
     }
 
@@ -365,7 +367,7 @@ mod tests {
         let mut decoder = EventStreamDecoder::new();
         let message = decoder.push(&input).unwrap().pop().unwrap();
         assert_eq!(
-            decode_internal_event(&message).unwrap(),
+            decode_generation_event(&message).unwrap(),
             GenerationEvent::ToolCallDelta {
                 id: "call".into(),
                 arguments: "{\"q\":".into(),
@@ -379,6 +381,6 @@ mod tests {
         let input = frame("metadataEvent", b"");
         let mut decoder = EventStreamDecoder::new();
         let message = decoder.push(&input).unwrap().pop().unwrap();
-        assert!(decode_internal_events(&message).unwrap().is_empty());
+        assert!(decode_generation_events(&message).unwrap().is_empty());
     }
 }

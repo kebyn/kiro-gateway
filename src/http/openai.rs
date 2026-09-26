@@ -7,7 +7,7 @@ use crate::{
     protocol::openai_chat::ChatRequest,
     transform::converter::{chat_finish_reason, openai_chat_response},
     transform::truncation::XmlLeakFilter,
-    upstream::request::GenerationAccumulator,
+    upstream::GenerationAccumulator,
 };
 use axum::{
     Json,

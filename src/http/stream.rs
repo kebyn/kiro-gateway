@@ -5,22 +5,22 @@
 use crate::{
     error::AppError,
     generation::{GenerationEvent, GenerationResult},
-    upstream::request::GenerationAccumulator,
+    upstream::GenerationAccumulator,
 };
 use futures_util::StreamExt;
 
-pub struct InternalStreamDriver {
+pub struct GenerationStreamDriver {
     accumulator: GenerationAccumulator,
     terminal_emitted: bool,
 }
 
-impl Default for InternalStreamDriver {
+impl Default for GenerationStreamDriver {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl InternalStreamDriver {
+impl GenerationStreamDriver {
     pub fn new() -> Self {
         Self { accumulator: GenerationAccumulator::new(), terminal_emitted: false }
     }
@@ -43,7 +43,7 @@ where
     S: futures_core::Stream<Item = Result<GenerationEvent, AppError>> + Unpin,
     F: FnMut(&GenerationEvent) -> Result<(), AppError>,
 {
-    let mut driver = InternalStreamDriver::new();
+    let mut driver = GenerationStreamDriver::new();
     while let Some(item) = stream.next().await {
         let event = item?;
         on_event(&event)?;

@@ -6,7 +6,7 @@ use crate::{
     error::AppError,
     generation::{GenerationRequest, GenerationResult},
     response_store::ResponseStore,
-    upstream::request::{GenerationEventStream, UpstreamClient},
+    upstream::{GenerationEventStream, UpstreamClient},
 };
 use std::sync::Arc;
 

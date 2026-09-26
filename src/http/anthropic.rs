@@ -9,7 +9,7 @@ use crate::{
         AnthropicMessage, CountTokensRequest, MessagesRequest, parse_message, text_value,
     },
     transform::converter::{anthropic_response, anthropic_stop_reason},
-    upstream::request::GenerationAccumulator,
+    upstream::GenerationAccumulator,
 };
 use axum::{
     Json,
