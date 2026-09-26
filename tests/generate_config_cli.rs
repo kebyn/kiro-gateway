@@ -16,21 +16,22 @@ fn generate_config_to_stdout_needs_no_runtime_environment() {
     assert!(output.status.success(), "{}", output_text(&output.stderr));
 
     let config: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(config["version"], 2);
     assert_eq!(config["admin"]["enabled"], true);
-    assert_eq!(config["credential_source"], "env");
-    assert_eq!(config["client_api_key"].as_str().unwrap().len(), 64);
-    assert_eq!(config["admin_api_key"].as_str().unwrap().len(), 64);
-    assert!(output_text(&output.stderr).contains("KIRO_ACCESS_TOKEN"));
+    assert_eq!(config["credential"]["source"], "env");
+    assert_eq!(config["access"]["client_api_key"].as_str().unwrap().len(), 64);
+    assert_eq!(config["admin"]["api_key"].as_str().unwrap().len(), 64);
+    assert!(output_text(&output.stderr).contains("KIRO__CREDENTIAL__ACCESS_TOKEN"));
 }
 
 #[test]
 fn generate_config_does_not_copy_environment_secrets() {
     let secrets = [
-        ("KIRO_CLIENT_API_KEY", "environment-client-secret"),
-        ("KIRO_ADMIN_API_KEY", "environment-admin-secret"),
-        ("KIRO_ACCESS_TOKEN", "environment-access-secret"),
-        ("KIRO_REFRESH_TOKEN", "environment-refresh-secret"),
-        ("KIRO_API_KEY", "environment-upstream-secret"),
+        ("KIRO__ACCESS__CLIENT_API_KEY", "environment-client-secret"),
+        ("KIRO__ADMIN__API_KEY", "environment-admin-secret"),
+        ("KIRO__CREDENTIAL__ACCESS_TOKEN", "environment-access-secret"),
+        ("KIRO__CREDENTIAL__REFRESH_TOKEN", "environment-refresh-secret"),
+        ("KIRO__CREDENTIAL__API_KEY", "environment-upstream-secret"),
     ];
     let mut process = command();
     process.arg("--generate-config");
@@ -55,8 +56,9 @@ fn generate_config_creates_a_new_private_file() {
     assert!(output.stdout.is_empty());
 
     let config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(config["version"], 2);
     assert_eq!(config["admin"]["enabled"], true);
-    assert_eq!(config["credential_source"], "env");
+    assert_eq!(config["credential"]["source"], "env");
 
     #[cfg(unix)]
     {
@@ -103,13 +105,45 @@ fn help_explains_minimum_runtime_credentials() {
     assert!(output.status.success(), "{}", output_text(&output.stderr));
     let stdout = output_text(&output.stdout);
     for expected in [
-        "KIRO_CLIENT_API_KEY",
-        "KIRO_ACCESS_TOKEN",
-        "KIRO_REFRESH_TOKEN",
-        "KIRO_API_KEY",
-        "KIRO_ADMIN_API_KEY",
+        "KIRO__ACCESS__CLIENT_API_KEY",
+        "KIRO__CREDENTIAL__ACCESS_TOKEN",
+        "KIRO__CREDENTIAL__REFRESH_TOKEN",
+        "KIRO__CREDENTIAL__API_KEY",
+        "KIRO__ADMIN__API_KEY",
         "does not create upstream Kiro credentials",
     ] {
         assert!(stdout.contains(expected), "missing {expected:?} in help output");
+    }
+}
+
+#[test]
+fn v2_environment_overrides_are_nested_and_redacted() {
+    let mut process = command();
+    process
+        .args(["--check-config"])
+        .env("KIRO__ACCESS__CLIENT_API_KEY", "client-from-env")
+        .env("KIRO__CREDENTIAL__SOURCE", "env")
+        .env("KIRO__CREDENTIAL__ACCESS_TOKEN", "upstream-secret")
+        .env("KIRO__UPSTREAM__ENDPOINT", "cli")
+        .env("KIRO__ADMIN__COOKIE_SECURE", "false");
+    let output = process.output().unwrap();
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    let config: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(config["version"], 2);
+    assert_eq!(config["access"]["client_api_key"], "[REDACTED]");
+    assert_eq!(config["credential"]["access_token"], "[REDACTED]");
+    assert_eq!(config["upstream"]["endpoint"], "cli");
+    assert_eq!(config["admin"]["cookie_secure"], false);
+}
+
+#[test]
+fn legacy_and_unknown_configuration_environment_variables_are_rejected() {
+    for variable in
+        [("KIRO_CLIENT_API_KEY", "legacy-client"), ("KIRO__UNKNOWN__FIELD", "unexpected")]
+    {
+        let output = command().arg("--check-config").env(variable.0, variable.1).output().unwrap();
+        assert!(!output.status.success(), "{} was unexpectedly accepted", variable.0);
+        let stderr = output_text(&output.stderr);
+        assert!(stderr.contains(variable.0), "missing variable name in: {stderr}");
     }
 }

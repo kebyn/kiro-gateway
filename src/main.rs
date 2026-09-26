@@ -36,7 +36,7 @@ use tokio::sync::oneshot;
     name = "kiro-gateway",
     version,
     about = "Single-tenant Kiro API gateway",
-    after_help = "Runtime configuration:\n  Set KIRO_CLIENT_API_KEY for /v1 authentication.\n  Configure an upstream credential with KIRO_ACCESS_TOKEN, KIRO_REFRESH_TOKEN, or KIRO_API_KEY, or select a JSON/SQLite credential source.\n  Admin is disabled by default; KIRO_ADMIN_API_KEY is required only when Admin is enabled.\n  --generate-config creates random client and Admin keys, but does not create upstream Kiro credentials."
+    after_help = "Runtime configuration:\n  Set KIRO__ACCESS__CLIENT_API_KEY for /v1 authentication.\n  Configure an upstream credential with KIRO__CREDENTIAL__ACCESS_TOKEN, KIRO__CREDENTIAL__REFRESH_TOKEN, or KIRO__CREDENTIAL__API_KEY, or select a JSON/SQLite credential source.\n  Admin is disabled by default; KIRO__ADMIN__API_KEY is required only when Admin is enabled.\n  --generate-config creates random client and Admin keys, but does not create upstream Kiro credentials."
 )]
 struct Args {
     #[arg(long, env = "KIRO_CONFIG", help = "Load configuration from this JSON file")]
@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn generate_config(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
-    const CREDENTIAL_NOTICE: &str = "Set an upstream Kiro credential with KIRO_ACCESS_TOKEN, KIRO_REFRESH_TOKEN, or KIRO_API_KEY before starting the gateway.";
+    const CREDENTIAL_NOTICE: &str = "Set an upstream Kiro credential with KIRO__CREDENTIAL__ACCESS_TOKEN, KIRO__CREDENTIAL__REFRESH_TOKEN, or KIRO__CREDENTIAL__API_KEY before starting the gateway.";
 
     let config = AppConfig::generated_template()?;
     let mut json = serde_json::to_string_pretty(&config)?;

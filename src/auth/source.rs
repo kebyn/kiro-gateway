@@ -40,26 +40,47 @@ pub fn discover(config: &AppConfig) -> Result<Vec<CredentialCandidate>, AppError
                 },
             ));
         }
-        "env" => candidates.extend(env::load()?.into_iter().map(|mut c| {
+        "env" => candidates.extend(env::load(config)?.into_iter().map(|mut c| {
             c.source = Some("environment".into());
             CredentialCandidate { credential: c }
         })),
         "api_key" => {
-            let key = std::env::var("KIRO_API_KEY")
-                .map_err(|_| AppError::Credential("KIRO_API_KEY is not set".into()))?;
+            let key = config
+                .credential_api_key
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| AppError::Credential("credential.api_key is not set".into()))?;
             candidates.push(CredentialCandidate {
                 credential: super::Credential {
                     auth_method: super::AuthMethod::ApiKey,
                     access_token: Some(super::SecretString::new(key)),
                     api_region: config.api_region.clone(),
-                    endpoint: config.endpoint.clone(),
-                    machine_id: uuid::Uuid::new_v4().to_string(),
+                    endpoint: if config.endpoint == "auto" {
+                        "ide".into()
+                    } else {
+                        config.endpoint.clone()
+                    },
+                    machine_id: config
+                        .credential_machine_id
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    client_id: config
+                        .credential_client_id
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(super::SecretString::new),
+                    client_secret: config
+                        .credential_client_secret
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(super::SecretString::new),
                     ..Default::default()
                 },
             });
         }
         "auto" => {
-            candidates.extend(env::load()?.into_iter().map(|mut c| {
+            candidates.extend(env::load(config)?.into_iter().map(|mut c| {
                 c.source = Some("environment".into());
                 CredentialCandidate { credential: c }
             }));
