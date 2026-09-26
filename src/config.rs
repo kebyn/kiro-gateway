@@ -479,9 +479,6 @@ impl AppConfig {
         if let Some(value) = env_string("KIRO__CREDENTIAL__MACHINE_ID") {
             self.credential_machine_id = Some(value);
         }
-        if let Some(value) = env_string("KIRO__CREDENTIAL__API_REGION") {
-            self.api_region = value;
-        }
         if let Some(value) = env_string("KIRO__UPSTREAM__ENDPOINT") {
             self.endpoint = value;
         }

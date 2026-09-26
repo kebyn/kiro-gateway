@@ -138,9 +138,11 @@ fn v2_environment_overrides_are_nested_and_redacted() {
 
 #[test]
 fn legacy_and_unknown_configuration_environment_variables_are_rejected() {
-    for variable in
-        [("KIRO_CLIENT_API_KEY", "legacy-client"), ("KIRO__UNKNOWN__FIELD", "unexpected")]
-    {
+    for variable in [
+        ("KIRO_CLIENT_API_KEY", "legacy-client"),
+        ("KIRO__UNKNOWN__FIELD", "unexpected"),
+        ("KIRO__CREDENTIAL__API_REGION", "us-east-1"),
+    ] {
         let output = command().arg("--check-config").env(variable.0, variable.1).output().unwrap();
         assert!(!output.status.success(), "{} was unexpectedly accepted", variable.0);
         let stderr = output_text(&output.stderr);
