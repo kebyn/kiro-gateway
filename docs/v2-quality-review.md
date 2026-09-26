@@ -78,14 +78,16 @@ SHA-256 校验过的 0.20.2 静态二进制；这不改变项目 Rust 工具链�
 
 ## v2 最终验证记录
 
-以下命令在代码最终提交（`3819493`；不含本节后续文档提交）上通过；验证过程未输出真实凭据或请求正文：
+以下命令在代码最终提交（`ade24cf`；不含本节后续文档提交）上通过；验证过程未输出真实凭据或请求正文：
 
 - `make check`：前端生成一致、秘密扫描、格式检查和严格 Clippy 通过。
-- `make test`：Rust 单元/集成测试 164 项通过、2 项真实环境测试按设计忽略；配置 CLI
+- `make test`：Rust 单元/集成测试 165 项通过、2 项真实环境测试按设计忽略；配置 CLI
   测试 9 项通过。
+- 上游非成功响应的错误正文按 `max_upstream_body_bytes` 及 4 KiB 预览上限流式读取；回归
+  测试覆盖超限错误正文不会被无界缓冲。
 - `make package`、`make audit`、`make deny`：打包、RustSec advisory、许可证/来源策略通过。
 - `make reproducible`：两次隔离 release 构建 SHA-256 均为
-  `fef1f48f647952ef31184539a116392e43bf4f220d860b50e37278adafe08ca4`，并通过绝对路径检查。
+  `056e6ccbc750350b822a07b6180c61f41b78791d5d81148c28699ec118241ef2`，并通过绝对路径检查。
   路径检查使用目录分隔符匹配，避免仓库根目录名恰好是 `/data` 时误匹配
   `~/.local/share/kiro-cli/data.sqlite3` 等正常字符串。
 - `make docker`：固定 Rust/Debian digest 镜像构建成功，镜像以 UID `10001` 非 root 运行。
