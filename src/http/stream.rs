@@ -4,13 +4,13 @@
 
 use crate::{
     error::AppError,
-    protocol::internal::{InternalEvent, InternalResponse},
-    upstream::request::InternalEventAccumulator,
+    generation::{GenerationEvent, GenerationResult},
+    upstream::request::GenerationAccumulator,
 };
 use futures_util::StreamExt;
 
 pub struct InternalStreamDriver {
-    accumulator: InternalEventAccumulator,
+    accumulator: GenerationAccumulator,
     terminal_emitted: bool,
 }
 
@@ -22,14 +22,14 @@ impl Default for InternalStreamDriver {
 
 impl InternalStreamDriver {
     pub fn new() -> Self {
-        Self { accumulator: InternalEventAccumulator::new(), terminal_emitted: false }
+        Self { accumulator: GenerationAccumulator::new(), terminal_emitted: false }
     }
 
-    pub fn push(&mut self, event: InternalEvent) -> Result<(), AppError> {
+    pub fn push(&mut self, event: GenerationEvent) -> Result<(), AppError> {
         self.accumulator.push(event)
     }
 
-    pub fn finish(mut self) -> InternalResponse {
+    pub fn finish(mut self) -> GenerationResult {
         self.terminal_emitted = true;
         self.accumulator.finish()
     }
@@ -38,10 +38,10 @@ impl InternalStreamDriver {
 /// Consumes an internal stream through one accumulator path. The callback is
 /// invoked before the event is accumulated, allowing a protocol adapter to
 /// emit deltas while retaining one consistent error/EOF policy.
-pub async fn drive<S, F>(mut stream: S, mut on_event: F) -> Result<InternalResponse, AppError>
+pub async fn drive<S, F>(mut stream: S, mut on_event: F) -> Result<GenerationResult, AppError>
 where
-    S: futures_core::Stream<Item = Result<InternalEvent, AppError>> + Unpin,
-    F: FnMut(&InternalEvent) -> Result<(), AppError>,
+    S: futures_core::Stream<Item = Result<GenerationEvent, AppError>> + Unpin,
+    F: FnMut(&GenerationEvent) -> Result<(), AppError>,
 {
     let mut driver = InternalStreamDriver::new();
     while let Some(item) = stream.next().await {

@@ -1,5 +1,5 @@
-use crate::protocol::internal::{
-    InternalMessage, InternalRequest, InternalTool, InternalToolCall, InternalToolResult,
+use crate::generation::{
+    ContentPart, GenerationRequest, Message, Role, ToolCall, ToolDefinition, ToolResult,
     content_text,
 };
 use serde::Deserialize;
@@ -60,8 +60,11 @@ impl ChatRequest {
     pub fn validate(&self) -> Result<(), String> {
         validate_tool_choice(self.tool_choice.as_ref())?;
         for message in &self.messages {
-            let content = message.content.clone().unwrap_or(Value::Null);
-            InternalMessage::new(message.role.as_str(), content).validate_content()?;
+            let role = Role::parse(&message.role)?;
+            parse_content(message.content.as_ref().unwrap_or(&Value::Null))?;
+            if role == Role::Tool && message.tool_call_id.as_deref().is_none_or(str::is_empty) {
+                return Err("Chat tool message requires tool_call_id".into());
+            }
             for call in &message.tool_calls {
                 if call.r#type != "function" {
                     return Err(format!("unsupported Chat tool call type: {}", call.r#type));
@@ -89,13 +92,13 @@ fn validate_tool_choice(choice: Option<&Value>) -> Result<(), String> {
     }
 }
 
-impl From<ChatRequest> for InternalRequest {
-    fn from(value: ChatRequest) -> Self {
+impl ChatRequest {
+    pub fn into_generation(self) -> Result<GenerationRequest, String> {
         let mut system_parts = Vec::new();
         let mut messages = Vec::new();
-        for message in value.messages {
-            let parsed = parse_message(message);
-            if matches!(parsed.role.as_str(), "system" | "developer") {
+        for message in self.messages {
+            let parsed = parse_message(message)?;
+            if parsed.role.is_instruction() {
                 let text = content_text(&parsed);
                 if !text.is_empty() {
                     system_parts.push(text);
@@ -104,15 +107,15 @@ impl From<ChatRequest> for InternalRequest {
                 messages.push(parsed);
             }
         }
-        Self {
-            model: value.model,
+        Ok(GenerationRequest {
+            model: self.model,
             messages,
             system: (!system_parts.is_empty()).then(|| system_parts.join("\n\n")),
-            tools: value
+            tools: self
                 .tools
                 .into_iter()
                 .filter(|t| t.r#type == "function")
-                .map(|t| InternalTool {
+                .map(|t| ToolDefinition {
                     name: t.function.name,
                     description: t.function.description,
                     input_schema: t.function.parameters,
@@ -121,19 +124,20 @@ impl From<ChatRequest> for InternalRequest {
                     namespace: None,
                 })
                 .collect(),
-            tool_choice: value.tool_choice,
-            stream: value.stream,
-            max_tokens: value.max_tokens,
-            temperature: value.temperature,
+            stream: self.stream,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
             conversation_id: None,
             instructions: None,
-        }
+            opaque_history: Vec::new(),
+        })
     }
 }
 
-fn parse_message(message: ChatMessage) -> InternalMessage {
+fn parse_message(message: ChatMessage) -> Result<Message, String> {
+    let role = Role::parse(&message.role)?;
     let content = message.content.unwrap_or(Value::Null);
-    let mut parsed = InternalMessage::new(message.role, content.clone());
+    let mut parsed = Message::new(role, parse_content(&content)?);
     parsed.name = message.name;
     parsed.tool_call_id = message.tool_call_id.clone();
     parsed.tool_calls = message
@@ -142,16 +146,44 @@ fn parse_message(message: ChatMessage) -> InternalMessage {
         .filter(|call| call.r#type == "function")
         .map(|call| {
             let (arguments, complete) = parse_arguments(Value::String(call.function.arguments));
-            InternalToolCall { id: call.id, name: call.function.name, arguments, complete }
+            ToolCall { id: call.id, name: call.function.name, arguments, complete }
         })
         .collect();
-    if parsed.role == "tool" {
+    if parsed.role == Role::Tool {
         if let Some(tool_call_id) = message.tool_call_id {
-            parsed.tool_results.push(InternalToolResult { tool_call_id, content, is_error: false });
-            parsed.content = Value::Null;
+            parsed.tool_results.push(ToolResult { tool_call_id, content, is_error: false });
+            parsed.content.clear();
         }
     }
-    parsed
+    Ok(parsed)
+}
+
+fn parse_content(value: &Value) -> Result<Vec<ContentPart>, String> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(text) => Ok(vec![ContentPart::text(text)]),
+        Value::Array(items) => items.iter().try_fold(Vec::new(), |mut parts, item| {
+            parts.extend(parse_content(item)?);
+            Ok(parts)
+        }),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("text" | "input_text" | "output_text") => object
+                .get("text")
+                .or_else(|| object.get("input_text"))
+                .or_else(|| object.get("output_text"))
+                .and_then(Value::as_str)
+                .map(|text| vec![ContentPart::text(text)])
+                .ok_or_else(|| "Chat text content part requires text".to_owned()),
+            Some("thinking" | "reasoning") => object
+                .get("thinking")
+                .or_else(|| object.get("text"))
+                .and_then(Value::as_str)
+                .map(|text| vec![ContentPart::thinking(text)])
+                .ok_or_else(|| "Chat reasoning content part requires text".to_owned()),
+            _ => Err("unsupported content in Chat message; only text and reasoning content are supported".into()),
+        },
+        _ => Err("unsupported content in Chat message; only text content is supported".into()),
+    }
 }
 
 fn parse_arguments(arguments: Value) -> (Value, bool) {
@@ -170,7 +202,7 @@ fn parse_arguments(arguments: Value) -> (Value, bool) {
 #[cfg(test)]
 mod tests {
     use super::ChatRequest;
-    use crate::protocol::internal::InternalRequest;
+    use crate::generation::GenerationRequest;
 
     #[test]
     fn preserves_parallel_calls_and_tool_messages() {
@@ -187,7 +219,7 @@ mod tests {
         }))
         .unwrap();
 
-        let internal: InternalRequest = request.into();
+        let internal: GenerationRequest = request.into_generation().unwrap();
         assert_eq!(internal.messages[0].tool_calls.len(), 2);
         assert_eq!(internal.messages[0].tool_calls[1].arguments["value"], 2);
         assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_a");
@@ -206,7 +238,7 @@ mod tests {
         }))
         .unwrap();
 
-        let internal: InternalRequest = request.into();
+        let internal: GenerationRequest = request.into_generation().unwrap();
         assert_eq!(internal.messages.len(), 1);
         assert_eq!(internal.messages[0].role, "user");
         assert_eq!(internal.system.as_deref(), Some("Follow the policy.\n\nBe concise."));
@@ -244,7 +276,7 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let internal: InternalRequest = request.into();
+        let internal: GenerationRequest = request.into_generation().unwrap();
         assert!(!internal.messages[0].tool_calls[0].complete);
         assert_eq!(internal.messages[0].tool_calls[0].arguments, "{\"q\":");
     }

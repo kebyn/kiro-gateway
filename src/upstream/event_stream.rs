@@ -3,7 +3,7 @@ use crc::{CRC_32_ISO_HDLC, Crc};
 use serde_json::Value;
 
 use super::error::UpstreamStreamError;
-use crate::protocol::internal::InternalEvent;
+use crate::generation::GenerationEvent;
 
 const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
@@ -114,7 +114,7 @@ fn parse_headers(mut bytes: &[u8]) -> Result<Vec<(String, String)>, UpstreamStre
 
 pub fn decode_internal_events(
     message: &EventMessage,
-) -> Result<Vec<InternalEvent>, UpstreamStreamError> {
+) -> Result<Vec<GenerationEvent>, UpstreamStreamError> {
     let parsed = if message.payload.is_empty() {
         Ok(Value::Object(serde_json::Map::new()))
     } else {
@@ -139,7 +139,7 @@ pub fn decode_internal_events(
         .map(|(_, v)| v.as_str())
         .unwrap_or_else(|| value.get("eventType").and_then(Value::as_str).unwrap_or(""));
     match kind {
-        "assistantResponseEvent" | "assistant_response" => Ok(vec![InternalEvent::TextDelta {
+        "assistantResponseEvent" | "assistant_response" => Ok(vec![GenerationEvent::TextDelta {
             text: value
                 .get("content")
                 .or_else(|| value.get("text"))
@@ -147,7 +147,7 @@ pub fn decode_internal_events(
                 .unwrap_or_default()
                 .to_owned(),
         }]),
-        "reasoningContentEvent" | "reasoning_content" => Ok(vec![InternalEvent::ThinkingDelta {
+        "reasoningContentEvent" | "reasoning_content" => Ok(vec![GenerationEvent::ThinkingDelta {
             text: value
                 .get("text")
                 .or_else(|| value.get("content"))
@@ -162,20 +162,20 @@ pub fn decode_internal_events(
             let name = string_field(&value, &["name", "toolName", "tool_name"]);
             let mut events = Vec::new();
             if name.is_some() || !id.is_empty() {
-                events.push(InternalEvent::ToolCallStart {
+                events.push(GenerationEvent::ToolCallStart {
                     id: id.clone(),
                     name: name.unwrap_or_default().to_owned(),
                 });
             }
             if let Some(arguments) = value.get("input").or_else(|| value.get("content")) {
-                events.push(InternalEvent::ToolCallDelta {
+                events.push(GenerationEvent::ToolCallDelta {
                     id: id.clone(),
                     arguments: value_to_fragment(arguments),
                     name: None,
                 });
             }
             if bool_field(&value, &["stop", "isStop", "done"]) {
-                events.push(InternalEvent::ToolCallEnd { id, complete: true });
+                events.push(GenerationEvent::ToolCallEnd { id, complete: true });
             }
             Ok(events)
         }
@@ -184,20 +184,20 @@ pub fn decode_internal_events(
             let output_tokens = number_field(&value, &["outputTokens", "output_tokens"]);
             let mut events = Vec::new();
             if input_tokens.is_some() || output_tokens.is_some() {
-                events.push(InternalEvent::Usage {
-                    usage: crate::protocol::internal::Usage::new(
+                events.push(GenerationEvent::Usage {
+                    usage: crate::generation::Usage::new(
                         input_tokens.unwrap_or_default(),
                         output_tokens.unwrap_or_default(),
                     ),
                 });
             }
             if let Some(reason) = string_field(&value, &["stopReason", "stop_reason"]) {
-                events.push(InternalEvent::Stop { reason: reason.to_owned() });
+                events.push(GenerationEvent::Stop { reason: reason.into() });
             }
             Ok(events)
         }
         "contextUsageEvent" | "context_usage" | "meteringEvent" | "metering" => Ok(Vec::new()),
-        "error" | "errorEvent" => Ok(vec![InternalEvent::Error {
+        "error" | "errorEvent" => Ok(vec![GenerationEvent::Error {
             message: value
                 .get("message")
                 .and_then(Value::as_str)
@@ -214,7 +214,9 @@ pub fn decode_internal_events(
 /// time. New code should use `decode_internal_events`, because one tool frame
 /// can carry a name, input, and stop marker simultaneously.
 #[cfg(test)]
-pub fn decode_internal_event(message: &EventMessage) -> Result<InternalEvent, UpstreamStreamError> {
+pub fn decode_internal_event(
+    message: &EventMessage,
+) -> Result<GenerationEvent, UpstreamStreamError> {
     let header_kind = header(message, ":event-type");
     if matches!(header_kind, Some("toolUseEvent" | "tool_use")) {
         let value: Value = serde_json::from_slice(&message.payload)
@@ -227,7 +229,7 @@ pub fn decode_internal_event(message: &EventMessage) -> Result<InternalEvent, Up
             .or_else(|| value.get("content"))
             .map(value_to_fragment)
             .unwrap_or_default();
-        return Ok(InternalEvent::ToolCallDelta {
+        return Ok(GenerationEvent::ToolCallDelta {
             id,
             arguments,
             name: string_field(&value, &["name", "toolName", "tool_name"]).map(ToOwned::to_owned),
@@ -274,7 +276,7 @@ fn number_field(value: &Value, names: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{CRC32, EventStreamDecoder, decode_internal_event, decode_internal_events};
-    use crate::protocol::internal::InternalEvent;
+    use crate::generation::GenerationEvent;
 
     fn frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
         frame_with_headers(&[(":event-type", event_type)], payload)
@@ -337,9 +339,9 @@ mod tests {
         assert_eq!(
             events,
             [
-                InternalEvent::ThinkingDelta { text: "thinking".into() },
-                InternalEvent::Usage { usage: crate::protocol::internal::Usage::new(3, 5) },
-                InternalEvent::Stop { reason: "MAX_TOKENS".into() },
+                GenerationEvent::ThinkingDelta { text: "thinking".into() },
+                GenerationEvent::Usage { usage: crate::generation::Usage::new(3, 5) },
+                GenerationEvent::Stop { reason: "MAX_TOKENS".into() },
             ]
         );
     }
@@ -364,7 +366,7 @@ mod tests {
         let message = decoder.push(&input).unwrap().pop().unwrap();
         assert_eq!(
             decode_internal_event(&message).unwrap(),
-            InternalEvent::ToolCallDelta {
+            GenerationEvent::ToolCallDelta {
                 id: "call".into(),
                 arguments: "{\"q\":".into(),
                 name: Some("lookup".into()),

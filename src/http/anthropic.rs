@@ -1,17 +1,15 @@
 #[cfg(test)]
-use crate::protocol::internal::InternalResponse;
+use crate::generation::GenerationResult;
 use crate::transform::truncation::XmlLeakFilter;
 use crate::{
     AppState,
     error::{AppError, Protocol, protocol_error_response},
-    protocol::{
-        anthropic::{
-            AnthropicMessage, CountTokensRequest, MessagesRequest, parse_message, text_value,
-        },
-        internal::{InternalEvent, InternalRequest, content_text},
+    generation::{GenerationEvent, GenerationRequest, content_text},
+    protocol::anthropic::{
+        AnthropicMessage, CountTokensRequest, MessagesRequest, parse_message, text_value,
     },
     transform::converter::{anthropic_response, anthropic_stop_reason},
-    upstream::request::InternalEventAccumulator,
+    upstream::request::GenerationAccumulator,
 };
 use axum::{
     Json,
@@ -78,7 +76,7 @@ pub async fn messages(
     Json(body): Json<MessagesRequest>,
 ) -> Result<Response, AppError> {
     body.validate().map_err(AppError::BadRequest)?;
-    let mut request: InternalRequest = body.into();
+    let mut request: GenerationRequest = body.into_generation().map_err(AppError::BadRequest)?;
     request.model = state.token_manager.resolve_model(&request.model).await?;
     tracing::debug!(
         protocol = "anthropic",
@@ -115,7 +113,7 @@ pub async fn messages(
         yield Ok::<Event, Infallible>(Event::default().event("message_start").data(start.to_string()));
 
         let mut upstream = upstream;
-        let mut accumulator = InternalEventAccumulator::new();
+        let mut accumulator = GenerationAccumulator::new();
         let mut text_index = None;
         let mut thinking_index = None;
         let mut tool_indices = HashMap::<String, usize>::new();
@@ -137,7 +135,7 @@ pub async fn messages(
                     break;
                 }
             };
-            if let InternalEvent::Error { message } = &event {
+            if let GenerationEvent::Error { message } = &event {
                 tracing::warn!(model = %model, error_class = "upstream", "Anthropic upstream returned an error event");
                 yield Ok(Event::default().event("error").data(json!({"type":"error","error":{"type":"upstream_error","message":message}}).to_string()));
                 yield Ok(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string()));
@@ -151,7 +149,7 @@ pub async fn messages(
                 break;
             }
             match event {
-                InternalEvent::TextDelta { text } => {
+                GenerationEvent::TextDelta { text } => {
                     if let Some(index) = thinking_index {
                         if closed_blocks.insert(index) {
                             yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
@@ -173,7 +171,7 @@ pub async fn messages(
                         yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}).to_string()));
                     }
                 }
-                InternalEvent::ThinkingDelta { text } => {
+                GenerationEvent::ThinkingDelta { text } => {
                     if let Some(index) = text_index {
                         if closed_blocks.insert(index) {
                             yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
@@ -194,7 +192,7 @@ pub async fn messages(
                         yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}}).to_string()));
                     }
                 }
-                InternalEvent::ToolCallStart { id, name } => {
+                GenerationEvent::ToolCallStart { id, name } => {
                     for index in [text_index, thinking_index].into_iter().flatten() {
                         if closed_blocks.insert(index) {
                             yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
@@ -214,7 +212,7 @@ pub async fn messages(
                     }
                     active_tool = Some(key);
                 }
-                InternalEvent::ToolCallDelta { id, arguments, name } => {
+                GenerationEvent::ToolCallDelta { id, arguments, name } => {
                     for index in [text_index, thinking_index].into_iter().flatten() {
                         if closed_blocks.insert(index) {
                             yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":index}).to_string()));
@@ -238,7 +236,7 @@ pub async fn messages(
                         yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":tool_indices[&key],"delta":{"type":"input_json_delta","partial_json":arguments}}).to_string()));
                     }
                 }
-                InternalEvent::ToolCallEnd { id, .. } => {
+                GenerationEvent::ToolCallEnd { id, .. } => {
                     let key = if id.is_empty() { active_tool.clone() } else { Some(id) };
                     if let Some(key) = key {
                         if let Some(index) = tool_indices.get(&key).copied() {
@@ -249,8 +247,8 @@ pub async fn messages(
                         if active_tool.as_deref() == Some(key.as_str()) { active_tool = None; }
                     }
                 }
-                InternalEvent::Usage { .. } | InternalEvent::Stop { .. } => {}
-                InternalEvent::Error { .. } => unreachable!(),
+                GenerationEvent::Usage { .. } | GenerationEvent::Stop { .. } => {}
+                GenerationEvent::Error { .. } => unreachable!(),
             }
         }
         if failed { return; }
@@ -299,7 +297,7 @@ pub async fn messages(
 #[cfg(test)]
 fn anthropic_stream_events(
     payload: &serde_json::Value,
-    response: &InternalResponse,
+    response: &GenerationResult,
 ) -> Vec<(&'static str, serde_json::Value)> {
     let mut events = vec![(
         "message_start",
@@ -382,10 +380,8 @@ pub async fn count_tokens(
             let parsed = parse_message(AnthropicMessage {
                 role: message.role.clone(),
                 content: message.content.clone(),
-            });
-            if let Err(error) = parsed.validate_content() {
-                return Err(AppError::BadRequest(error));
-            }
+            })
+            .map_err(AppError::BadRequest)?;
             Ok(content_text(&parsed))
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -406,8 +402,8 @@ mod tests {
         config::AppConfig,
         credential::TokenManager,
         error::AppError,
+        generation::{GenerationResult, ToolCall},
         model_catalog::ModelInfo,
-        protocol::internal::{InternalResponse, InternalToolCall},
         response_store::ResponseStore,
         transform::converter::anthropic_response,
     };
@@ -626,15 +622,15 @@ mod tests {
 
     #[test]
     fn streams_tool_use_blocks_with_protocol_indices() {
-        let response = InternalResponse {
+        let response = GenerationResult {
             tool_calls: vec![
-                InternalToolCall {
+                ToolCall {
                     id: "call_a".into(),
                     name: "alpha".into(),
                     arguments: json!({"a":1}),
                     complete: true,
                 },
-                InternalToolCall {
+                ToolCall {
                     id: "call_b".into(),
                     name: "beta".into(),
                     arguments: json!({"b":2}),

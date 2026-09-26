@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::protocol::internal::InternalToolCall;
+use crate::generation::ToolCall;
 
 #[derive(Clone, Debug)]
 struct ToolBuffer {
@@ -133,14 +133,10 @@ impl ToolCallAccumulator {
     }
 
     #[cfg(test)]
-    pub fn finish(&mut self, id: Option<&str>) -> Option<InternalToolCall> {
+    pub fn finish(&mut self, id: Option<&str>) -> Option<ToolCall> {
         self.finish_with_state(id, true)
     }
-    pub fn finish_with_state(
-        &mut self,
-        id: Option<&str>,
-        complete: bool,
-    ) -> Option<InternalToolCall> {
+    pub fn finish_with_state(&mut self, id: Option<&str>, complete: bool) -> Option<ToolCall> {
         let key = id
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
@@ -160,7 +156,7 @@ impl ToolCallAccumulator {
         }
     }
 
-    pub fn finish_all(&mut self) -> Vec<InternalToolCall> {
+    pub fn finish_all(&mut self) -> Vec<ToolCall> {
         for buffer in self.buffers.values_mut().filter(|buffer| !buffer.ended) {
             buffer.complete = arguments_are_complete(&buffer.arguments);
             buffer.ended = true;
@@ -172,7 +168,7 @@ impl ToolCallAccumulator {
         self.buffers.values().any(|b| !b.complete)
     }
     #[cfg(test)]
-    pub fn calls(&self) -> Vec<InternalToolCall> {
+    pub fn calls(&self) -> Vec<ToolCall> {
         self.arrival_order.iter().filter_map(|key| self.buffers.get(key).map(to_call)).collect()
     }
 }
@@ -182,14 +178,14 @@ fn arguments_are_complete(arguments: &str) -> bool {
         || serde_json::from_str::<Value>(arguments).is_ok_and(|value| value.is_object())
 }
 
-fn to_call(buffer: &ToolBuffer) -> InternalToolCall {
+fn to_call(buffer: &ToolBuffer) -> ToolCall {
     let arguments = if buffer.arguments.trim().is_empty() {
         serde_json::json!({})
     } else {
         serde_json::from_str::<Value>(&buffer.arguments)
             .unwrap_or_else(|_| Value::String(buffer.arguments.clone()))
     };
-    InternalToolCall {
+    ToolCall {
         id: buffer.id.clone(),
         name: buffer.name.clone(),
         arguments,

@@ -1,5 +1,6 @@
-use crate::protocol::internal::{
-    InternalMessage, InternalRequest, InternalTool, InternalToolCall, InternalToolResult,
+use crate::generation::{
+    ContentPart, GenerationRequest, Message, Role, ToolCall, ToolDefinition, ToolResult,
+    content_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,7 +55,7 @@ impl MessagesRequest {
     pub fn validate(&self) -> Result<(), String> {
         validate_tool_choice(self.tool_choice.as_ref())?;
         if let Some(system) = &self.system {
-            InternalMessage::new("system", system.clone()).validate_content()?;
+            parse_text_parts(system)?;
         }
         for message in &self.messages {
             validate_message_content(message)?;
@@ -66,7 +67,7 @@ impl MessagesRequest {
 impl CountTokensRequest {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(system) = &self._system {
-            InternalMessage::new("system", system.clone()).validate_content()?;
+            parse_text_parts(system)?;
         }
         for message in &self.messages {
             validate_message_content(message)?;
@@ -88,19 +89,23 @@ fn validate_tool_choice(choice: Option<&Value>) -> Result<(), String> {
 
 fn validate_message_content(message: &AnthropicMessage) -> Result<(), String> {
     parse_message(AnthropicMessage { role: message.role.clone(), content: message.content.clone() })
-        .validate_content()
+        .map(|_| ())
 }
 
-impl From<MessagesRequest> for InternalRequest {
-    fn from(value: MessagesRequest) -> Self {
-        Self {
-            model: value.model,
-            messages: value.messages.into_iter().map(parse_message).collect(),
-            system: value.system.map(|v| text_value(&v)),
-            tools: value
+impl MessagesRequest {
+    pub fn into_generation(self) -> Result<GenerationRequest, String> {
+        Ok(GenerationRequest {
+            model: self.model,
+            messages: self
+                .messages
+                .into_iter()
+                .map(parse_message)
+                .collect::<Result<Vec<_>, _>>()?,
+            system: self.system.map(|value| text_value(&value)),
+            tools: self
                 .tools
                 .into_iter()
-                .map(|tool| InternalTool {
+                .map(|tool| ToolDefinition {
                     name: tool.name,
                     description: tool.description,
                     input_schema: tool.input_schema,
@@ -109,56 +114,93 @@ impl From<MessagesRequest> for InternalRequest {
                     namespace: None,
                 })
                 .collect(),
-            tool_choice: value.tool_choice,
-            stream: value.stream,
-            max_tokens: value.max_tokens,
-            temperature: value.temperature,
+            stream: self.stream,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
             conversation_id: None,
             instructions: None,
-        }
+            opaque_history: Vec::new(),
+        })
     }
 }
 
-pub(crate) fn parse_message(message: AnthropicMessage) -> InternalMessage {
-    let mut parsed = InternalMessage::new(message.role, Value::Null);
-    let mut content = Vec::new();
+pub(crate) fn parse_message(message: AnthropicMessage) -> Result<Message, String> {
+    let role = Role::parse(&message.role)?;
+    if !matches!(role, Role::User | Role::Assistant) {
+        return Err(format!("unsupported Anthropic message role: {role}"));
+    }
+    let mut parsed = Message::empty(role);
     match message.content {
         Value::Array(items) => {
             for item in items {
-                parse_content_block(item, &mut content, &mut parsed);
+                parse_content_block(item, &mut parsed)?;
             }
-            parsed.content = Value::Array(content);
         }
-        value => parsed.content = value,
+        value => parsed.content = parse_text_parts(&value)?,
     }
-    parsed
+    Ok(parsed)
 }
 
-fn parse_content_block(item: Value, content: &mut Vec<Value>, message: &mut InternalMessage) {
+fn parse_content_block(item: Value, message: &mut Message) -> Result<(), String> {
     match item.get("type").and_then(Value::as_str) {
         Some("tool_use") => {
-            if let (Some(id), Some(name)) =
-                (item.get("id").and_then(Value::as_str), item.get("name").and_then(Value::as_str))
-            {
-                let input = item.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
-                message.tool_calls.push(InternalToolCall {
-                    id: id.to_owned(),
-                    name: name.to_owned(),
-                    complete: input.is_object(),
-                    arguments: input,
-                });
-            }
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Anthropic tool_use requires id".to_owned())?;
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Anthropic tool_use requires name".to_owned())?;
+            let input = item.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+            message.tool_calls.push(ToolCall {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                complete: input.is_object(),
+                arguments: input,
+            });
         }
         Some("tool_result") => {
-            if let Some(tool_call_id) = item.get("tool_use_id").and_then(Value::as_str) {
-                message.tool_results.push(InternalToolResult {
-                    tool_call_id: tool_call_id.to_owned(),
-                    content: item.get("content").cloned().unwrap_or(Value::Null),
-                    is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-                });
-            }
+            let tool_call_id = item
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Anthropic tool_result requires tool_use_id".to_owned())?;
+            message.tool_results.push(ToolResult {
+                tool_call_id: tool_call_id.to_owned(),
+                content: item.get("content").cloned().unwrap_or(Value::Null),
+                is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+            });
         }
-        _ => content.push(item),
+        _ => message.content.extend(parse_text_parts(&item)?),
+    }
+    Ok(())
+}
+
+fn parse_text_parts(value: &Value) -> Result<Vec<ContentPart>, String> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(text) => Ok(vec![ContentPart::text(text)]),
+        Value::Array(items) => items.iter().try_fold(Vec::new(), |mut parts, item| {
+            parts.extend(parse_text_parts(item)?);
+            Ok(parts)
+        }),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("text" | "input_text" | "output_text") => object
+                .get("text")
+                .or_else(|| object.get("input_text"))
+                .or_else(|| object.get("output_text"))
+                .and_then(Value::as_str)
+                .map(|text| vec![ContentPart::text(text)])
+                .ok_or_else(|| "Anthropic text block requires text".to_owned()),
+            Some("thinking" | "reasoning") => object
+                .get("thinking")
+                .or_else(|| object.get("text"))
+                .and_then(Value::as_str)
+                .map(|text| vec![ContentPart::thinking(text)])
+                .ok_or_else(|| "Anthropic thinking block requires text".to_owned()),
+            _ => Err("unsupported content in Anthropic message; only text, thinking, and tool blocks are supported".into()),
+        },
+        _ => Err("unsupported content in Anthropic message; only text content is supported".into()),
     }
 }
 
@@ -166,25 +208,21 @@ pub(crate) fn text_value(value: &Value) -> String {
     match value {
         Value::Array(items) => items
             .iter()
-            .map(|item| {
-                crate::protocol::internal::content_text(&InternalMessage::new(
-                    "system",
-                    item.clone(),
-                ))
-            })
+            .filter_map(|item| parse_text_parts(item).ok())
+            .map(|content| content_text(&Message::new(Role::System, content)))
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
-        _ => {
-            crate::protocol::internal::content_text(&InternalMessage::new("system", value.clone()))
-        }
+        _ => parse_text_parts(value)
+            .map(|content| content_text(&Message::new(Role::System, content)))
+            .unwrap_or_default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::MessagesRequest;
-    use crate::protocol::internal::InternalRequest;
+    use crate::generation::GenerationRequest;
 
     #[test]
     fn parses_mixed_tool_calls_and_results() {
@@ -204,13 +242,13 @@ mod tests {
         }))
         .unwrap();
 
-        let internal: InternalRequest = request.into();
+        let internal: GenerationRequest = request.into_generation().unwrap();
         assert_eq!(internal.messages[0].tool_calls.len(), 2);
         assert_eq!(internal.messages[0].tool_calls[0].arguments["city"], "Paris");
         assert_eq!(internal.messages[1].tool_results.len(), 2);
         assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_weather");
         assert!(internal.messages[1].tool_results[1].is_error);
-        assert_eq!(crate::protocol::internal::content_text(&internal.messages[0]), "Checking");
+        assert_eq!(crate::generation::content_text(&internal.messages[0]), "Checking");
     }
 
     #[test]
@@ -225,7 +263,7 @@ mod tests {
         }))
         .unwrap();
 
-        let internal: InternalRequest = request.into();
+        let internal: GenerationRequest = request.into_generation().unwrap();
         assert_eq!(internal.system.as_deref(), Some("Follow the policy.\nBe concise."));
     }
 
@@ -260,7 +298,7 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let internal: InternalRequest = request.into();
+        let internal: GenerationRequest = request.into_generation().unwrap();
         assert!(!internal.messages[0].tool_calls[0].complete);
         assert_eq!(internal.messages[0].tool_calls[0].arguments, "{\"q\":");
     }

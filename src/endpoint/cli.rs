@@ -2,7 +2,7 @@ use crate::{
     auth::Credential,
     endpoint::{KiroEndpoint, conversation_body},
     error::AppError,
-    protocol::internal::InternalRequest,
+    generation::GenerationRequest,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -28,7 +28,7 @@ impl KiroEndpoint for CliEndpoint {
     }
     fn transform_api_body(
         &self,
-        request: &InternalRequest,
+        request: &GenerationRequest,
         credential: &Credential,
     ) -> serde_json::Value {
         let mut body = conversation_body(request, credential, "KIRO_CLI", &request.model);
@@ -111,9 +111,8 @@ mod tests {
     use crate::{
         auth::Credential,
         endpoint::KiroEndpoint,
-        protocol::internal::{InternalMessage, InternalRequest},
+        generation::{GenerationRequest, Message},
     };
-    use serde_json::Value;
 
     #[test]
     fn uses_runtime_cli_endpoint_by_default() {
@@ -128,20 +127,20 @@ mod tests {
     #[test]
     fn uses_cli_origin_and_removes_model_ids_from_history() {
         let endpoint = CliEndpoint::new(None);
-        let request = InternalRequest {
+        let request = GenerationRequest {
             model: "gpt-5.6-luna".into(),
             messages: vec![
-                InternalMessage::new("user", Value::String("old".into())),
-                InternalMessage::new("user", Value::String("current".into())),
+                Message::text(crate::generation::Role::User, "old"),
+                Message::text(crate::generation::Role::User, "current"),
             ],
             system: None,
             tools: Vec::new(),
-            tool_choice: None,
             stream: false,
             max_tokens: None,
             temperature: None,
             conversation_id: None,
             instructions: None,
+            opaque_history: Vec::new(),
         };
         let body = endpoint.transform_api_body(&request, &Credential::default());
         assert_eq!(
@@ -170,17 +169,17 @@ mod tests {
     #[test]
     fn includes_profile_arn_for_runtime_cli_requests() {
         let endpoint = CliEndpoint::new(None);
-        let request = InternalRequest {
+        let request = GenerationRequest {
             model: "gpt-5.6-luna".into(),
-            messages: vec![InternalMessage::new("user", Value::String("current".into()))],
+            messages: vec![Message::text(crate::generation::Role::User, "current")],
             system: None,
             tools: Vec::new(),
-            tool_choice: None,
             stream: false,
             max_tokens: None,
             temperature: None,
             conversation_id: None,
             instructions: None,
+            opaque_history: Vec::new(),
         };
         let credential = Credential {
             profile_arn: Some("arn:aws:codewhisperer:eu-central-1:123:profile/test".into()),

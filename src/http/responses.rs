@@ -1,16 +1,15 @@
 use crate::{
     AppState,
     error::{AppError, Protocol, protocol_error_response},
-    protocol::{
-        internal::{
-            InternalEvent, InternalMessage, InternalResponse, InternalTool, InternalToolCall, Usage,
-        },
-        openai_responses::ResponsesRequest,
+    generation::{
+        ContentPart, GenerationEvent, GenerationResult, Message, Role, StopReason, ToolCall,
+        ToolDefinition, Usage,
     },
+    protocol::openai_responses::ResponsesRequest,
     response_store::{ResponseStatus, ResponseStore},
     transform::converter::responses_incomplete_reason,
     transform::truncation::XmlLeakFilter,
-    upstream::request::InternalEventAccumulator,
+    upstream::request::GenerationAccumulator,
 };
 use axum::{
     Json,
@@ -63,11 +62,7 @@ pub async fn create(
         previous_record.as_ref().map(ResponseStore::extract_tools).unwrap_or_default();
     let store = body.store;
     let stream_response = body.stream;
-    let mut internal = body.into_internal(previous);
-    internal
-        .messages
-        .iter()
-        .try_for_each(|message| message.validate_content().map_err(AppError::BadRequest))?;
+    let mut internal = body.into_generation(previous).map_err(AppError::BadRequest)?;
     if internal.tools.is_empty() {
         internal.tools = previous_tools;
     }
@@ -82,7 +77,7 @@ pub async fn create(
     );
     let model = internal.model.clone();
     let id = format!("resp_{}", uuid::Uuid::now_v7());
-    let stored_messages = response_messages(&internal.messages, &InternalResponse::default());
+    let stored_messages = response_messages(&internal.messages, &GenerationResult::default());
     let initial_payload = response_in_progress_payload(&id, &model);
     let mut record = None;
     if store {
@@ -258,14 +253,14 @@ struct LiveResponseState {
     next_output_index: usize,
     text: String,
     thinking: String,
-    stop_reason: Option<String>,
+    stop_reason: Option<StopReason>,
     usage: Option<Usage>,
 }
 
 #[derive(Clone)]
 struct ResponseSnapshot {
-    messages: Vec<InternalMessage>,
-    tools: Vec<crate::protocol::internal::InternalTool>,
+    messages: Vec<Message>,
+    tools: Vec<crate::generation::ToolDefinition>,
     response: Value,
     status: ResponseStatus,
 }
@@ -301,14 +296,14 @@ impl Drop for IncompleteRecordGuard {
 }
 
 impl LiveResponseState {
-    fn snapshot_response(&self) -> InternalResponse {
-        InternalResponse {
+    fn snapshot_response(&self) -> GenerationResult {
+        GenerationResult {
             text: self.text.clone(),
             thinking: self.thinking.clone(),
             tool_calls: self
                 .tools
                 .iter()
-                .map(|tool| InternalToolCall {
+                .map(|tool| ToolCall {
                     id: tool.call_id.clone(),
                     name: tool.name.clone(),
                     arguments: serde_json::from_str(&tool.arguments)
@@ -398,7 +393,7 @@ impl LiveResponseState {
     }
 }
 
-fn custom_tool_info(name: &str, tools: &[InternalTool]) -> Option<CustomToolInfo> {
+fn custom_tool_info(name: &str, tools: &[ToolDefinition]) -> Option<CustomToolInfo> {
     tools.iter().find(|tool| tool.custom && tool.name == name).map(|tool| CustomToolInfo {
         name: tool.original_name.clone().unwrap_or_else(|| tool.name.clone()),
         namespace: tool.namespace.clone(),
@@ -500,14 +495,14 @@ fn attach_sequence(
 
 fn responses_live_stream(
     state: AppState,
-    mut upstream: crate::upstream::request::InternalEventStream,
+    mut upstream: crate::upstream::request::GenerationEventStream,
     id: String,
     model: String,
-    internal: crate::protocol::internal::InternalRequest,
+    internal: crate::generation::GenerationRequest,
     store: bool,
     record: Option<crate::response_store::ResponseRecord>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
-    let stored_messages = response_messages(&internal.messages, &InternalResponse::default());
+    let stored_messages = response_messages(&internal.messages, &GenerationResult::default());
     let stored_tools = internal.tools.clone();
     let snapshot = Arc::new(Mutex::new(ResponseSnapshot {
         messages: stored_messages.clone(),
@@ -528,7 +523,7 @@ fn responses_live_stream(
         let _disconnect_guard = disconnect_guard;
         let mut sequence = 0_u64;
         let mut live = LiveResponseState::default();
-        let mut accumulator = InternalEventAccumulator::new();
+        let mut accumulator = GenerationAccumulator::new();
         let mut text_filter = XmlLeakFilter::new();
         let mut failed = false;
         let initial = response_in_progress_payload_at(&id, &model, created_at);
@@ -564,7 +559,7 @@ fn responses_live_stream(
                     break;
                 }
             };
-            if let InternalEvent::Error { message } = &event {
+            if let GenerationEvent::Error { message } = &event {
                 let payload = response_failed_payload(&id, &model, message);
                 if store {
                     if let Some(record) = record.clone() {
@@ -591,7 +586,7 @@ fn responses_live_stream(
                 break;
             }
             match event {
-                InternalEvent::TextDelta { text } => {
+                GenerationEvent::TextDelta { text } => {
                     let text = text_filter.push(&text);
                     live.text.push_str(&text);
                     let (item_id, output_index, added) = live.ensure_text();
@@ -610,7 +605,7 @@ fn responses_live_stream(
                         }
                     }
                 }
-                InternalEvent::ToolCallStart { id: call_id, name } => {
+                GenerationEvent::ToolCallStart { id: call_id, name } => {
                     let key = if call_id.is_empty() { format!("tool_call_{}", live.tools.len() + 1) } else { call_id };
                     let custom = custom_tool_info(&name, &stored_tools);
                     let (tool_index, added) = live.ensure_tool(&key, &name, custom);
@@ -631,7 +626,7 @@ fn responses_live_stream(
                         }
                     }
                 }
-                InternalEvent::ToolCallDelta { id: call_id, arguments, name } => {
+                GenerationEvent::ToolCallDelta { id: call_id, arguments, name } => {
                     let key = if call_id.is_empty() { live.tools.last().map(|tool| tool.call_id.clone()).unwrap_or_else(|| format!("tool_call_{}", live.tools.len() + 1)) } else { call_id };
                     let tool_name = name.as_deref().unwrap_or_default();
                     let custom = custom_tool_info(tool_name, &stored_tools);
@@ -662,7 +657,7 @@ fn responses_live_stream(
                         }
                     }
                 }
-                InternalEvent::ToolCallEnd { id: call_id, complete } => {
+                GenerationEvent::ToolCallEnd { id: call_id, complete } => {
                     let key = if call_id.is_empty() { live.tools.last().map(|tool| tool.call_id.clone()) } else { Some(call_id) };
                     if let Some(key) = key {
                         if let Some(tool_index) = live.tool_indices.get(&key).copied() {
@@ -720,7 +715,7 @@ fn responses_live_stream(
                         }
                     }
                 }
-                InternalEvent::ThinkingDelta { text } => {
+                GenerationEvent::ThinkingDelta { text } => {
                     live.thinking.push_str(&text);
                     let (reasoning_index, added) = live.ensure_reasoning();
                     let item_id = live.reasoning[reasoning_index].item_id.clone();
@@ -772,9 +767,9 @@ fn responses_live_stream(
                         }
                     }
                 }
-                InternalEvent::Usage { usage } => live.usage = Some(usage),
-                InternalEvent::Stop { reason } => live.stop_reason = Some(reason),
-                InternalEvent::Error { .. } => unreachable!(),
+                GenerationEvent::Usage { usage } => live.usage = Some(usage),
+                GenerationEvent::Stop { reason } => live.stop_reason = Some(reason),
+                GenerationEvent::Error { .. } => unreachable!(),
             }
             refresh_snapshot(
                 &snapshot,
@@ -918,7 +913,7 @@ fn responses_live_stream(
                             .tool_calls
                             .iter()
                             .find(|call| call.id == tool.call_id)
-                            .map(InternalToolCall::arguments_json)
+                            .map(ToolCall::arguments_json)
                             .unwrap_or_default();
                         let input = custom_input(&arguments);
                         let (done_event, done_payload) = if tool.custom {
@@ -976,8 +971,8 @@ fn responses_live_stream(
 fn responses_payload_with_live_items_and_tools(
     id: &str,
     model: &str,
-    tools: &[InternalTool],
-    response: &InternalResponse,
+    tools: &[ToolDefinition],
+    response: &GenerationResult,
     live: &LiveResponseState,
     created_at: i64,
 ) -> Value {
@@ -1035,8 +1030,8 @@ fn responses_payload_with_live_items_and_tools(
 
 fn refresh_snapshot(
     snapshot: &Arc<Mutex<ResponseSnapshot>>,
-    input_messages: &[InternalMessage],
-    tools: &[crate::protocol::internal::InternalTool],
+    input_messages: &[Message],
+    tools: &[crate::generation::ToolDefinition],
     live: &LiveResponseState,
     id: &str,
     model: &str,
@@ -1052,15 +1047,15 @@ fn refresh_snapshot(
 }
 
 #[cfg(test)]
-fn responses_payload(id: &str, model: &str, response: &InternalResponse) -> Value {
+fn responses_payload(id: &str, model: &str, response: &GenerationResult) -> Value {
     responses_payload_with_tools(id, model, &[], response)
 }
 
 fn responses_payload_with_tools(
     id: &str,
     model: &str,
-    tools: &[InternalTool],
-    response: &InternalResponse,
+    tools: &[ToolDefinition],
+    response: &GenerationResult,
 ) -> Value {
     let incomplete_reason = responses_incomplete_reason(response);
     let status = if incomplete_reason.is_some() { "incomplete" } else { "completed" };
@@ -1129,23 +1124,18 @@ fn responses_payload_with_tools(
     })
 }
 
-fn response_messages(
-    input: &[InternalMessage],
-    response: &InternalResponse,
-) -> Vec<InternalMessage> {
+fn response_messages(input: &[Message], response: &GenerationResult) -> Vec<Message> {
     let mut messages = input.to_vec();
     if !response.text.is_empty() || !response.thinking.is_empty() || !response.tool_calls.is_empty()
     {
-        let content = match (response.thinking.is_empty(), response.text.is_empty()) {
-            (false, false) => json!([
-                {"type":"thinking","thinking":response.thinking.clone()},
-                {"type":"text","text":response.text.clone()}
-            ]),
-            (false, true) => json!([{"type":"thinking","thinking":response.thinking.clone()}]),
-            (true, false) => Value::String(response.text.clone()),
-            (true, true) => Value::Null,
-        };
-        let mut assistant = InternalMessage::new("assistant", content);
+        let mut content = Vec::new();
+        if !response.thinking.is_empty() {
+            content.push(ContentPart::thinking(response.thinking.clone()));
+        }
+        if !response.text.is_empty() {
+            content.push(ContentPart::text(response.text.clone()));
+        }
+        let mut assistant = Message::new(Role::Assistant, content);
         assistant.tool_calls = response.tool_calls.clone();
         messages.push(assistant);
     }
@@ -1406,8 +1396,8 @@ mod tests {
         auth::{AuthMethod, Credential, SecretString},
         config::AppConfig,
         credential::TokenManager,
+        generation::{GenerationResult, Message, ToolCall, ToolDefinition},
         model_catalog::ModelInfo,
-        protocol::internal::{InternalMessage, InternalResponse, InternalTool, InternalToolCall},
         protocol::openai_responses::ResponsesRequest,
         response_store::{ResponseStatus, ResponseStore},
     };
@@ -1422,10 +1412,10 @@ mod tests {
         net::TcpListener,
     };
 
-    fn response(text: &str) -> InternalResponse {
-        InternalResponse {
+    fn response(text: &str) -> GenerationResult {
+        GenerationResult {
             text: text.into(),
-            tool_calls: vec![InternalToolCall {
+            tool_calls: vec![ToolCall {
                 id: "call_upstream".into(),
                 name: "lookup".into(),
                 arguments: json!({"id":42}),
@@ -1639,39 +1629,40 @@ mod tests {
     async fn live_tool_arguments_and_item_completion_keep_arrival_order() {
         let directory = tempfile::tempdir().unwrap();
         let state = state(&directory.path().join("responses.sqlite3"));
-        let internal = crate::protocol::internal::InternalRequest {
+        let internal = crate::generation::GenerationRequest {
             model: "kiro".into(),
-            messages: vec![InternalMessage::new("user", Value::String("lookup".into()))],
+            messages: vec![Message::text(crate::generation::Role::User, "lookup")],
             system: None,
             tools: Vec::new(),
-            tool_choice: None,
             stream: true,
             max_tokens: None,
             temperature: None,
             conversation_id: None,
             instructions: None,
+            opaque_history: Vec::new(),
         };
-        let upstream: crate::upstream::request::InternalEventStream = Box::pin(stream::iter(vec![
-            Ok(crate::protocol::internal::InternalEvent::ToolCallStart {
-                id: "call_1".into(),
-                name: "lookup".into(),
-            }),
-            Ok(crate::protocol::internal::InternalEvent::ToolCallDelta {
-                id: "call_1".into(),
-                arguments: "{\"x\":".into(),
-                name: None,
-            }),
-            Ok(crate::protocol::internal::InternalEvent::ToolCallDelta {
-                id: "call_1".into(),
-                arguments: "1}".into(),
-                name: None,
-            }),
-            Ok(crate::protocol::internal::InternalEvent::ToolCallEnd {
-                id: "call_1".into(),
-                complete: true,
-            }),
-            Ok(crate::protocol::internal::InternalEvent::Stop { reason: "end_turn".into() }),
-        ]));
+        let upstream: crate::upstream::request::GenerationEventStream =
+            Box::pin(stream::iter(vec![
+                Ok(crate::generation::GenerationEvent::ToolCallStart {
+                    id: "call_1".into(),
+                    name: "lookup".into(),
+                }),
+                Ok(crate::generation::GenerationEvent::ToolCallDelta {
+                    id: "call_1".into(),
+                    arguments: "{\"x\":".into(),
+                    name: None,
+                }),
+                Ok(crate::generation::GenerationEvent::ToolCallDelta {
+                    id: "call_1".into(),
+                    arguments: "1}".into(),
+                    name: None,
+                }),
+                Ok(crate::generation::GenerationEvent::ToolCallEnd {
+                    id: "call_1".into(),
+                    complete: true,
+                }),
+                Ok(crate::generation::GenerationEvent::Stop { reason: "end_turn".into() }),
+            ]));
         let response = responses_live_stream(
             state,
             upstream,
@@ -1697,11 +1688,11 @@ mod tests {
     async fn live_custom_tool_emits_custom_input_events_and_output_item() {
         let directory = tempfile::tempdir().unwrap();
         let state = state(&directory.path().join("responses.sqlite3"));
-        let internal = crate::protocol::internal::InternalRequest {
+        let internal = crate::generation::GenerationRequest {
             model: "kiro".into(),
-            messages: vec![InternalMessage::new("user", Value::String("apply patch".into()))],
+            messages: vec![Message::text(crate::generation::Role::User, "apply patch")],
             system: None,
-            tools: vec![InternalTool {
+            tools: vec![ToolDefinition {
                 name: "functions_apply_patch".into(),
                 description: Some("Apply a patch".into()),
                 input_schema: json!({"type":"object"}),
@@ -1709,29 +1700,30 @@ mod tests {
                 original_name: Some("apply_patch".into()),
                 namespace: Some("functions".into()),
             }],
-            tool_choice: None,
             stream: true,
             max_tokens: None,
             temperature: None,
             conversation_id: None,
             instructions: None,
+            opaque_history: Vec::new(),
         };
-        let upstream: crate::upstream::request::InternalEventStream = Box::pin(stream::iter(vec![
-            Ok(crate::protocol::internal::InternalEvent::ToolCallStart {
-                id: "call_custom".into(),
-                name: "functions_apply_patch".into(),
-            }),
-            Ok(crate::protocol::internal::InternalEvent::ToolCallDelta {
-                id: "call_custom".into(),
-                arguments: "{\"input\":\"*** Begin\\n+hello\\n*** End\"}".into(),
-                name: None,
-            }),
-            Ok(crate::protocol::internal::InternalEvent::ToolCallEnd {
-                id: "call_custom".into(),
-                complete: true,
-            }),
-            Ok(crate::protocol::internal::InternalEvent::Stop { reason: "end_turn".into() }),
-        ]));
+        let upstream: crate::upstream::request::GenerationEventStream =
+            Box::pin(stream::iter(vec![
+                Ok(crate::generation::GenerationEvent::ToolCallStart {
+                    id: "call_custom".into(),
+                    name: "functions_apply_patch".into(),
+                }),
+                Ok(crate::generation::GenerationEvent::ToolCallDelta {
+                    id: "call_custom".into(),
+                    arguments: "{\"input\":\"*** Begin\\n+hello\\n*** End\"}".into(),
+                    name: None,
+                }),
+                Ok(crate::generation::GenerationEvent::ToolCallEnd {
+                    id: "call_custom".into(),
+                    complete: true,
+                }),
+                Ok(crate::generation::GenerationEvent::Stop { reason: "end_turn".into() }),
+            ]));
         let response = responses_live_stream(
             state,
             upstream,
@@ -1757,23 +1749,24 @@ mod tests {
     async fn live_reasoning_emits_native_responses_summary_events() {
         let directory = tempfile::tempdir().unwrap();
         let state = state(&directory.path().join("responses.sqlite3"));
-        let internal = crate::protocol::internal::InternalRequest {
+        let internal = crate::generation::GenerationRequest {
             model: "kiro".into(),
-            messages: vec![InternalMessage::new("user", Value::String("think".into()))],
+            messages: vec![Message::text(crate::generation::Role::User, "think")],
             system: None,
             tools: Vec::new(),
-            tool_choice: None,
             stream: true,
             max_tokens: None,
             temperature: None,
             conversation_id: None,
             instructions: None,
+            opaque_history: Vec::new(),
         };
-        let upstream: crate::upstream::request::InternalEventStream = Box::pin(stream::iter(vec![
-            Ok(crate::protocol::internal::InternalEvent::ThinkingDelta { text: "plan".into() }),
-            Ok(crate::protocol::internal::InternalEvent::TextDelta { text: "answer".into() }),
-            Ok(crate::protocol::internal::InternalEvent::Stop { reason: "end_turn".into() }),
-        ]));
+        let upstream: crate::upstream::request::GenerationEventStream =
+            Box::pin(stream::iter(vec![
+                Ok(crate::generation::GenerationEvent::ThinkingDelta { text: "plan".into() }),
+                Ok(crate::generation::GenerationEvent::TextDelta { text: "answer".into() }),
+                Ok(crate::generation::GenerationEvent::Stop { reason: "end_turn".into() }),
+            ]));
         let response = responses_live_stream(
             state,
             upstream,
@@ -1808,19 +1801,19 @@ mod tests {
                 ResponseStatus::InProgress,
             )
             .unwrap();
-        let internal = crate::protocol::internal::InternalRequest {
+        let internal = crate::generation::GenerationRequest {
             model: "kiro".into(),
             messages: Vec::new(),
             system: None,
             tools: Vec::new(),
-            tool_choice: None,
             stream: true,
             max_tokens: None,
             temperature: None,
             conversation_id: None,
             instructions: None,
+            opaque_history: Vec::new(),
         };
-        let upstream: crate::upstream::request::InternalEventStream = Box::pin(stream::pending());
+        let upstream: crate::upstream::request::GenerationEventStream = Box::pin(stream::pending());
         let response = responses_live_stream(
             state.clone(),
             upstream,
@@ -1875,7 +1868,7 @@ mod tests {
 
     #[test]
     fn custom_tool_response_restores_name_namespace_and_freeform_input() {
-        let tools = vec![InternalTool {
+        let tools = vec![ToolDefinition {
             name: "functions_apply_patch".into(),
             description: Some("Apply a patch".into()),
             input_schema: json!({"type":"object"}),
@@ -1883,8 +1876,8 @@ mod tests {
             original_name: Some("apply_patch".into()),
             namespace: Some("functions".into()),
         }];
-        let response = InternalResponse {
-            tool_calls: vec![InternalToolCall {
+        let response = GenerationResult {
+            tool_calls: vec![ToolCall {
                 id: "call_custom".into(),
                 name: "functions_apply_patch".into(),
                 arguments: json!({"input":"*** Begin\n+hello\n*** End"}),
@@ -1908,7 +1901,7 @@ mod tests {
 
     #[test]
     fn reasoning_payload_uses_native_summary_stream_events() {
-        let response = InternalResponse {
+        let response = GenerationResult {
             text: "answer".into(),
             thinking: "plan".into(),
             stop_reason: Some("end_turn".into()),
@@ -1987,7 +1980,7 @@ mod tests {
 
     #[test]
     fn empty_response_has_a_message_output_item() {
-        let payload = responses_payload("resp_test", "kiro", &InternalResponse::default());
+        let payload = responses_payload("resp_test", "kiro", &GenerationResult::default());
         assert_eq!(payload["output"].as_array().unwrap().len(), 1);
         assert_eq!(payload["output"][0]["type"], "message");
         assert_eq!(payload["output"][0]["content"][0]["text"], "");
@@ -1995,7 +1988,7 @@ mod tests {
 
     #[test]
     fn stored_response_replays_tool_call_for_previous_response_id() {
-        let input = vec![InternalMessage::new("user", Value::String("question".into()))];
+        let input = vec![Message::text(crate::generation::Role::User, "question")];
         let messages = response_messages(&input, &response(""));
         let directory = tempfile::tempdir().unwrap();
         let store = ResponseStore::open(directory.path().join("responses.sqlite3")).unwrap();
@@ -2012,7 +2005,7 @@ mod tests {
             "previous_response_id":record.id
         }))
         .unwrap();
-        let internal = continuation.into_internal(replayed);
+        let internal = continuation.into_generation(replayed).unwrap();
         assert_eq!(internal.messages.len(), 3);
         assert_eq!(internal.messages[1].tool_calls[0].id, "call_upstream");
         assert_eq!(internal.messages[1].tool_calls[0].arguments["id"], 42);
@@ -2022,8 +2015,8 @@ mod tests {
 
     #[test]
     fn stored_response_replays_tool_definitions_for_continuation() {
-        use crate::protocol::internal::InternalTool;
-        let input = vec![InternalMessage::new("user", Value::String("question".into()))];
+        use crate::generation::ToolDefinition;
+        let input = vec![Message::text(crate::generation::Role::User, "question")];
         let messages = response_messages(&input, &response(""));
         let directory = tempfile::tempdir().unwrap();
         let store = ResponseStore::open(directory.path().join("responses.sqlite3")).unwrap();
@@ -2032,7 +2025,7 @@ mod tests {
                 "kiro",
                 json!({
                     "messages":messages,
-                    "tools":[InternalTool { name:"lookup".into(), description:None, input_schema:json!({"type":"object"}), custom:false, original_name:None, namespace:None }]
+                    "tools":[ToolDefinition { name:"lookup".into(), description:None, input_schema:json!({"type":"object"}), custom:false, original_name:None, namespace:None }]
                 }),
                 ResponseStatus::Completed,
             )

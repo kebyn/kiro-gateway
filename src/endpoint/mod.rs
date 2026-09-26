@@ -4,9 +4,7 @@ pub mod ide;
 use crate::{
     auth::{AuthMethod, Credential},
     error::AppError,
-    protocol::internal::{
-        InternalMessage, InternalRequest, InternalToolResult, content_text, value_text,
-    },
+    generation::{GenerationRequest, Message, ToolResult, content_text, value_text},
     transform::tool_compression::compress_schema,
 };
 use std::collections::HashSet;
@@ -62,7 +60,7 @@ pub trait KiroEndpoint: Send + Sync {
     fn api_url(&self, credential: &Credential) -> String;
     fn transform_api_body(
         &self,
-        request: &InternalRequest,
+        request: &GenerationRequest,
         credential: &Credential,
     ) -> serde_json::Value;
     fn decorate_api(
@@ -89,7 +87,7 @@ impl EndpointAdapter {
 
     pub fn transform_api_body(
         &self,
-        request: &InternalRequest,
+        request: &GenerationRequest,
         credential: &Credential,
     ) -> serde_json::Value {
         match self {
@@ -147,7 +145,7 @@ mod endpoint_policy_tests {
 }
 
 pub fn conversation_body(
-    request: &InternalRequest,
+    request: &GenerationRequest,
     credential: &Credential,
     origin: &str,
     model_id: &str,
@@ -258,7 +256,7 @@ fn with_instruction_context(
 }
 
 fn active_tool_round(
-    messages: &[InternalMessage],
+    messages: &[Message],
     declared_tools: &HashSet<&str>,
 ) -> Option<ActiveToolRound> {
     if messages.last().is_none_or(|message| message.tool_results.is_empty()) {
@@ -293,7 +291,7 @@ fn active_tool_round(
 }
 
 fn assistant_tool_message(
-    message: &InternalMessage,
+    message: &Message,
     structured_ids: &HashSet<String>,
 ) -> serde_json::Value {
     let mut content = Vec::new();
@@ -330,7 +328,7 @@ fn assistant_tool_message(
     })
 }
 
-fn active_round_text(message: &InternalMessage, structured_ids: &HashSet<String>) -> String {
+fn active_round_text(message: &Message, structured_ids: &HashSet<String>) -> String {
     let mut parts = Vec::new();
     let content = content_text(message);
     if !content.is_empty() {
@@ -346,7 +344,7 @@ fn active_round_text(message: &InternalMessage, structured_ids: &HashSet<String>
     parts.join("\n")
 }
 
-fn tool_result(result: &InternalToolResult) -> serde_json::Value {
+fn tool_result(result: &ToolResult) -> serde_json::Value {
     serde_json::json!({
         "toolUseId": result.tool_call_id,
         "content": tool_result_content(&result.content),
@@ -377,11 +375,7 @@ fn tool_result_content(value: &serde_json::Value) -> Vec<serde_json::Value> {
     }
 }
 
-fn message_to_history(
-    message: &InternalMessage,
-    origin: &str,
-    model_id: &str,
-) -> serde_json::Value {
+fn message_to_history(message: &Message, origin: &str, model_id: &str) -> serde_json::Value {
     match message.role.as_str() {
         "assistant" => {
             serde_json::json!({"assistantResponseMessage":{"content":history_text(message)}})
@@ -392,7 +386,7 @@ fn message_to_history(
     }
 }
 
-fn history_text(message: &InternalMessage) -> String {
+fn history_text(message: &Message) -> String {
     let mut parts = Vec::new();
     let content = content_text(message);
     if !content.is_empty() {
@@ -403,11 +397,11 @@ fn history_text(message: &InternalMessage) -> String {
     parts.join("\n")
 }
 
-fn tool_call_text(call: &crate::protocol::internal::InternalToolCall) -> String {
+fn tool_call_text(call: &crate::generation::ToolCall) -> String {
     format!("[Tool call {} ({})]\n{}", call.name, call.id, call.arguments_json())
 }
 
-fn tool_result_text(result: &InternalToolResult) -> String {
+fn tool_result_text(result: &ToolResult) -> String {
     let status = if result.is_error { " error" } else { "" };
     let content = value_text(&result.content);
     let content = if content.is_empty() { result.content.to_string() } else { content };
@@ -419,19 +413,17 @@ mod tests {
     use super::conversation_body;
     use crate::{
         auth::Credential,
-        protocol::internal::{
-            InternalMessage, InternalRequest, InternalToolCall, InternalToolResult,
-        },
+        generation::{GenerationRequest, Message, ToolCall, ToolResult},
     };
     use serde_json::{Value, json};
 
-    fn request(messages: Vec<InternalMessage>) -> InternalRequest {
-        InternalRequest {
+    fn request(messages: Vec<Message>) -> GenerationRequest {
+        GenerationRequest {
             model: "kiro".into(),
             messages,
             system: None,
             tools: vec![
-                crate::protocol::internal::InternalTool {
+                crate::generation::ToolDefinition {
                     name: "alpha".into(),
                     description: None,
                     input_schema: json!({"type":"object"}),
@@ -439,7 +431,7 @@ mod tests {
                     original_name: None,
                     namespace: None,
                 },
-                crate::protocol::internal::InternalTool {
+                crate::generation::ToolDefinition {
                     name: "beta".into(),
                     description: None,
                     input_schema: json!({"type":"object"}),
@@ -448,38 +440,29 @@ mod tests {
                     namespace: None,
                 },
             ],
-            tool_choice: None,
             stream: false,
             max_tokens: None,
             temperature: None,
             conversation_id: Some("conversation".into()),
             instructions: None,
+            opaque_history: Vec::new(),
         }
     }
 
-    fn call(id: &str, name: &str) -> InternalToolCall {
-        InternalToolCall {
-            id: id.into(),
-            name: name.into(),
-            arguments: json!({"id":id}),
-            complete: true,
-        }
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: name.into(), arguments: json!({"id":id}), complete: true }
     }
 
-    fn result(id: &str, content: Value, is_error: bool) -> InternalMessage {
-        let mut message = InternalMessage::new("tool", Value::Null);
-        message.tool_results.push(InternalToolResult {
-            tool_call_id: id.into(),
-            content,
-            is_error,
-        });
+    fn result(id: &str, content: Value, is_error: bool) -> Message {
+        let mut message = Message::empty(crate::generation::Role::Tool);
+        message.tool_results.push(ToolResult { tool_call_id: id.into(), content, is_error });
         message
     }
 
     #[test]
     fn preserves_system_and_developer_instructions_in_current_prompt() {
         let mut request =
-            request(vec![InternalMessage::new("user", Value::String("answer briefly".into()))]);
+            request(vec![Message::text(crate::generation::Role::User, "answer briefly")]);
         request.system = Some("You are a precise assistant.".into());
         request.instructions = Some("Use concise wording.".into());
 
@@ -492,19 +475,18 @@ mod tests {
 
     #[test]
     fn sends_only_active_tool_round_as_native_kiro_payload() {
-        let mut old_assistant = InternalMessage::new("assistant", Value::Null);
+        let mut old_assistant = Message::empty(crate::generation::Role::Assistant);
         old_assistant.tool_calls.push(call("old", "old_lookup"));
-        let mut active_assistant =
-            InternalMessage::new("assistant", Value::String("Checking".into()));
+        let mut active_assistant = Message::text(crate::generation::Role::Assistant, "Checking");
         active_assistant.tool_calls.push(call("call_a", "alpha"));
         active_assistant.tool_calls.push(call("call_b", "beta"));
         let body = conversation_body(
             &request(vec![
-                InternalMessage::new("user", Value::String("old question".into())),
+                Message::text(crate::generation::Role::User, "old question"),
                 old_assistant,
                 result("old", Value::String("old result".into()), false),
-                InternalMessage::new("assistant", Value::String("old answer".into())),
-                InternalMessage::new("user", Value::String("new question".into())),
+                Message::text(crate::generation::Role::Assistant, "old answer"),
+                Message::text(crate::generation::Role::User, "new question"),
                 active_assistant,
                 result("call_a", Value::String("first".into()), false),
                 result("call_b", json!({"answer":2}), true),
@@ -540,13 +522,13 @@ mod tests {
 
     #[test]
     fn renders_tool_history_as_text_when_no_tools_are_declared() {
-        let mut assistant = InternalMessage::new("assistant", Value::Null);
+        let mut assistant = Message::empty(crate::generation::Role::Assistant);
         assistant.tool_calls.push(call("call_a", "alpha"));
         let body = conversation_body(
-            &InternalRequest {
+            &GenerationRequest {
                 tools: Vec::new(),
                 ..request(vec![
-                    InternalMessage::new("user", Value::String("question".into())),
+                    Message::text(crate::generation::Role::User, "question"),
                     assistant,
                     result("call_a", Value::String("done".into()), false),
                 ])
@@ -574,7 +556,7 @@ mod tests {
 
     #[test]
     fn filters_unknown_duplicate_and_undeclared_tool_results() {
-        let mut assistant = InternalMessage::new("assistant", Value::Null);
+        let mut assistant = Message::empty(crate::generation::Role::Assistant);
         assistant.tool_calls.push(call("call_a", "alpha"));
         assistant.tool_calls.push(call("call_b", "beta"));
         assistant.tool_calls.push(call("call_hidden", "undeclared"));
@@ -582,34 +564,30 @@ mod tests {
         incomplete.complete = false;
         assistant.tool_calls.push(incomplete);
 
-        let mut results = InternalMessage::new("tool", Value::Null);
+        let mut results = Message::empty(crate::generation::Role::Tool);
         results.tool_results = vec![
-            InternalToolResult {
+            ToolResult {
                 tool_call_id: "call_b".into(),
                 content: Value::String(String::new()),
                 is_error: false,
             },
-            InternalToolResult {
+            ToolResult {
                 tool_call_id: "unknown".into(),
                 content: Value::String("orphan".into()),
                 is_error: false,
             },
-            InternalToolResult {
-                tool_call_id: "call_a".into(),
-                content: Value::Null,
-                is_error: true,
-            },
-            InternalToolResult {
+            ToolResult { tool_call_id: "call_a".into(), content: Value::Null, is_error: true },
+            ToolResult {
                 tool_call_id: "call_b".into(),
                 content: Value::String("duplicate".into()),
                 is_error: false,
             },
-            InternalToolResult {
+            ToolResult {
                 tool_call_id: "call_hidden".into(),
                 content: Value::String("hidden result".into()),
                 is_error: false,
             },
-            InternalToolResult {
+            ToolResult {
                 tool_call_id: "call_incomplete".into(),
                 content: Value::String("partial result".into()),
                 is_error: false,
@@ -617,7 +595,7 @@ mod tests {
         ];
         let body = conversation_body(
             &request(vec![
-                InternalMessage::new("user", Value::String("question".into())),
+                Message::text(crate::generation::Role::User, "question"),
                 assistant,
                 results,
             ]),
@@ -653,12 +631,12 @@ mod tests {
 
     #[test]
     fn does_not_keep_a_partial_tool_round_structured() {
-        let mut assistant = InternalMessage::new("assistant", Value::Null);
+        let mut assistant = Message::empty(crate::generation::Role::Assistant);
         assistant.tool_calls.push(call("call_a", "alpha"));
         assistant.tool_calls.push(call("call_b", "beta"));
         let body = conversation_body(
             &request(vec![
-                InternalMessage::new("user", Value::String("question".into())),
+                Message::text(crate::generation::Role::User, "question"),
                 assistant,
                 result("call_a", Value::String("only one result".into()), false),
             ]),

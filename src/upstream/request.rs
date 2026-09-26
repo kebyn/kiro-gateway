@@ -2,7 +2,7 @@ use crate::{
     auth::{AuthMethod, Credential},
     endpoint::{EndpointAdapter, EndpointPolicy, endpoint_for},
     error::AppError,
-    protocol::internal::{InternalEvent, InternalRequest, InternalResponse, Usage},
+    generation::{GenerationEvent, GenerationRequest, GenerationResult, Usage},
     transform::truncation::XmlLeakFilter,
     upstream::{
         error::UpstreamStreamError,
@@ -19,7 +19,8 @@ use serde_json::Value;
 use std::time::Instant;
 use std::{collections::HashSet, pin::Pin};
 
-pub type InternalEventStream = Pin<Box<dyn Stream<Item = Result<InternalEvent, AppError>> + Send>>;
+pub type GenerationEventStream =
+    Pin<Box<dyn Stream<Item = Result<GenerationEvent, AppError>> + Send>>;
 
 pub struct UpstreamClient {
     client: Client,
@@ -53,9 +54,9 @@ impl UpstreamClient {
     /// frame arrives.
     pub async fn event_stream(
         &self,
-        request: &InternalRequest,
+        request: &GenerationRequest,
         credential: &Credential,
-    ) -> Result<InternalEventStream, AppError> {
+    ) -> Result<GenerationEventStream, AppError> {
         let client = self.client.clone();
         let endpoint_policy = self.endpoint_policy;
         let upstream_url = self.upstream_url.clone();
@@ -276,7 +277,7 @@ impl UpstreamClient {
                 if !integrity.completed {
                     integrity.incomplete = true;
                     event_count += 1;
-                    yield Ok(InternalEvent::Stop { reason: "stream_incomplete".into() });
+                    yield Ok(GenerationEvent::Stop { reason: "stream_incomplete".into() });
                 }
                 tracing::debug!(
                     model = %request.model,
@@ -310,7 +311,7 @@ impl SendOnceError {
 async fn send_once(
     client: &Client,
     endpoint: &EndpointAdapter,
-    request: &InternalRequest,
+    request: &GenerationRequest,
     credential: &Credential,
 ) -> Result<reqwest::Response, SendOnceError> {
     let body = endpoint.transform_api_body(request, credential);
@@ -344,21 +345,17 @@ async fn send_once(
     Ok(response)
 }
 
-fn event_marks_completion(event: &InternalEvent) -> bool {
+fn event_marks_completion(event: &GenerationEvent) -> bool {
     matches!(
         event,
-        InternalEvent::Stop { reason }
-            if !matches!(
-                reason.trim().to_ascii_lowercase().as_str(),
-                "incomplete" | "stream_incomplete" | "upstream_disconnect"
-            )
-    ) || matches!(event, InternalEvent::ToolCallEnd { complete: true, .. })
+        GenerationEvent::Stop { reason } if !reason.is_incomplete()
+    ) || matches!(event, GenerationEvent::ToolCallEnd { complete: true, .. })
 }
 
 /// Converts a complete JSON response into the same logical events produced by
 /// the binary EventStream endpoint. JSON is necessarily finite, but downstream
 /// protocol handlers still consume it through the one event path.
-fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
+fn json_events(body: &[u8]) -> Result<Vec<GenerationEvent>, AppError> {
     let body: Value = serde_json::from_slice(body)
         .map_err(|error| AppError::Upstream(format!("invalid JSON upstream response: {error}")))?;
     let mut nodes = Vec::new();
@@ -371,10 +368,10 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
             .or_else(|| error.as_str())
             .unwrap_or("upstream error")
             .to_owned();
-        return Ok(vec![InternalEvent::Error { message }]);
+        return Ok(vec![GenerationEvent::Error { message }]);
     }
     if let Some(message) = json_error_message(&nodes) {
-        return Ok(vec![InternalEvent::Error { message }]);
+        return Ok(vec![GenerationEvent::Error { message }]);
     }
     let mut events = Vec::new();
     let mut recognized = has_explicit_empty_response(&nodes);
@@ -383,7 +380,7 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
         .find_map(|node| json_text(node, &["content", "text", "output_text", "outputText"]))
     {
         if !text.is_empty() {
-            events.push(InternalEvent::TextDelta { text });
+            events.push(GenerationEvent::TextDelta { text });
         }
         recognized = true;
     }
@@ -391,7 +388,7 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
         nodes.iter().find_map(|node| json_text(node, &["thinking", "reasoning", "reasoningText"]))
     {
         if !text.is_empty() {
-            events.push(InternalEvent::ThinkingDelta { text });
+            events.push(GenerationEvent::ThinkingDelta { text });
         }
         recognized = true;
     }
@@ -411,13 +408,13 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
             let name = call.name.clone();
             let arguments = call.arguments_json();
             let complete = call.complete;
-            events.push(InternalEvent::ToolCallStart { id: id.clone(), name });
-            events.push(InternalEvent::ToolCallDelta { id: id.clone(), arguments, name: None });
-            events.push(InternalEvent::ToolCallEnd { id, complete });
+            events.push(GenerationEvent::ToolCallStart { id: id.clone(), name });
+            events.push(GenerationEvent::ToolCallDelta { id: id.clone(), arguments, name: None });
+            events.push(GenerationEvent::ToolCallEnd { id, complete });
         }
     }
     if let Some(usage) = nodes.iter().find_map(|node| node.get("usage")) {
-        events.push(InternalEvent::Usage {
+        events.push(GenerationEvent::Usage {
             usage: Usage::new(
                 usage
                     .get("inputTokens")
@@ -452,7 +449,7 @@ fn json_events(body: &[u8]) -> Result<Vec<InternalEvent>, AppError> {
             json_shape(&body)
         )));
     }
-    events.push(InternalEvent::Stop { reason: reason.unwrap_or_else(|| "end_turn".into()) });
+    events.push(GenerationEvent::Stop { reason: reason.as_deref().unwrap_or("end_turn").into() });
     Ok(events)
 }
 
@@ -594,24 +591,24 @@ fn json_shape(value: &Value) -> String {
 
 /// Shared state machine used by complete responses and by all streaming HTTP
 /// handlers. It preserves tool ordering and the cross-chunk XML filter.
-pub struct InternalEventAccumulator {
-    output: InternalResponse,
+pub struct GenerationAccumulator {
+    output: GenerationResult,
     tools: ToolCallAccumulator,
     xml_filter: XmlLeakFilter,
     integrity: StreamIntegrity,
 }
 
-impl InternalEventAccumulator {
+impl GenerationAccumulator {
     pub fn new() -> Self {
         Self {
-            output: InternalResponse::default(),
+            output: GenerationResult::default(),
             tools: ToolCallAccumulator::new(),
             xml_filter: XmlLeakFilter::new(),
             integrity: StreamIntegrity::default(),
         }
     }
 
-    pub fn push(&mut self, event: InternalEvent) -> Result<(), AppError> {
+    pub fn push(&mut self, event: GenerationEvent) -> Result<(), AppError> {
         apply_internal_event(
             event,
             &mut self.output,
@@ -621,7 +618,7 @@ impl InternalEventAccumulator {
         )
     }
 
-    pub fn finish(mut self) -> InternalResponse {
+    pub fn finish(mut self) -> GenerationResult {
         let tail = self.xml_filter.finish();
         self.output.text.push_str(&tail);
         finish_stream_response(self.output, &mut self.tools)
@@ -629,68 +626,60 @@ impl InternalEventAccumulator {
 }
 
 fn apply_internal_event(
-    event: InternalEvent,
-    output: &mut crate::protocol::internal::InternalResponse,
+    event: GenerationEvent,
+    output: &mut crate::generation::GenerationResult,
     tools: &mut ToolCallAccumulator,
     xml_filter: &mut XmlLeakFilter,
     integrity: &mut StreamIntegrity,
 ) -> Result<(), AppError> {
     match event {
-        InternalEvent::TextDelta { text } => {
+        GenerationEvent::TextDelta { text } => {
             integrity.record_emission();
             output.text.push_str(&xml_filter.push(&text));
         }
-        InternalEvent::ThinkingDelta { text } => {
+        GenerationEvent::ThinkingDelta { text } => {
             integrity.record_emission();
             output.thinking.push_str(&text);
         }
-        InternalEvent::ToolCallStart { id, name } => {
+        GenerationEvent::ToolCallStart { id, name } => {
             tools.start(Some(&id), &name);
         }
-        InternalEvent::ToolCallDelta { id, arguments, name } => {
+        GenerationEvent::ToolCallDelta { id, arguments, name } => {
             if let Some(name) = name {
                 tools.start(Some(&id), &name);
             }
             tools.append(Some(&id), &arguments);
         }
-        InternalEvent::ToolCallEnd { id, complete } => {
+        GenerationEvent::ToolCallEnd { id, complete } => {
             if tools.finish_with_state(Some(&id), complete).is_some_and(|call| call.complete) {
                 integrity.completed = true;
             }
         }
-        InternalEvent::Usage { usage } => output.usage = Some(usage),
-        InternalEvent::Stop { reason } => {
+        GenerationEvent::Usage { usage } => output.usage = Some(usage),
+        GenerationEvent::Stop { reason } => {
             integrity.completed = true;
             output.stop_reason = Some(reason);
         }
-        InternalEvent::Error { message } => return Err(AppError::Upstream(message)),
+        GenerationEvent::Error { message } => return Err(AppError::Upstream(message)),
     }
     Ok(())
 }
 
 fn finish_stream_response(
-    mut output: crate::protocol::internal::InternalResponse,
+    mut output: crate::generation::GenerationResult,
     tools: &mut ToolCallAccumulator,
-) -> crate::protocol::internal::InternalResponse {
+) -> crate::generation::GenerationResult {
     output.tool_calls = tools.finish_all();
     let truncated_without_terminal = output.stop_reason.is_none()
         && output.tool_calls.is_empty()
         && (!output.text.is_empty() || !output.thinking.is_empty());
-    let stopped_incomplete = output.stop_reason.as_deref().is_some_and(|reason| {
+    let stopped_incomplete = output.stop_reason.as_ref().is_some_and(|reason| {
         matches!(
-            reason.trim().to_ascii_lowercase().as_str(),
-            "max_tokens"
-                | "max_output_tokens"
-                | "length"
-                | "model_context_window_exceeded"
-                | "context_window_exceeded"
-                | "refusal"
-                | "content_filter"
-                | "content_filtered"
-                | "guardrail_intervened"
-                | "incomplete"
-                | "stream_incomplete"
-                | "upstream_disconnect"
+            reason,
+            crate::generation::StopReason::MaxTokens
+                | crate::generation::StopReason::ContextWindowExceeded
+                | crate::generation::StopReason::Refusal
+                | crate::generation::StopReason::StreamIncomplete
         )
     });
     output.incomplete = output.tool_calls.iter().any(|call| !call.complete)
@@ -699,9 +688,7 @@ fn finish_stream_response(
     output
 }
 
-fn parse_json_tool_calls(
-    body: &serde_json::Value,
-) -> Vec<crate::protocol::internal::InternalToolCall> {
+fn parse_json_tool_calls(body: &serde_json::Value) -> Vec<crate::generation::ToolCall> {
     let mut items = Vec::new();
     for key in ["toolUses", "tool_uses", "toolUse", "toolCalls", "tool_calls", "toolCall", "output"]
     {
@@ -770,13 +757,13 @@ fn parse_json_tool_calls(
                         item.get("status").and_then(serde_json::Value::as_str),
                         Some("incomplete" | "failed" | "cancelled")
                     );
-            Some(crate::protocol::internal::InternalToolCall { id, name, arguments, complete })
+            Some(crate::generation::ToolCall { id, name, arguments, complete })
         })
         .collect()
 }
 
 #[cfg(test)]
-fn is_empty_stream(response: &crate::protocol::internal::InternalResponse) -> bool {
+fn is_empty_stream(response: &crate::generation::GenerationResult) -> bool {
     response.text.is_empty()
         && response.thinking.is_empty()
         && response.tool_calls.is_empty()
@@ -792,7 +779,7 @@ mod tests {
     use crate::{
         auth::{AuthMethod, Credential, SecretString},
         endpoint::EndpointPolicy,
-        protocol::internal::{InternalEvent, InternalRequest, InternalResponse},
+        generation::{GenerationEvent, GenerationRequest, GenerationResult},
         transform::truncation::XmlLeakFilter,
         upstream::{
             event_stream::{EventStreamDecoder, decode_internal_events},
@@ -871,20 +858,20 @@ mod tests {
             access_token: Some(SecretString::new("token")),
             ..Default::default()
         };
-        let request = InternalRequest {
+        let request = GenerationRequest {
             model: "kiro".into(),
-            messages: vec![crate::protocol::internal::InternalMessage::new(
-                "user",
-                Value::String("hello".into()),
+            messages: vec![crate::generation::Message::text(
+                crate::generation::Role::User,
+                "hello",
             )],
             system: None,
             tools: Vec::new(),
-            tool_choice: None,
             stream: true,
             max_tokens: None,
             temperature: None,
             conversation_id: None,
             instructions: None,
+            opaque_history: Vec::new(),
         };
         let mut events = client.event_stream(&request, &credential).await.unwrap();
         let mut collected = Vec::new();
@@ -894,14 +881,14 @@ mod tests {
         server.await.unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(
-            matches!(&collected[..], [InternalEvent::TextDelta { text }, InternalEvent::Stop { reason }] if text == "ok" && reason == "end_turn")
+            matches!(&collected[..], [GenerationEvent::TextDelta { text }, GenerationEvent::Stop { reason }] if text == "ok" && reason == "end_turn")
         );
     }
 
     #[test]
     fn incomplete_terminal_reason_is_not_reported_as_completed() {
         let response = finish_stream_response(
-            InternalResponse {
+            GenerationResult {
                 text: "partial".into(),
                 stop_reason: Some("stream_incomplete".into()),
                 ..Default::default()
@@ -909,7 +896,7 @@ mod tests {
             &mut ToolCallAccumulator::new(),
         );
         assert!(response.incomplete);
-        assert!(!event_marks_completion(&InternalEvent::Stop {
+        assert!(!event_marks_completion(&GenerationEvent::Stop {
             reason: "stream_incomplete".into(),
         }));
     }
@@ -978,20 +965,20 @@ mod tests {
             EndpointPolicy::Auto,
             Some(format!("http://{address}/generateAssistantResponse")),
         );
-        let request = InternalRequest {
+        let request = GenerationRequest {
             model: "ide-model".into(),
-            messages: vec![crate::protocol::internal::InternalMessage::new(
-                "user",
-                Value::String("hello".into()),
+            messages: vec![crate::generation::Message::text(
+                crate::generation::Role::User,
+                "hello",
             )],
             system: None,
             tools: Vec::new(),
-            tool_choice: None,
             stream: true,
             max_tokens: None,
             temperature: None,
             conversation_id: None,
             instructions: None,
+            opaque_history: Vec::new(),
         };
         for endpoint in ["cli", "ide"] {
             let credential = Credential {
@@ -1007,14 +994,14 @@ mod tests {
             }
             assert!(matches!(
                 &collected[..],
-                [InternalEvent::TextDelta { text }, InternalEvent::Stop { reason }]
+                [GenerationEvent::TextDelta { text }, GenerationEvent::Stop { reason }]
                     if text == "ok" && reason == "end_turn"
             ));
         }
         server.await.unwrap();
     }
 
-    fn response_from_events(events: Vec<(&str, Value)>) -> InternalResponse {
+    fn response_from_events(events: Vec<(&str, Value)>) -> GenerationResult {
         let bytes = events
             .into_iter()
             .flat_map(|(kind, payload)| event_frame(kind, payload))
@@ -1023,7 +1010,7 @@ mod tests {
         let mut tools = ToolCallAccumulator::new();
         let mut filter = XmlLeakFilter::new();
         let mut integrity = StreamIntegrity::default();
-        let mut output = InternalResponse::default();
+        let mut output = GenerationResult::default();
         for message in decoder.push(&bytes).unwrap() {
             for event in decode_internal_events(&message).unwrap() {
                 apply_internal_event(event, &mut output, &mut tools, &mut filter, &mut integrity)
@@ -1069,13 +1056,13 @@ mod tests {
             br#"{"content":"answer","thinking":"plan","toolUses":[{"toolUseId":"call_1","name":"lookup","input":"{\"id\":1}"}],"usage":{"inputTokens":2,"outputTokens":3},"stopReason":"end_turn"}"#,
         )
         .unwrap();
-        assert!(matches!(events[0], InternalEvent::TextDelta { .. }));
-        assert!(matches!(events[1], InternalEvent::ThinkingDelta { .. }));
-        assert!(matches!(events[2], InternalEvent::ToolCallStart { .. }));
-        assert!(matches!(events[3], InternalEvent::ToolCallDelta { .. }));
-        assert!(matches!(events[4], InternalEvent::ToolCallEnd { .. }));
-        assert!(matches!(events[5], InternalEvent::Usage { .. }));
-        assert!(matches!(events[6], InternalEvent::Stop { .. }));
+        assert!(matches!(events[0], GenerationEvent::TextDelta { .. }));
+        assert!(matches!(events[1], GenerationEvent::ThinkingDelta { .. }));
+        assert!(matches!(events[2], GenerationEvent::ToolCallStart { .. }));
+        assert!(matches!(events[3], GenerationEvent::ToolCallDelta { .. }));
+        assert!(matches!(events[4], GenerationEvent::ToolCallEnd { .. }));
+        assert!(matches!(events[5], GenerationEvent::Usage { .. }));
+        assert!(matches!(events[6], GenerationEvent::Stop { .. }));
     }
 
     #[test]
@@ -1086,22 +1073,22 @@ mod tests {
         .unwrap();
         assert!(matches!(
             &events[0],
-            InternalEvent::TextDelta { text } if text == "nested answer"
+            GenerationEvent::TextDelta { text } if text == "nested answer"
         ));
         assert!(matches!(
             &events[1],
-            InternalEvent::ToolCallStart { id, name } if id == "call_1" && name == "lookup"
+            GenerationEvent::ToolCallStart { id, name } if id == "call_1" && name == "lookup"
         ));
         assert!(
-            matches!(&events[2], InternalEvent::ToolCallDelta { arguments, .. } if arguments == r#"{"id":1}"#)
+            matches!(&events[2], GenerationEvent::ToolCallDelta { arguments, .. } if arguments == r#"{"id":1}"#)
         );
-        assert!(matches!(&events[3], InternalEvent::ToolCallEnd { complete: true, .. }));
+        assert!(matches!(&events[3], GenerationEvent::ToolCallEnd { complete: true, .. }));
         assert!(
-            matches!(&events[4], InternalEvent::Usage { usage } if usage.input_tokens == 2 && usage.output_tokens == 3)
+            matches!(&events[4], GenerationEvent::Usage { usage } if usage.input_tokens == 2 && usage.output_tokens == 3)
         );
         assert!(matches!(
             &events[5],
-            InternalEvent::Stop { reason } if reason == "end_turn"
+            GenerationEvent::Stop { reason } if reason == "end_turn"
         ));
     }
 
@@ -1113,7 +1100,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             &events[..],
-            [InternalEvent::TextDelta { text }, InternalEvent::Stop { reason }]
+            [GenerationEvent::TextDelta { text }, GenerationEvent::Stop { reason }]
                 if text == "deep answer" && reason == "end_turn"
         ));
     }
@@ -1154,7 +1141,7 @@ mod tests {
                 .unwrap();
         assert!(matches!(
             &events[..],
-            [InternalEvent::Stop { reason }] if reason == "end_turn"
+            [GenerationEvent::Stop { reason }] if reason == "end_turn"
         ));
     }
 
@@ -1163,7 +1150,7 @@ mod tests {
         let events = json_events(br#"{"response":{"status":"completed","output":[]}}"#).unwrap();
         assert!(matches!(
             &events[..],
-            [InternalEvent::Stop { reason }] if reason == "end_turn"
+            [GenerationEvent::Stop { reason }] if reason == "end_turn"
         ));
     }
 
@@ -1171,7 +1158,7 @@ mod tests {
     fn adapts_json_upstream_error_to_error_event() {
         let events = json_events(br#"{"error":{"message":"overloaded"}}"#).unwrap();
         assert!(
-            matches!(&events[..], [InternalEvent::Error { message }] if message == "overloaded")
+            matches!(&events[..], [GenerationEvent::Error { message }] if message == "overloaded")
         );
     }
 
@@ -1183,7 +1170,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             &events[..],
-            [InternalEvent::Error { message }] if message == "ModelError: request rejected"
+            [GenerationEvent::Error { message }] if message == "ModelError: request rejected"
         ));
     }
 
@@ -1193,9 +1180,9 @@ mod tests {
             br#"{"output":[{"type":"message","content":[{"type":"output_text","text":"nested"}]},{"type":"function","id":"call_1","function":{"name":"lookup","arguments":"{\"x\":1}"}}]}"#,
         )
         .unwrap();
-        assert!(matches!(&events[0], InternalEvent::TextDelta { text } if text == "nested"));
+        assert!(matches!(&events[0], GenerationEvent::TextDelta { text } if text == "nested"));
         assert!(
-            matches!(&events[1], InternalEvent::ToolCallStart { id, name } if id == "call_1" && name == "lookup")
+            matches!(&events[1], GenerationEvent::ToolCallStart { id, name } if id == "call_1" && name == "lookup")
         );
     }
 
@@ -1303,29 +1290,32 @@ mod tests {
             ]);
             assert_eq!(response.thinking, "thinking");
             assert_eq!(response.text, "answer");
-            assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+            assert_eq!(
+                response.stop_reason.as_ref().map(|reason| reason.as_str()),
+                Some("end_turn")
+            );
             assert!(!response.incomplete);
         }
     }
 
     #[test]
     fn completion_logging_tracks_terminal_internal_events() {
-        assert!(event_marks_completion(&InternalEvent::Stop { reason: "end_turn".into() }));
-        assert!(event_marks_completion(&InternalEvent::ToolCallEnd {
+        assert!(event_marks_completion(&GenerationEvent::Stop { reason: "end_turn".into() }));
+        assert!(event_marks_completion(&GenerationEvent::ToolCallEnd {
             id: "call_1".into(),
             complete: true,
         }));
-        assert!(!event_marks_completion(&InternalEvent::ToolCallEnd {
+        assert!(!event_marks_completion(&GenerationEvent::ToolCallEnd {
             id: "call_1".into(),
             complete: false,
         }));
-        assert!(!event_marks_completion(&InternalEvent::TextDelta { text: "answer".into() }));
+        assert!(!event_marks_completion(&GenerationEvent::TextDelta { text: "answer".into() }));
     }
 
     #[test]
     fn rejects_a_clean_but_empty_stream_without_terminal_signal() {
-        assert!(is_empty_stream(&InternalResponse::default()));
-        assert!(!is_empty_stream(&InternalResponse {
+        assert!(is_empty_stream(&GenerationResult::default()));
+        assert!(!is_empty_stream(&GenerationResult {
             stop_reason: Some("end_turn".into()),
             ..Default::default()
         }));

@@ -1,15 +1,13 @@
 #[cfg(test)]
-use crate::protocol::internal::InternalResponse;
+use crate::generation::GenerationResult;
 use crate::{
     AppState,
     error::{AppError, Protocol, protocol_error_response},
-    protocol::{
-        internal::{InternalEvent, InternalRequest},
-        openai_chat::ChatRequest,
-    },
+    generation::{GenerationEvent, GenerationRequest},
+    protocol::openai_chat::ChatRequest,
     transform::converter::{chat_finish_reason, openai_chat_response},
     transform::truncation::XmlLeakFilter,
-    upstream::request::InternalEventAccumulator,
+    upstream::request::GenerationAccumulator,
 };
 use axum::{
     Json,
@@ -51,7 +49,7 @@ pub async fn chat_completions(
     Json(body): Json<ChatRequest>,
 ) -> Result<Response, AppError> {
     body.validate().map_err(AppError::BadRequest)?;
-    let mut request: InternalRequest = body.into();
+    let mut request: GenerationRequest = body.into_generation().map_err(AppError::BadRequest)?;
     request.model = state.token_manager.resolve_model(&request.model).await?;
     tracing::debug!(
         protocol = "openai_chat",
@@ -74,7 +72,7 @@ pub async fn chat_completions(
         let mut upstream = upstream;
         let first = json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]});
         yield Ok::<Event, Infallible>(Event::default().data(first.to_string()));
-        let mut accumulator = InternalEventAccumulator::new();
+        let mut accumulator = GenerationAccumulator::new();
         let mut tool_indices = HashMap::<String, usize>::new();
         let mut next_tool_index = 0_usize;
         let mut text_filter = XmlLeakFilter::new();
@@ -92,7 +90,7 @@ pub async fn chat_completions(
                     break;
                 }
             };
-            if let InternalEvent::Error { message } = &event {
+            if let GenerationEvent::Error { message } = &event {
                 yield Ok(Event::default().event("error").data(json!({"error":{"message":message,"type":"upstream_error"}}).to_string()));
                 yield Ok(Event::default().data("[DONE]"));
                 failed = true;
@@ -105,16 +103,16 @@ pub async fn chat_completions(
                 break;
             }
             match event {
-                InternalEvent::TextDelta { text } if !text.is_empty() => {
+                GenerationEvent::TextDelta { text } if !text.is_empty() => {
                     let text = text_filter.push(&text);
                     if !text.is_empty() {
                         yield Ok(Event::default().data(chunk(json!({"content":text})).to_string()));
                     }
                 }
-                InternalEvent::ThinkingDelta { text } if !text.is_empty() => {
+                GenerationEvent::ThinkingDelta { text } if !text.is_empty() => {
                     yield Ok(Event::default().data(chunk(json!({"reasoning_content":text})).to_string()));
                 }
-                InternalEvent::ToolCallStart { id: call_id, name } => {
+                GenerationEvent::ToolCallStart { id: call_id, name } => {
                     let index = *tool_indices.entry(call_id.clone()).or_insert_with(|| {
                         let value = next_tool_index;
                         next_tool_index += 1;
@@ -122,7 +120,7 @@ pub async fn chat_completions(
                     });
                     yield Ok(Event::default().data(chunk(json!({"tool_calls":[{"index":index,"id":call_id,"type":"function","function":{"name":name,"arguments":""}}]})).to_string()));
                 }
-                InternalEvent::ToolCallDelta { id: call_id, arguments, name } => {
+                GenerationEvent::ToolCallDelta { id: call_id, arguments, name } => {
                     let index = *tool_indices.entry(call_id.clone()).or_insert_with(|| {
                         let value = next_tool_index;
                         next_tool_index += 1;
@@ -132,8 +130,8 @@ pub async fn chat_completions(
                     if let Some(name) = name { function["name"] = json!(name); }
                     yield Ok(Event::default().data(chunk(json!({"tool_calls":[{"index":index,"function":function}]})).to_string()));
                 }
-                InternalEvent::ToolCallEnd { .. } | InternalEvent::Usage { .. } | InternalEvent::Stop { .. } => {}
-                InternalEvent::Error { .. } | InternalEvent::TextDelta { .. } | InternalEvent::ThinkingDelta { .. } => {}
+                GenerationEvent::ToolCallEnd { .. } | GenerationEvent::Usage { .. } | GenerationEvent::Stop { .. } => {}
+                GenerationEvent::Error { .. } | GenerationEvent::TextDelta { .. } | GenerationEvent::ThinkingDelta { .. } => {}
             }
         }
         if failed { return; }
@@ -156,7 +154,7 @@ pub async fn chat_completions(
 }
 
 #[cfg(test)]
-fn chat_stream_data(payload: &serde_json::Value, response: &InternalResponse) -> Vec<String> {
+fn chat_stream_data(payload: &serde_json::Value, response: &GenerationResult) -> Vec<String> {
     let chunk = |delta: serde_json::Value, finish_reason: serde_json::Value| {
         json!({
             "id":payload["id"],
@@ -200,8 +198,8 @@ mod tests {
         config::AppConfig,
         credential::TokenManager,
         error::AppError,
+        generation::{GenerationResult, ToolCall},
         model_catalog::ModelInfo,
-        protocol::internal::{InternalResponse, InternalToolCall},
         response_store::ResponseStore,
         transform::converter::openai_chat_response,
     };
@@ -410,15 +408,15 @@ mod tests {
 
     #[test]
     fn streams_parallel_tool_calls_before_done() {
-        let response = InternalResponse {
+        let response = GenerationResult {
             tool_calls: vec![
-                InternalToolCall {
+                ToolCall {
                     id: "call_a".into(),
                     name: "alpha".into(),
                     arguments: json!({"a":1}),
                     complete: true,
                 },
-                InternalToolCall {
+                ToolCall {
                     id: "call_b".into(),
                     name: "beta".into(),
                     arguments: json!({"b":2}),

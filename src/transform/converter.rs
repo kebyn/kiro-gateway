@@ -1,7 +1,7 @@
-use crate::protocol::internal::{InternalResponse, Usage};
+use crate::generation::{GenerationResult, StopReason, Usage};
 use serde_json::{Value, json};
 
-pub fn anthropic_response(model: &str, response: &InternalResponse) -> Value {
+pub fn anthropic_response(model: &str, response: &GenerationResult) -> Value {
     let mut content = Vec::new();
     if !response.thinking.is_empty() {
         content.push(json!({"type":"thinking", "thinking": response.thinking}));
@@ -20,7 +20,7 @@ pub fn anthropic_usage(usage: Usage) -> Value {
     json!({"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens})
 }
 
-pub fn openai_chat_response(model: &str, response: &InternalResponse) -> Value {
+pub fn openai_chat_response(model: &str, response: &GenerationResult) -> Value {
     let tool_calls: Vec<Value> = response.tool_calls.iter().map(|call| json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments_json()}})).collect();
     json!({"id":format!("chatcmpl-{}",uuid::Uuid::now_v7()),"object":"chat.completion","created":chrono::Utc::now().timestamp(),"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":if response.text.is_empty(){Value::Null}else{Value::String(response.text.clone())},"tool_calls":tool_calls},"finish_reason":chat_finish_reason(response)}],"usage":openai_usage(response.usage.clone().unwrap_or_else(||Usage::new(0,0)))})
 }
@@ -28,14 +28,14 @@ pub fn openai_usage(usage: Usage) -> Value {
     json!({"prompt_tokens":usage.input_tokens,"completion_tokens":usage.output_tokens,"total_tokens":usage.total_tokens})
 }
 
-pub fn anthropic_stop_reason(response: &InternalResponse) -> String {
+pub fn anthropic_stop_reason(response: &GenerationResult) -> String {
     if response.incomplete {
         return "max_tokens".into();
     }
     if !response.tool_calls.is_empty() {
         return "tool_use".into();
     }
-    match normalized_stop_reason(response.stop_reason.as_deref()) {
+    match normalized_stop_reason(response.stop_reason.as_ref()) {
         Some("max_tokens") => "max_tokens".into(),
         Some("context_window_exceeded") => "model_context_window_exceeded".into(),
         Some("refusal") => "refusal".into(),
@@ -45,39 +45,35 @@ pub fn anthropic_stop_reason(response: &InternalResponse) -> String {
     }
 }
 
-pub fn chat_finish_reason(response: &InternalResponse) -> &'static str {
+pub fn chat_finish_reason(response: &GenerationResult) -> &'static str {
     if response.incomplete {
         return "length";
     }
     if !response.tool_calls.is_empty() {
         return "tool_calls";
     }
-    match normalized_stop_reason(response.stop_reason.as_deref()) {
+    match normalized_stop_reason(response.stop_reason.as_ref()) {
         Some("max_tokens") | Some("context_window_exceeded") => "length",
         Some("refusal") => "content_filter",
         _ => "stop",
     }
 }
 
-pub fn normalized_stop_reason(reason: Option<&str>) -> Option<&'static str> {
-    match reason?.trim().to_ascii_lowercase().as_str() {
-        "max_tokens" | "max_output_tokens" | "length" => Some("max_tokens"),
-        "model_context_window_exceeded" | "context_window_exceeded" | "context_limit" => {
-            Some("context_window_exceeded")
-        }
-        "refusal" | "content_filter" | "content_filtered" | "guardrail_intervened" => {
-            Some("refusal")
-        }
-        "stream_incomplete" | "incomplete" | "upstream_disconnect" => Some("stream_incomplete"),
-        "stop_sequence" => Some("stop_sequence"),
-        "pause_turn" => Some("pause_turn"),
-        "end_turn" | "complete" | "completed" | "stop" => Some("end_turn"),
-        _ => None,
+pub fn normalized_stop_reason(reason: Option<&StopReason>) -> Option<&'static str> {
+    match reason? {
+        StopReason::MaxTokens => Some("max_tokens"),
+        StopReason::ContextWindowExceeded => Some("context_window_exceeded"),
+        StopReason::Refusal => Some("refusal"),
+        StopReason::StreamIncomplete => Some("stream_incomplete"),
+        StopReason::StopSequence => Some("stop_sequence"),
+        StopReason::PauseTurn => Some("pause_turn"),
+        StopReason::EndTurn => Some("end_turn"),
+        StopReason::Unknown(_) => None,
     }
 }
 
-pub fn responses_incomplete_reason(response: &InternalResponse) -> Option<&'static str> {
-    match normalized_stop_reason(response.stop_reason.as_deref()) {
+pub fn responses_incomplete_reason(response: &GenerationResult) -> Option<&'static str> {
+    match normalized_stop_reason(response.stop_reason.as_ref()) {
         Some("max_tokens") | Some("context_window_exceeded") => Some("max_output_tokens"),
         Some("refusal") => Some("content_filter"),
         Some("stream_incomplete") => Some("error"),
@@ -89,13 +85,13 @@ pub fn responses_incomplete_reason(response: &InternalResponse) -> Option<&'stat
 #[cfg(test)]
 mod tests {
     use super::{anthropic_response, anthropic_stop_reason, openai_chat_response};
-    use crate::protocol::internal::{InternalResponse, InternalToolCall};
+    use crate::generation::{GenerationResult, ToolCall};
     use serde_json::json;
 
-    fn tool_response() -> InternalResponse {
-        InternalResponse {
+    fn tool_response() -> GenerationResult {
+        GenerationResult {
             text: "Let me check".into(),
-            tool_calls: vec![InternalToolCall {
+            tool_calls: vec![ToolCall {
                 id: "call_weather".into(),
                 name: "weather".into(),
                 arguments: json!({"city":"Paris"}),
@@ -128,7 +124,7 @@ mod tests {
     #[test]
     fn maps_upstream_stop_reasons_to_protocol_values() {
         let mut response =
-            InternalResponse { stop_reason: Some("MAX_TOKENS".into()), ..Default::default() };
+            GenerationResult { stop_reason: Some("MAX_TOKENS".into()), ..Default::default() };
         assert_eq!(anthropic_stop_reason(&response), "max_tokens");
         assert_eq!(
             openai_chat_response("kiro", &response)["choices"][0]["finish_reason"],

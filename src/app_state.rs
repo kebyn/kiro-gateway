@@ -4,9 +4,9 @@ use crate::{
     credential::TokenManager,
     endpoint::EndpointPolicy,
     error::AppError,
-    protocol::internal::{InternalRequest, InternalResponse},
+    generation::{GenerationRequest, GenerationResult},
     response_store::ResponseStore,
-    upstream::request::{InternalEventStream, UpstreamClient},
+    upstream::request::{GenerationEventStream, UpstreamClient},
 };
 use std::sync::Arc;
 
@@ -22,8 +22,8 @@ pub struct AppState {
 impl AppState {
     pub async fn event_stream(
         &self,
-        request: &InternalRequest,
-    ) -> Result<InternalEventStream, AppError> {
+        request: &GenerationRequest,
+    ) -> Result<GenerationEventStream, AppError> {
         self.token_manager.ensure_fresh().await?;
         let credential = self.token_manager.credential();
         if credential.access_token.as_ref().is_none_or(|token| token.is_empty()) {
@@ -34,7 +34,10 @@ impl AppState {
         self.upstream.event_stream(request, &credential).await
     }
 
-    pub async fn complete(&self, request: &InternalRequest) -> Result<InternalResponse, AppError> {
+    pub async fn complete(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<GenerationResult, AppError> {
         let events = self.event_stream(request).await?;
         let response = crate::http::stream::drive(events, |_| Ok(())).await?;
         if response.text.is_empty()

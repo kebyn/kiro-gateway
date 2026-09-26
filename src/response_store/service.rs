@@ -1,6 +1,6 @@
 use crate::{
     error::AppError,
-    protocol::internal::{InternalMessage, InternalTool},
+    generation::{Message, ToolDefinition},
     response_store::{
         model::{ResponseEvent, ResponseRecord, ResponseStatus},
         sqlite::SqliteStore,
@@ -78,14 +78,14 @@ impl ResponseStore {
     pub fn events(&self, response_id: &str) -> Result<Vec<ResponseEvent>, AppError> {
         self.inner.events(response_id)
     }
-    pub fn extract_messages(record: &ResponseRecord) -> Vec<InternalMessage> {
+    pub fn extract_messages(record: &ResponseRecord) -> Vec<Message> {
         record
             .payload
             .get("messages")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default()
     }
-    pub fn extract_tools(record: &ResponseRecord) -> Vec<InternalTool> {
+    pub fn extract_tools(record: &ResponseRecord) -> Vec<ToolDefinition> {
         record
             .payload
             .get("tools")

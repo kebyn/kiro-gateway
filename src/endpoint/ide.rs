@@ -2,7 +2,7 @@ use crate::{
     auth::Credential,
     endpoint::{KiroEndpoint, conversation_body},
     error::AppError,
-    protocol::internal::InternalRequest,
+    generation::GenerationRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -23,7 +23,7 @@ impl KiroEndpoint for IdeEndpoint {
     }
     fn transform_api_body(
         &self,
-        request: &InternalRequest,
+        request: &GenerationRequest,
         credential: &Credential,
     ) -> serde_json::Value {
         conversation_body(request, credential, "AI_EDITOR", &request.model)

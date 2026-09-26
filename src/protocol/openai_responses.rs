@@ -1,6 +1,6 @@
-use crate::protocol::internal::{
-    InternalMessage, InternalRequest, InternalTool, InternalToolCall, InternalToolResult,
-    content_text,
+use crate::generation::{
+    ContentPart, GenerationRequest, Message, OpaqueHistory, Role, ToolCall, ToolDefinition,
+    ToolResult, content_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,32 +80,15 @@ impl ResponsesRequest {
                     {
                         return Err("message requires role and content".into());
                     }
-                    let message = InternalMessage::new(
-                        item.get("role").and_then(Value::as_str).unwrap_or_default(),
-                        item.get("content").cloned().unwrap_or(Value::Null),
-                    );
-                    message.validate_content()?;
+                    Role::parse(item.get("role").and_then(Value::as_str).unwrap_or_default())?;
+                    parse_content(item.get("content").unwrap_or(&Value::Null))?;
                 }
                 // Codex resends reasoning items as opaque history. They are
                 // accepted for compatibility but are intentionally not sent
                 // to the upstream model.
-                Some("reasoning") => {}
-                Some(
-                    "tool_search_call"
-                    | "tool_search_output"
-                    | "mcp_tool_call"
-                    | "mcp_tool_call_output"
-                    | "local_shell_call"
-                    | "local_shell_call_output"
-                    | "web_search_call"
-                    | "web_search_result"
-                    | "image_generation_call"
-                    | "compaction"
-                    | "context_compaction"
-                    | "configuration_update",
-                ) => {}
+                Some(kind) if is_opaque_history_type(kind) => {}
                 Some(other) => return Err(format!("unsupported Responses input type: {other}")),
-                None => {}
+                None => return Err("Responses input item requires type".into()),
             }
             Ok(())
         };
@@ -116,7 +99,8 @@ impl ResponsesRequest {
                 }
             }
             Value::Object(item) => validate_item(&Value::Object(item.clone()))?,
-            _ => {}
+            Value::String(_) => {}
+            _ => return Err("Responses input must be a string, object, or array of items".into()),
         }
         for tool in &self.tools {
             if tool.get("function").is_some() || tool.get("name").and_then(Value::as_str).is_none()
@@ -127,11 +111,12 @@ impl ResponsesRequest {
         Ok(())
     }
 
-    pub fn into_internal(self, previous: Vec<InternalMessage>) -> InternalRequest {
+    pub fn into_generation(self, previous: Vec<Message>) -> Result<GenerationRequest, String> {
         let mut messages = previous;
         let previous_len = messages.len();
         let mut tools = self.tools.into_iter().filter_map(parse_tool).collect::<Vec<_>>();
         let mut instructions = self.instructions;
+        let mut opaque_history = Vec::new();
         match self.input {
             Value::Array(items) => {
                 for item in items {
@@ -141,39 +126,39 @@ impl ResponsesRequest {
                     }
                     if is_instruction_item(&item) {
                         if let Some(content) = item.get("content").cloned() {
-                            append_instruction(&mut instructions, content);
+                            append_instruction(&mut instructions, content)?;
                         }
                         continue;
                     }
-                    append_item(&mut messages, &item, previous_len);
+                    append_item(&mut messages, &mut opaque_history, item, previous_len)?;
                 }
             }
-            Value::String(text) => messages.push(InternalMessage::new("user", Value::String(text))),
+            Value::String(text) => messages.push(Message::text(Role::User, text)),
             item @ Value::Object(_) => {
                 if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
                     tools.extend(parse_additional_tools(&item));
                 } else if is_instruction_item(&item) {
                     if let Some(content) = item.get("content").cloned() {
-                        append_instruction(&mut instructions, content);
+                        append_instruction(&mut instructions, content)?;
                     }
-                } else if !append_item(&mut messages, &item, previous_len) {
-                    messages.push(InternalMessage::new("user", item));
+                } else if !append_item(&mut messages, &mut opaque_history, item, previous_len)? {
+                    return Err("unsupported Responses input object".into());
                 }
             }
-            value => messages.push(InternalMessage::new("user", value)),
+            _ => return Err("Responses input must be a string, object, or array of items".into()),
         }
-        InternalRequest {
+        Ok(GenerationRequest {
             model: self.model,
             messages,
             system: None,
             tools,
-            tool_choice: self.tool_choice,
             stream: self.stream,
             max_tokens: None,
             temperature: None,
             conversation_id: self.conversation.or(self.previous_response_id),
             instructions,
-        }
+            opaque_history,
+        })
     }
 }
 
@@ -197,10 +182,10 @@ fn is_instruction_item(item: &Value) -> bool {
             .is_some_and(|role| matches!(role, "system" | "developer"))
 }
 
-fn append_instruction(instructions: &mut Option<String>, content: Value) {
-    let text = content_text(&InternalMessage::new("developer", content));
+fn append_instruction(instructions: &mut Option<String>, content: Value) -> Result<(), String> {
+    let text = content_text(&Message::new(Role::Developer, parse_content(&content)?));
     if text.is_empty() {
-        return;
+        return Ok(());
     }
     if let Some(existing) = instructions {
         existing.push_str("\n\n");
@@ -208,14 +193,23 @@ fn append_instruction(instructions: &mut Option<String>, content: Value) {
     } else {
         *instructions = Some(text);
     }
+    Ok(())
 }
 
-fn append_item(messages: &mut Vec<InternalMessage>, item: &Value, previous_len: usize) -> bool {
+fn append_item(
+    messages: &mut Vec<Message>,
+    opaque_history: &mut Vec<OpaqueHistory>,
+    item: Value,
+    previous_len: usize,
+) -> Result<bool, String> {
     match item.get("type").and_then(Value::as_str) {
-        Some("reasoning") => true,
+        Some(kind) if is_opaque_history_type(kind) => {
+            opaque_history.push(OpaqueHistory::from_item(item)?);
+            Ok(true)
+        }
         Some("function_call") => {
-            let Some(call) = parse_function_call(item) else {
-                return false;
+            let Some(call) = parse_function_call(&item) else {
+                return Ok(false);
             };
             let can_merge = messages.len() > previous_len;
             if let Some(message) =
@@ -223,15 +217,15 @@ fn append_item(messages: &mut Vec<InternalMessage>, item: &Value, previous_len: 
             {
                 message.tool_calls.push(call);
             } else {
-                let mut message = InternalMessage::new("assistant", Value::Null);
+                let mut message = Message::empty(Role::Assistant);
                 message.tool_calls.push(call);
                 messages.push(message);
             }
-            true
+            Ok(true)
         }
         Some("custom_tool_call") => {
-            let Some(call) = parse_custom_tool_call(item) else {
-                return false;
+            let Some(call) = parse_custom_tool_call(&item) else {
+                return Ok(false);
             };
             let can_merge = messages.len() > previous_len;
             if let Some(message) =
@@ -239,42 +233,89 @@ fn append_item(messages: &mut Vec<InternalMessage>, item: &Value, previous_len: 
             {
                 message.tool_calls.push(call);
             } else {
-                let mut message = InternalMessage::new("assistant", Value::Null);
+                let mut message = Message::empty(Role::Assistant);
                 message.tool_calls.push(call);
                 messages.push(message);
             }
-            true
+            Ok(true)
         }
         Some("function_call_output") | Some("custom_tool_call_output") => {
             let Some(tool_call_id) = item.get("call_id").and_then(Value::as_str) else {
-                return false;
+                return Ok(false);
             };
-            let mut message = InternalMessage::new("tool", Value::Null);
+            let mut message = Message::empty(Role::Tool);
             message.tool_call_id = Some(tool_call_id.to_owned());
-            message.tool_results.push(InternalToolResult {
+            message.tool_results.push(ToolResult {
                 tool_call_id: tool_call_id.to_owned(),
                 content: item.get("output").cloned().unwrap_or(Value::Null),
                 is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false)
                     || item.get("status").and_then(Value::as_str) == Some("failed"),
             });
             messages.push(message);
-            true
+            Ok(true)
         }
         Some("message") if item.get("role").and_then(Value::as_str).is_some() => {
-            let role = item.get("role").and_then(Value::as_str).unwrap();
-            let Some(content) = item.get("content").cloned() else {
-                return false;
+            let role = Role::parse(item.get("role").and_then(Value::as_str).unwrap())?;
+            let Some(content) = item.get("content") else {
+                return Ok(false);
             };
-            let mut message = InternalMessage::new(role, content);
+            let mut message = Message::new(role, parse_content(content)?);
             message.name = item.get("name").and_then(Value::as_str).map(ToOwned::to_owned);
             messages.push(message);
-            true
+            Ok(true)
         }
-        _ => false,
+        _ => Ok(false),
     }
 }
 
-fn parse_function_call(item: &Value) -> Option<InternalToolCall> {
+fn is_opaque_history_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "reasoning"
+            | "tool_search_call"
+            | "tool_search_output"
+            | "mcp_tool_call"
+            | "mcp_tool_call_output"
+            | "local_shell_call"
+            | "local_shell_call_output"
+            | "web_search_call"
+            | "web_search_result"
+            | "image_generation_call"
+            | "compaction"
+            | "context_compaction"
+            | "configuration_update"
+    )
+}
+
+fn parse_content(value: &Value) -> Result<Vec<ContentPart>, String> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(text) => Ok(vec![ContentPart::text(text)]),
+        Value::Array(items) => items.iter().try_fold(Vec::new(), |mut parts, item| {
+            parts.extend(parse_content(item)?);
+            Ok(parts)
+        }),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("text" | "input_text" | "output_text") => object
+                .get("text")
+                .or_else(|| object.get("input_text"))
+                .or_else(|| object.get("output_text"))
+                .and_then(Value::as_str)
+                .map(|text| vec![ContentPart::text(text)])
+                .ok_or_else(|| "Responses text content part requires text".to_owned()),
+            Some("thinking" | "reasoning") => object
+                .get("thinking")
+                .or_else(|| object.get("text"))
+                .and_then(Value::as_str)
+                .map(|text| vec![ContentPart::thinking(text)])
+                .ok_or_else(|| "Responses reasoning content part requires text".to_owned()),
+            _ => Err("unsupported content in Responses message; only text and reasoning content are supported".into()),
+        },
+        _ => Err("unsupported content in Responses message; only text content is supported".into()),
+    }
+}
+
+fn parse_function_call(item: &Value) -> Option<ToolCall> {
     let id = item.get("call_id")?.as_str()?.to_owned();
     let name = item.get("name")?.as_str()?.to_owned();
     let (arguments, arguments_complete) =
@@ -283,10 +324,10 @@ fn parse_function_call(item: &Value) -> Option<InternalToolCall> {
         item.get("status").and_then(Value::as_str),
         Some("incomplete" | "failed" | "cancelled")
     );
-    Some(InternalToolCall { id, name, arguments, complete: arguments_complete && status_complete })
+    Some(ToolCall { id, name, arguments, complete: arguments_complete && status_complete })
 }
 
-fn parse_custom_tool_call(item: &Value) -> Option<InternalToolCall> {
+fn parse_custom_tool_call(item: &Value) -> Option<ToolCall> {
     let id = item.get("call_id")?.as_str()?.to_owned();
     let name = qualified_custom_tool_name(
         item.get("namespace").and_then(Value::as_str),
@@ -297,7 +338,7 @@ fn parse_custom_tool_call(item: &Value) -> Option<InternalToolCall> {
         item.get("status").and_then(Value::as_str),
         Some("incomplete" | "failed" | "cancelled")
     );
-    Some(InternalToolCall { id, name, arguments: serde_json::json!({"input": input}), complete })
+    Some(ToolCall { id, name, arguments: serde_json::json!({"input": input}), complete })
 }
 
 fn parse_arguments(arguments: Value) -> (Value, bool) {
@@ -324,10 +365,10 @@ fn custom_input_schema() -> Value {
     })
 }
 
-fn parse_tool(tool: Value) -> Option<InternalTool> {
+fn parse_tool(tool: Value) -> Option<ToolDefinition> {
     let custom = tool.get("type").and_then(Value::as_str) == Some("custom");
     let original_name = tool.get("name")?.as_str()?.to_owned();
-    Some(InternalTool {
+    Some(ToolDefinition {
         name: kiro_tool_name(&original_name),
         description: tool.get("description").and_then(Value::as_str).map(ToOwned::to_owned),
         input_schema: if custom {
@@ -341,7 +382,7 @@ fn parse_tool(tool: Value) -> Option<InternalTool> {
     })
 }
 
-fn parse_additional_tools(item: &Value) -> Vec<InternalTool> {
+fn parse_additional_tools(item: &Value) -> Vec<ToolDefinition> {
     item.get("tools")
         .and_then(Value::as_array)
         .into_iter()
@@ -365,7 +406,7 @@ fn parse_additional_tools(item: &Value) -> Vec<InternalTool> {
                                 serde_json::json!({"type":"object"})
                             }
                         });
-                    Some(InternalTool {
+                    Some(ToolDefinition {
                         name: qualified_name,
                         description: tool
                             .get("description")
@@ -401,7 +442,7 @@ fn qualified_custom_tool_name(namespace: Option<&str>, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::ResponsesRequest;
-    use crate::protocol::internal::InternalMessage;
+    use crate::generation::Message;
     use serde_json::{Value, json};
 
     #[test]
@@ -418,7 +459,7 @@ mod tests {
         }))
         .unwrap();
 
-        let internal = request.into_internal(Vec::new());
+        let internal = request.into_generation(Vec::new()).unwrap();
         assert_eq!(internal.messages.len(), 3);
         assert_eq!(internal.messages[0].tool_calls.len(), 2);
         assert_eq!(internal.messages[0].tool_calls[0].id, "call_a");
@@ -429,8 +470,8 @@ mod tests {
 
     #[test]
     fn appends_function_output_to_stored_tool_call_history() {
-        let mut assistant = InternalMessage::new("assistant", Value::Null);
-        assistant.tool_calls.push(crate::protocol::internal::InternalToolCall {
+        let mut assistant = Message::empty(crate::generation::Role::Assistant);
+        assistant.tool_calls.push(crate::generation::ToolCall {
             id: "call_saved".into(),
             name: "lookup".into(),
             arguments: json!({"id":7}),
@@ -442,7 +483,7 @@ mod tests {
         }))
         .unwrap();
 
-        let internal = request.into_internal(vec![assistant]);
+        let internal = request.into_generation(vec![assistant]).unwrap();
         assert_eq!(internal.messages[0].tool_calls[0].id, "call_saved");
         assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_saved");
     }
@@ -459,14 +500,14 @@ mod tests {
             ]
         }))
         .unwrap();
-        let internal = request.into_internal(Vec::new());
+        let internal = request.into_generation(Vec::new()).unwrap();
         assert_eq!(internal.messages.len(), 3);
         assert_eq!(internal.messages[0].tool_calls.len(), 2);
         assert_eq!(internal.messages[0].tool_calls[0].id, "call_a");
         assert_eq!(internal.messages[0].tool_calls[1].id, "call_b");
         assert!(!internal.messages[0].tool_calls[1].complete);
         assert_eq!(internal.messages[1].role, "user");
-        assert_eq!(internal.messages[1].content, "after calls");
+        assert_eq!(crate::generation::content_text(&internal.messages[1]), "after calls");
         assert_eq!(internal.messages[2].tool_calls[0].id, "call_c");
         assert!(!internal.messages[2].tool_calls[0].complete);
     }
@@ -478,7 +519,7 @@ mod tests {
             "input":[{"type":"function_call","id":"fc_only","name":"lookup","arguments":{}}]
         }))
         .unwrap();
-        let internal = request.into_internal(Vec::new());
+        let internal = request.into_generation(Vec::new()).unwrap();
         assert!(internal.messages.is_empty() || internal.messages[0].tool_calls.is_empty());
     }
 
@@ -528,7 +569,7 @@ mod tests {
         }))
         .unwrap();
         request.validate().unwrap();
-        let internal = request.into_internal(Vec::new());
+        let internal = request.into_generation(Vec::new()).unwrap();
         assert_eq!(internal.messages.len(), 1);
         assert_eq!(internal.tools.len(), 2);
         assert_eq!(internal.tools[0].name, "functions_wait");
@@ -553,7 +594,7 @@ mod tests {
         .unwrap();
 
         request.validate().unwrap();
-        let internal = request.into_internal(Vec::new());
+        let internal = request.into_generation(Vec::new()).unwrap();
         assert_eq!(internal.tools.len(), 1);
         assert!(internal.tools[0].custom);
         assert_eq!(internal.messages[0].tool_calls[0].name, "apply_patch");
@@ -583,13 +624,18 @@ mod tests {
         .unwrap();
 
         request.validate().unwrap();
-        let internal = request.into_internal(Vec::new());
-        assert_eq!(internal.messages.len(), 1);
-        assert_eq!(internal.messages[0].content, "hello");
+        let generation = request.into_generation(Vec::new()).unwrap();
+        assert_eq!(generation.messages.len(), 1);
+        assert_eq!(crate::generation::content_text(&generation.messages[0]), "hello");
+        assert_eq!(generation.opaque_history.len(), 8);
+        assert_eq!(generation.opaque_history[0].item_type, "tool_search_call");
+        assert_eq!(generation.opaque_history[7].item_type, "configuration_update");
+        assert!(!generation.input_text().contains("calendar"));
+        assert!(!generation.input_text().contains("opaque"));
     }
 
     #[test]
-    fn accepts_and_ignores_opaque_codex_reasoning_items() {
+    fn preserves_opaque_codex_reasoning_without_forwarding_it() {
         let request: ResponsesRequest = serde_json::from_value(json!({
             "model":"gpt-5.6-sol",
             "input":[
@@ -605,12 +651,15 @@ mod tests {
         .unwrap();
 
         request.validate().unwrap();
-        let internal = request.into_internal(Vec::new());
-        assert_eq!(internal.messages.len(), 1);
-        assert_eq!(internal.messages[0].role, "user");
-        assert_eq!(internal.messages[0].content, "hello");
-        assert!(!internal.input_text().contains("private reasoning"));
-        assert!(!internal.input_text().contains("opaque-reasoning"));
+        let generation = request.into_generation(Vec::new()).unwrap();
+        assert_eq!(generation.messages.len(), 1);
+        assert_eq!(generation.messages[0].role, "user");
+        assert_eq!(crate::generation::content_text(&generation.messages[0]), "hello");
+        assert_eq!(generation.opaque_history.len(), 1);
+        assert_eq!(generation.opaque_history[0].item_type, "reasoning");
+        assert_eq!(generation.opaque_history[0].payload["id"], "rs_1");
+        assert!(!generation.input_text().contains("private reasoning"));
+        assert!(!generation.input_text().contains("opaque-reasoning"));
     }
 
     #[test]
@@ -626,7 +675,7 @@ mod tests {
         .unwrap();
 
         request.validate().unwrap();
-        let internal = request.into_internal(Vec::new());
+        let internal = request.into_generation(Vec::new()).unwrap();
         assert_eq!(internal.messages.len(), 1);
         assert_eq!(internal.messages[0].role, "user");
         assert_eq!(internal.instructions.as_deref(), Some("Follow the policy.\n\nBe concise."));
@@ -669,8 +718,10 @@ mod tests {
         .unwrap();
 
         request.validate().unwrap();
-        let internal = request.into_internal(Vec::new());
-        assert!(internal.messages.is_empty());
+        let generation = request.into_generation(Vec::new()).unwrap();
+        assert!(generation.messages.is_empty());
+        assert_eq!(generation.opaque_history.len(), 1);
+        assert_eq!(generation.opaque_history[0].item_type, "reasoning");
     }
 
     #[test]
@@ -687,7 +738,7 @@ mod tests {
         .unwrap();
 
         request.validate().unwrap();
-        let internal = request.into_internal(Vec::new());
+        let internal = request.into_generation(Vec::new()).unwrap();
         assert_eq!(internal.messages.len(), 2);
         assert_eq!(internal.messages[0].tool_calls[0].id, "call_a");
         assert_eq!(internal.messages[1].tool_results[0].tool_call_id, "call_a");
@@ -695,8 +746,8 @@ mod tests {
 
     #[test]
     fn does_not_merge_first_new_call_into_previous_response_assistant() {
-        let mut previous = InternalMessage::new("assistant", Value::Null);
-        previous.tool_calls.push(crate::protocol::internal::InternalToolCall {
+        let mut previous = Message::empty(crate::generation::Role::Assistant);
+        previous.tool_calls.push(crate::generation::ToolCall {
             id: "call_previous".into(),
             name: "old".into(),
             arguments: json!({}),
@@ -710,7 +761,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let internal = request.into_internal(vec![previous]);
+        let internal = request.into_generation(vec![previous]).unwrap();
         assert_eq!(internal.messages.len(), 2);
         assert_eq!(internal.messages[0].tool_calls[0].id, "call_previous");
         assert_eq!(internal.messages[1].tool_calls.len(), 2);

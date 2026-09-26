@@ -7,6 +7,7 @@ mod config;
 mod credential;
 mod endpoint;
 mod error;
+mod generation;
 mod http;
 mod model_catalog;
 mod protocol;
