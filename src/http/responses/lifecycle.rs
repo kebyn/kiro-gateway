@@ -45,7 +45,7 @@ impl Drop for IncompleteRecordGuard {
         payload["error"] = json!({"code":"client_disconnected","message":"client disconnected before response completion"});
         payload["incomplete_details"] = json!({"reason":"client_disconnect"});
         let event_payload = json!({"response":payload.clone()});
-        let _ = store.mark_incomplete_on_disconnect(
+        if let Err(error) = store.mark_incomplete_on_disconnect(
             self.record_id.clone(),
             json!({
                 "messages":snapshot.messages,
@@ -54,6 +54,12 @@ impl Drop for IncompleteRecordGuard {
                 "response":payload
             }),
             event_payload,
-        );
+        ) {
+            tracing::error!(
+                response_id = %self.record_id,
+                error = %error,
+                "failed to queue client-disconnect response transition"
+            );
+        }
     }
 }
