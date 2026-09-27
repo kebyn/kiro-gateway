@@ -8,6 +8,7 @@ Responses 本地存储。本文不包含凭据、请求正文、真实数据库�
 - `3d8e4a4`：拒绝损坏续传历史，严格校验 v2 SQLite schema 和 WAL/SHM 权限。
 - `fc33613`：所有成功 JSON/模型目录响应都使用有界逐 chunk 读取。
 - `eac31df`：补充存储不可用、协议错误 envelope、损坏历史和传输边界测试。
+- `6ae1d8b`、`69f92ee`：报告断连排队失败，并拒绝部分唯一索引等异常 schema。
 
 ## 工具链与基线
 
@@ -32,15 +33,20 @@ Responses 本地存储。本文不包含凭据、请求正文、真实数据库�
 1. **Responses 流事件持久化错误被忽略（已修复）**：`src/http/responses/live.rs` 原先大量
    `if let Ok(...)` 会在 append/transition 失败后继续发送事件。现在所有事件先经统一宏持久化；失败时
    发送 `response.incomplete`，错误码为 `storage_error`，记录一次 best-effort 不完整转换并立即停止。
-   断连仍由析构 guard 排队转换，actor 不可用时会记录结构化错误。
+   断连仍由析构 guard 排队转换，actor 不可用时会记录结构化错误；回归测试为
+   `http::responses::tests::storage_append_failure_emits_incomplete_and_stops_stream`。
 2. **续传历史损坏静默变空（已修复）**：`ResponseStore::extract_messages/tools/opaque_history` 现在
    对缺失字段和反序列化错误返回 `AppError::Storage`。`previous_response_id` 不会再把损坏上下文当作空历史。
+   `response_store::service::tests::corrupted_history_is_reported_instead_of_becoming_empty` 和
+   `http::responses::tests::corrupted_previous_response_is_not_treated_as_empty_history` 覆盖该边界。
 3. **v2 数据库校验过浅（已修复）**：启动时要求唯一的五张 v2 表、完整列/类型/非空/主键约束、
    `schema_meta` 单行 `CHECK(version=2)`、三条级联外键和事件唯一约束。旧库、额外表、缺列或错误约束
-   均拒绝，且不会迁移或覆盖文件。
+   均拒绝，且不会迁移或覆盖文件；部分唯一索引也不被接受。`rejects_v2_database_with_missing_column_without_modifying_it`
+   覆盖文件字节不变的拒绝行为。
 4. **上游体积限制绕过（已修复）**：模型目录和成功 JSON 响应不再调用无界 `bytes()`；无
    `Content-Length`、chunked 和 HTTP/2 数据均逐 chunk 受 `max_upstream_body_bytes` 限制。EventStream
-   和非 2xx 预览保持原有上限。
+   和非 2xx 预览保持原有上限；`model_catalog::tests::rejects_chunked_model_response_over_limit` 和
+   `upstream::request::tests::limits_chunked_success_json_without_content_length` 覆盖 chunked 路径。
 5. **模型目录/凭据错误被误报为 400（已修复）**：模型不存在仍为协议级 `400`；凭据、网络、上游和
    完整性错误保留 `502`（凭据/上游 envelope），不会伪装成“模型不可用”。`GET /v1/models` 的兼容约定
    仍是在发现失败时返回 `200` 且 `data=[]`。
