@@ -116,4 +116,4 @@ Claude Code `2.1.274`、Grok `1.0.41`。
 
 外部/工具 warning：Corepack pnpm 输出 Node `url.parse()` deprecation；Docker builder 在镜像内没有
 Node 时使用仓库已有 `admin-ui/dist`（不影响构建结果）。真实 SQLite 当前 `0644 root:root`，仅做
-`stat` 检查且未修改；建议凭据所有者改为 `0600`。最终提交为 `ac89d67`。
+`stat` 检查且未修改；建议凭据所有者改为 `0600`。最终提交为 `77dc134`。
