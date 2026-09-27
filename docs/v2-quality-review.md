@@ -109,9 +109,9 @@ git diff --check
 
 结果：上述命令全部通过；`make test` 为 Rust `179 passed; 2 ignored` 加 CLI `9 passed`。
 `make reproducible` 的两次隔离 release 二进制 SHA-256 均为
-`f79ef23038ae2c01087a630a282190c08b1ad43e44deb5e15d02ae4dcf998b6e`。
+`c0c0245bec1bdf03ce1142c624b1e666d2189445394f9d3afb979fc6f954ee79`。
 `make docker` 成功，镜像 manifest digest 为
-`sha256:42b0f99d16f0a18048b229fedb39146c8e2881ec73766586fa4926884088c750`，容器以 UID `10001`
+`sha256:f4189501d3b647caf015610f2fde9c778b8f9dbdfa6e2fb64b2951a7033f2ff3`，容器以 UID `10001`
 运行。使用临时脱敏 `.env` 的 `docker compose config`、配置生成/`--check-config`、旧配置拒绝、
 `make secrets` 和 `git diff --check` 均通过；临时文件已删除，工作树干净。
 
