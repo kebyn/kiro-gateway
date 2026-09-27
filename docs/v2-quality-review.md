@@ -86,7 +86,7 @@ Responses 本地存储。本文不包含凭据、请求正文、真实数据库�
 - SQLite：旧库字节不变拒绝、缺列 schema 拒绝、外键/唯一约束、事务事件顺序、主库及 WAL/SHM 权限。
 - 三套协议错误 envelope 均验证了 `400` 请求错误与 `502` 凭据/上游错误的区分。
 
-最终交付前仍需在干净环境执行并记录：
+最终验收已在当前工作树执行并记录：
 
 ```text
 make check
@@ -101,6 +101,19 @@ make secrets
 git diff --check
 ```
 
-同时记录 Rust/pnpm/audit/deny 版本、release 二进制 SHA-256、Docker digest、最终提交和外部 warning。
-真实客户端冒烟必须显式设置 `KIRO_ALLOW_LIVE_TESTS=1`，只读 SQLite、绝不配置 JSON 回写，并在报告中区分
-代码、凭据/订阅和外部服务故障。
+结果：上述命令全部通过；`make test` 为 Rust `179 passed; 2 ignored` 加 CLI `9 passed`。
+`make reproducible` 的两次隔离 release 二进制 SHA-256 均为
+`f79ef23038ae2c01087a630a282190c08b1ad43e44deb5e15d02ae4dcf998b6e`。
+`make docker` 成功，镜像 manifest digest 为
+`sha256:42b0f99d16f0a18048b229fedb39146c8e2881ec73766586fa4926884088c750`，容器以 UID `10001`
+运行。使用临时脱敏 `.env` 的 `docker compose config`、配置生成/`--check-config`、旧配置拒绝、
+`make secrets` 和 `git diff --check` 均通过；临时文件已删除，工作树干净。
+
+`KIRO_ALLOW_LIVE_TESTS=1` 加只读 `/root/.local/share/kiro-cli/data.sqlite3`（未配置 JSON 回写）运行
+`scripts/test-local-clients.sh`，动态模型 `gpt-5.6-sol`，健康/鉴权/模型发现、三套协议普通响应与
+SSE、Codex、Claude Code、Grok Build 共 `12 passed; 0 failed`。客户端版本为 Codex `0.157.1`、
+Claude Code `2.1.274`、Grok `1.0.41`。
+
+外部/工具 warning：Corepack pnpm 输出 Node `url.parse()` deprecation；Docker builder 在镜像内没有
+Node 时使用仓库已有 `admin-ui/dist`（不影响构建结果）。真实 SQLite 当前 `0644 root:root`，仅做
+`stat` 检查且未修改；建议凭据所有者改为 `0600`。最终提交为 `ac89d67`。
