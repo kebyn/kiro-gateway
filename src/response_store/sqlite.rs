@@ -389,10 +389,12 @@ fn validate_response_foreign_key(conn: &Connection, table: &str) -> Result<(), A
 fn validate_event_sequence_constraint(conn: &Connection) -> Result<(), AppError> {
     let mut statement = conn.prepare("PRAGMA index_list('response_events')")?;
     let indexes = statement
-        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0)))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0, row.get::<_, i64>(5)? != 0))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
-    for (name, unique) in indexes {
-        if !unique {
+    for (name, unique, partial) in indexes {
+        if !unique || partial {
             continue;
         }
         let sql = format!("PRAGMA index_info('{name}')");
