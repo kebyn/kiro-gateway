@@ -171,8 +171,11 @@ JSON 凭据使用 `credential.source: "json"` 和 `/etc/kiro-gateway/kiro.json`�
 Responses 存储使用独立的 v2 schema（`schema_meta.version=2`），将请求、最新响应快照和
 生命周期事件分开保存；`(response_id, sequence_number)` 具有唯一约束，删除 Response
 会级联删除事件。数据库写入由单连接 actor 串行执行，快照和同一状态转换的事件在一个事务中
-提交。启动时发现没有 v2 标记的旧数据库会直接拒绝，并提示改用新的存储路径；网关不会迁移、
-覆盖或修改旧库。请在切换前自行备份旧文件，并通过 `storage.response_store_path` 指定新路径。
+提交。启动时会同时校验五张 v2 表的列、类型、主键、级联外键、`schema_meta` 检查约束以及事件
+唯一约束；缺列、额外表、错误约束或没有 v2 标记的旧数据库都会直接拒绝，并提示改用新的存储路径。
+网关不会迁移、覆盖或修改旧库；SQLite 主库和已创建的 WAL/SHM sidecar 会强化为仅所有者可读写，
+权限强化失败会阻止该次存储操作。请在切换前自行备份旧文件，并通过
+`storage.response_store_path` 指定新路径。
 
 ## 接口与鉴权
 
@@ -202,6 +205,12 @@ Authorization: Bearer client-key-change-me
 三套生成接口均支持 `stream: true`，响应类型为 SSE；流式响应会发送 keep-alive 注释，
 并在完成时发送各自协议要求的终止事件（Anthropic `message_stop`、Chat Completions
 `[DONE]`、Responses `response.completed` 或 `response.incomplete`）。
+
+Responses 开启 `store` 时，每个生命周期事件都会先写入本地 actor 再发送给客户端。若追加或最终
+快照事务失败，网关会发送带 `error.code=storage_error` 的 `response.incomplete` 并停止流，
+不会继续声称后续事件已可靠存储；已存在的记录会尝试以不完整状态排队更新。使用
+`previous_response_id` 时，如果保存的 `messages`、`tools` 或 `opaque_history` 缺失/损坏，会返回
+存储错误而不是静默按空历史继续。
 
 ### 兼容性边界
 
@@ -466,6 +475,9 @@ CI 不需要挂载真实 `data.sqlite3`；普通 fixture 测试已经覆盖真�
 Chat Completions、Responses 和 `count_tokens` 请求中的 `model` 必须存在于当前模型
 目录，否则返回 `400`，且不会调用 Kiro 上游。若配置了 `model_aliases`，先解析别名，
 再校验并转发目标模型；未配置别名时请求中的模型 ID 会原样严格校验。
+
+模型目录请求失败、凭据缺失或上游网络/完整性错误不会再被伪装成模型不存在：生成接口会按各自协议
+返回 `502` 的上游/凭据错误 envelope；只有目录中明确不存在的模型才返回 `400`。
 
 如需在本机使用真实 SQLite 凭据验证完整远程链路，可执行以下默认忽略的测试；它不会
 输出 token，也不会修改数据库：
