@@ -74,6 +74,13 @@ impl ResponseStore {
     }
 
     #[cfg(test)]
+    pub fn unavailable_for_tests() -> Self {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        Self { commands }
+    }
+
+    #[cfg(test)]
     pub async fn create(
         &self,
         model: &str,
@@ -392,6 +399,18 @@ mod tests {
         let missing = store.get(&missing.id).await.unwrap().unwrap();
         let error = ResponseStore::extract_opaque_history(&missing).unwrap_err();
         assert!(error.to_string().contains("opaque_history"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_actor_returns_observable_storage_errors() {
+        let store = ResponseStore::unavailable_for_tests();
+        let error = store.get("resp_missing").await.unwrap_err();
+        assert!(matches!(error, AppError::Storage(message) if message.contains("unavailable")));
+        let error = store
+            .append_event("resp_missing", "response.created", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Storage(message) if message.contains("unavailable")));
     }
 
     #[test]

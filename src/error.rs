@@ -214,3 +214,31 @@ impl From<serde_json::Error> for AppError {
         Self::BadRequest(value.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AppError, Protocol, protocol_error_response};
+    use axum::{body::to_bytes, http::StatusCode};
+
+    #[tokio::test]
+    async fn protocol_envelopes_preserve_error_classification() {
+        for protocol in [Protocol::Anthropic, Protocol::ChatCompletions, Protocol::Responses] {
+            let credential = protocol_error_response(
+                protocol,
+                AppError::Credential("missing access token".into()),
+            );
+            assert_eq!(credential.status(), StatusCode::BAD_GATEWAY);
+            let body = to_bytes(credential.into_body(), usize::MAX).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(value.get("error").is_some());
+
+            let upstream =
+                protocol_error_response(protocol, AppError::Upstream("connection reset".into()));
+            assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
+
+            let bad_request =
+                protocol_error_response(protocol, AppError::BadRequest("unknown model".into()));
+            assert_eq!(bad_request.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+}

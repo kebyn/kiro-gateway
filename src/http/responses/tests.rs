@@ -11,10 +11,11 @@ use crate::{
     generation::{GenerationResult, Message, ToolCall, ToolDefinition},
     model_catalog::ModelInfo,
     protocol::openai_responses::ResponsesRequest,
-    response_store::{ResponseStatus, ResponseStore},
+    response_store::{ResponseRecord, ResponseStatus, ResponseStore},
 };
 use axum::response::IntoResponse;
 use axum::{Json, extract::State};
+use chrono::Utc;
 use futures_util::stream;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -442,6 +443,55 @@ async fn dropping_a_live_stream_marks_an_in_progress_record_incomplete() {
 }
 
 #[tokio::test]
+async fn storage_append_failure_emits_incomplete_and_stops_stream() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = state(&directory.path().join("responses.sqlite3"));
+    state.responses = ResponseStore::unavailable_for_tests();
+    let now = Utc::now();
+    let record = ResponseRecord {
+        id: "resp_storage_failure".into(),
+        object: "response".into(),
+        status: ResponseStatus::InProgress,
+        model: "kiro".into(),
+        payload: json!({"messages":[],"tools":[],"opaque_history":[],"response":{}}),
+        created_at: now,
+        updated_at: now,
+    };
+    let internal = crate::generation::GenerationRequest {
+        model: "kiro".into(),
+        messages: Vec::new(),
+        system: None,
+        tools: Vec::new(),
+        stream: true,
+        max_tokens: None,
+        temperature: None,
+        conversation_id: None,
+        instructions: None,
+        opaque_history: Vec::new(),
+    };
+    let upstream: crate::upstream::GenerationEventStream =
+        Box::pin(stream::iter(vec![Ok(crate::generation::GenerationEvent::TextDelta {
+            text: "answer".into(),
+        })]));
+    let response = responses_live_stream(
+        state,
+        upstream,
+        record.id.clone(),
+        "kiro".into(),
+        internal,
+        true,
+        Some(record),
+    )
+    .into_response();
+    let body = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec())
+        .unwrap();
+    assert!(body.contains("response.incomplete"));
+    assert!(body.contains("storage_error"));
+    assert!(!body.contains("response.in_progress"));
+    assert!(!body.contains("response.output_text.delta"));
+}
+
+#[tokio::test]
 async fn missing_previous_response_is_not_treated_as_empty_history() {
     let directory = tempfile::tempdir().unwrap();
     let state = state(&directory.path().join("responses.sqlite3"));
@@ -455,6 +505,32 @@ async fn missing_previous_response_is_not_treated_as_empty_history() {
         create(State(state), Json(request)).await,
         Err(crate::error::AppError::NotFound)
     ));
+}
+
+#[tokio::test]
+async fn corrupted_previous_response_is_not_treated_as_empty_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = state(&directory.path().join("responses.sqlite3"));
+    let record = state
+        .responses
+        .create_with_id(
+            "resp_corrupt".into(),
+            "kiro",
+            json!({"messages":"corrupt","tools":[],"opaque_history":[]}),
+            ResponseStatus::Completed,
+        )
+        .await
+        .unwrap();
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model":"kiro",
+        "input":"hello",
+        "previous_response_id":record.id
+    }))
+    .unwrap();
+    let error = create(State(state), Json(request)).await.unwrap_err();
+    assert!(
+        matches!(error, crate::error::AppError::Storage(message) if message.contains("messages"))
+    );
 }
 
 #[test]

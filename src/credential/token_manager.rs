@@ -283,4 +283,22 @@ mod tests {
         assert_eq!(manager.resolve_model("claude-haiku-4-5").await.unwrap(), "gpt-5.6-sol");
         assert_eq!(manager.resolve_model("gpt-5.6-terra").await.unwrap(), "gpt-5.6-terra");
     }
+
+    #[tokio::test]
+    async fn preserves_credential_error_when_model_catalog_cannot_authenticate() {
+        let config = AppConfig {
+            client_api_key: "client".into(),
+            admin_api_key: "admin".into(),
+            ..Default::default()
+        };
+        let manager = TokenManager::new(
+            &config,
+            Credential { auth_method: AuthMethod::ApiKey, ..Default::default() },
+        )
+        .unwrap();
+        let error = manager.resolve_model("kiro").await.unwrap_err();
+        assert!(
+            matches!(error, crate::error::AppError::Credential(message) if message.contains("access token"))
+        );
+    }
 }
